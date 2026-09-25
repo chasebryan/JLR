@@ -94,10 +94,24 @@ impl Policy {
     /// trust it should not. A policy that fails validation must be refused;
     /// the caller must not fall back to a permissive default (I-11).
     pub fn validate(&self) -> Result<(), PolicyError> {
+        self.validate_with(true)
+    }
+
+    /// Validation for a policy that was **already signed and installed**. Every rule of [`Policy::validate`]
+    /// applies except the alphabet of names: policies installed before names were restricted may use spaces and
+    /// punctuation, and refusing to open such an installation would leave the operator unable to replace the
+    /// policy. The name is only ever printed after escaping, so accepting it is safe. New policies still go
+    /// through [`Policy::validate`].
+    pub fn validate_loaded(&self) -> Result<(), PolicyError> {
+        self.validate_with(false)
+    }
+
+    fn validate_with(&self, strict_names: bool) -> Result<(), PolicyError> {
+        let name_ok = |n: &str| if strict_names { plain_name(n) } else { !n.is_empty() && n.len() <= 128 };
         if self.schema != Self::SCHEMA {
             return bad(format!("unsupported schema {}", self.schema));
         }
-        if !plain_name(&self.name) {
+        if !name_ok(&self.name) {
             return bad("name must be 1 to 128 characters from A-Z a-z 0-9 . _ -");
         }
         if self.epoch == 0 {
@@ -118,7 +132,7 @@ impl Policy {
         }
         let mut seen = std::collections::BTreeSet::new();
         for t in &self.tiers {
-            if !plain_name(&t.name) || !seen.insert(t.name.as_str()) {
+            if !name_ok(&t.name) || !seen.insert(t.name.as_str()) {
                 return bad(format!(
                     "tier names must be unique, 1 to 128 characters from A-Z a-z 0-9 . _ -: {:?}",
                     jlr_model::sanitize(&t.name)

@@ -320,10 +320,35 @@ mod media_tests {
         // When both exist the rename did not happen; the file that was renamed earlier is authoritative.
         fs::write(d.path().join("jlr/bootstate.cbor"), proven_at(3).to_cbor()).unwrap();
         assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(proven_at(3)));
-        // A torn .new is an error, not a silent reset.
-        fs::remove_file(d.path().join("jlr/bootstate.cbor")).unwrap();
+    }
+
+    #[test]
+    fn a_torn_replacement_beside_no_state_is_a_fresh_medium_not_a_brick() {
+        // The replacement is synced before it replaces anything, so a torn `.new` with no state file means the very
+        // first write was cut short. Refusing to boot on it, on every boot, would strand a machine over nothing.
+        let d = media_dir();
         fs::write(d.path().join("jlr/bootstate.cbor.new"), b"\x01").unwrap();
-        assert!(read_state(d.path()).is_err());
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Fresh(BootState::fresh()));
+        // A torn `.new` beside a state file is simply ignored: the state file is what counts.
+        fs::write(d.path().join("jlr/bootstate.cbor"), proven_at(3).to_cbor()).unwrap();
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(proven_at(3)));
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_partial_file_and_a_recovered_copy_is_never_truncated() {
+        // A rename that cannot happen (a directory is in the way) fails after the new file was written.
+        let d = media_dir();
+        fs::create_dir(d.path().join("jlr/bootstate.cbor")).unwrap();
+        assert!(write_state(d.path(), &proven_at(9)).is_err());
+        assert!(!d.path().join("jlr/bootstate.cbor.new").exists(), "a failed write must not leave its partial file");
+        fs::remove_dir(d.path().join("jlr/bootstate.cbor")).unwrap();
+
+        // A complete `.new` with no state file is the only copy of the floor. Writing a later state promotes it
+        // first instead of truncating it, and ends with the newer state in place.
+        fs::write(d.path().join("jlr/bootstate.cbor.new"), proven_at(12).to_cbor()).unwrap();
+        write_state(d.path(), &proven_at(20)).unwrap();
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(proven_at(20)));
+        assert!(!d.path().join("jlr/bootstate.cbor.new").exists());
     }
 
     #[test]

@@ -446,6 +446,10 @@ fn in_terminal_session(test: &str) -> bool {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "the terminal-session child failed:\n{text}");
     assert!(text.contains("1 passed"), "the child did not run the test:\n{text}");
+    // A skip inside the child must not look like a pass: repeat its notices in this test's own output.
+    for line in text.lines().filter(|l| l.starts_with("SKIPPED") || l.starts_with("NOTE")) {
+        eprintln!("{line}");
+    }
     drop(pty.master);
     false
 }
@@ -490,15 +494,25 @@ fn a_terminal_cannot_be_used_to_type_into_the_operators_shell() {
     if !in_terminal_session("a_terminal_cannot_be_used_to_type_into_the_operators_shell") {
         return;
     }
-    // TIOCSTI (0x5412) queues a character in the terminal's input as if the user had typed it. Some kernels
-    // refuse it themselves (EIO); the cell must refuse it with EPERM regardless of that setting.
-    let probe = "my $c = 'x'; if (ioctl(STDIN, 0x5412, $c)) { print \"INJECTED\\n\" } else { print \"errno=\" . ($!+0) . \"\\n\" }";
-    let Some((_, out, err)) = run_with_inherited_terminal("/usr/bin/perl", &["perl", "-e", probe]) else { return };
-    assert!(!out.contains("INJECTED"), "a character was injected into the operator's terminal: {out}");
-    assert!(
-        out.contains(&format!("errno={}", libc::EPERM)),
-        "TIOCSTI must be refused by the cell (EPERM): {out} {err}"
+    // TIOCSTI (0x5412) queues a character in the terminal's input as if the user had typed it; the others
+    // re-target or reconfigure a terminal. The cell must refuse every one with EPERM, including TIOCSTI with a high
+    // bit set: the kernel looks at the low 32 bits only, so a filter that compared all 64 would let it through.
+    // perl's `ioctl` narrows the request to 32 bits itself, so the high-bit variant goes through `syscall`.
+    let probe = format!(
+        "for my $r (0x5412, 0x540E, 0x541C, 0x541D, 0x5423) {{ my $c = 'x'; \
+           my $ok = ioctl(STDIN, $r, $c); printf(\"%x=%s\\n\", $r, $ok ? 'ALLOWED' : ($!+0)); }} \
+         my $c = 'x'; my $rc = syscall({}, 0, 0x100005412, $c); \
+         printf(\"100005412=%s\\n\", $rc == -1 ? ($!+0) : 'ALLOWED');",
+        libc::SYS_ioctl
     );
+    let Some((_, out, err)) = run_with_inherited_terminal("/usr/bin/perl", &["perl", "-e", &probe]) else { return };
+    assert!(!out.contains("ALLOWED"), "a terminal request was let through: {out} {err}");
+    for req in ["5412", "540e", "541c", "541d", "5423", "100005412"] {
+        assert!(
+            out.lines().any(|l| l == format!("{req}={}", libc::EPERM)),
+            "request 0x{req} must be refused by the cell with EPERM: {out} {err}"
+        );
+    }
 }
 
 #[test]
@@ -519,16 +533,36 @@ fn a_grant_below_tmp_is_applied_even_though_the_root_is_assembled_in_a_tmpfs() {
 
 #[test]
 fn a_grant_that_cannot_be_applied_is_reported_and_makes_the_report_partial() {
+    // CELL-2 requests no cgroup limits, so a host without a delegated cgroup does not make the report Partial by
+    // itself and the grant is the only thing that can.
     let missing = "/no/such/directory/jlr-test";
+    let clean = decision(CellClass::Cell2, NetworkMode::None, vec![], AdmissionState::Admitted);
+    let Some((o, _, _)) = run_sh(&clean, "true") else { return };
+    if o.report.status != Status::Full {
+        eprintln!(
+            "SKIPPED: this host cannot give a CELL-2 a Full report on its own ({:?}), so the grant is not the only cause",
+            o.report.unavailable
+        );
+        return;
+    }
     let cap = Capability::parse(&format!("FS_READ:{missing}")).unwrap();
-    let d = decision(CellClass::Cell1, NetworkMode::None, vec![cap], AdmissionState::Verified);
+    let d = decision(CellClass::Cell2, NetworkMode::None, vec![cap], AdmissionState::Admitted);
     let Some((o, _, _)) = run_sh(&d, "true") else { return };
-    assert_eq!(o.report.status, Status::Partial, "{:?}", o.report);
+    assert_eq!(o.report.status, Status::Partial, "an unapplied grant must not leave the report Full: {:?}", o.report);
     assert!(
         o.report.unavailable.iter().any(|u| u.contains(missing) && u.contains("not applied")),
         "the dropped grant must be listed: {:?}",
         o.report.unavailable
     );
+}
+
+/// The Landlock ABI this kernel supports, asked from the test process itself so that the test does not depend on
+/// what the helper reports about it.
+#[allow(unsafe_code)]
+fn kernel_landlock_abi() -> Option<u32> {
+    // SAFETY: with a null attribute, size 0 and the VERSION flag (1) the call only returns a number.
+    let v = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<libc::c_void>(), 0usize, 1u32) };
+    u32::try_from(v).ok().filter(|v| *v > 0)
 }
 
 #[test]
@@ -542,31 +576,35 @@ fn the_destination_allow_list_is_enforced_by_landlock_and_reported_as_active() {
         "(exec 3<>/dev/tcp/127.0.0.1/{pa}) 2>/dev/null && echo allowed-ok || echo allowed-FAILED; \
          (exec 3<>/dev/tcp/127.0.0.1/{pb}) 2>/dev/null && echo blocked-REACHED || echo blocked-ok"
     );
+    let abi = kernel_landlock_abi();
     let exe = seal("/bin/bash");
     let spec = spec_for(&d, &["bash", "-c", &script]);
     match launch(Path::new(HELPER), &exe, &spec, Stdio3::captured()) {
         Ok(running) => {
+            assert!(abi.is_some_and(|v| v >= 4), "the launch succeeded on a kernel with Landlock ABI {abi:?}");
             let (o, out, err) = running.wait_with_output().unwrap();
             let out = String::from_utf8_lossy(&out);
             assert!(o.report.active.iter().any(|a| a == "landlock-net"), "{:?}", o.report);
-            assert!(o.report.landlock_abi.is_some_and(|v| v >= 4), "the real kernel ABI is reported: {:?}", o.report);
+            assert_eq!(o.report.landlock_abi, abi, "the report carries the kernel's real ABI");
             assert!(out.contains("allowed-ok"), "the granted port must work: {out} {}", String::from_utf8_lossy(&err));
             assert!(
                 out.contains("blocked-ok") && !out.contains("blocked-REACHED"),
                 "an ungranted port was reachable: {out}"
             );
         }
-        // A kernel without TCP rules must refuse rather than run the workload unconfined, and must say why.
-        Err(CellError::Refused(r)) if r.landlock_abi.is_none_or(|v| v < 4) => {
-            assert!(r.mandatory_missing.iter().any(|m| m == "landlock-net"), "{r:?}");
-            eprintln!("SKIPPED: kernel Landlock ABI {:?} has no TCP rules", r.landlock_abi);
-        }
         Err(CellError::Refused(r))
             if r.unavailable.iter().any(|u| u.starts_with("mount-ns") || u.starts_with("user-ns")) =>
         {
-            eprintln!("SKIPPED: namespaces unavailable");
+            eprintln!("SKIPPED: namespaces unavailable: {:?}", r.unavailable);
         }
-        Err(e) => panic!("{e}"),
+        // A kernel without TCP rules must refuse rather than run the workload unconfined, and must say why. Any
+        // other refusal on a kernel that has them is exactly the failure this test exists to catch.
+        Err(CellError::Refused(r)) if abi.is_none_or(|v| v < 4) => {
+            assert!(r.mandatory_missing.iter().any(|m| m == "landlock-net"), "{r:?}");
+            assert_eq!(r.landlock_abi, abi, "even a refusal carries the ABI: {r:?}");
+            eprintln!("SKIPPED: kernel Landlock ABI {abi:?} has no TCP rules");
+        }
+        Err(e) => panic!("kernel ABI {abi:?} supports TCP rules but the launch failed: {e}"),
     }
 }
 
@@ -575,6 +613,12 @@ fn the_host_kernel_log_cannot_be_read_from_inside_a_cell() {
     if !Path::new("/usr/bin/perl").exists() {
         eprintln!("SKIPPED: perl is not installed");
         return;
+    }
+    if fs::read_to_string("/proc/sys/kernel/dmesg_restrict").is_ok_and(|v| v.trim() != "0") {
+        eprintln!(
+            "NOTE: kernel.dmesg_restrict is set, so the kernel refuses an unprivileged reader itself; this run cannot \
+             show that the cell's own filter refuses it, only that nothing is readable"
+        );
     }
     // syslog(2) action 3 (READ_ALL) needs no capability when kernel.dmesg_restrict is 0, and the log names other
     // users' processes and paths. The result must be EPERM from the cell's filter, never data.

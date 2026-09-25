@@ -30,7 +30,7 @@ and `RLIMIT_CPU`, `RLIMIT_NOFILE` and a wall-clock timer still apply.
 |---|---|---|
 | `NONE` | New network namespace | Not even loopback is up. Mandatory `net-ns` |
 | `LOOPBACK_ONLY` | New network namespace with `lo` up | Cannot reach the host's loopback. Mandatory `net-ns` |
-| `DESTINATION_ALLOWLIST` | Host network namespace plus Landlock TCP rules | Landlock matches **ports**, not addresses. A `NET_CONNECT:host:port` grants that **port**; the host part is not enforced at IP level. Mandatory `landlock-net` (kernel ABI 4 or later) |
+| `DESTINATION_ALLOWLIST` | Host network namespace plus Landlock TCP rules | Landlock matches **ports**, not addresses, and only **TCP** `connect` and `bind`. A `NET_CONNECT:host:port` grants that TCP **port**; the host part is not enforced at IP level, and UDP, ICMP and other protocols are not restricted at all (a probe sent a datagram to an ungranted UDP port). Mandatory `landlock-net` (kernel ABI 4 or later) |
 | `FULL_USER_NETWORK` | Host network namespace | No network confinement |
 | `MEDIATED_PROXY`, `PRIVILEGED_NETWORK` | Not implemented | The launch is refused, not approximated |
 
@@ -70,6 +70,10 @@ makes the status `Partial`.
 | `/proc` | A new procfs for the new PID namespace |
 | `/tmp`, `/run` | Private tmpfs, `noexec`, size limited |
 | Granted paths | `FS_READ:/p` as a read-only bind at `/p`; `FS_WRITE:/p` as a read-write bind. Nothing else of the host is present |
+
+Grant paths are checked when the specification is decoded (absolute and normalised): a relative or non-normalised one
+never reaches the helper and refuses the launch. A grant of `/` overlaps every place the root could be assembled and
+refuses it with that reason.
 
 Absent: `/home`, `/root`, `/var`, `/sys`, the state directory and every key. **What a cell can see is decided by the
 mount namespace.** Landlock is scoped to what it can express cleanly: it confines *writes* to the granted paths and
@@ -148,9 +152,15 @@ shell shares that terminal, and `TIOCSTI` on a permissive kernel would type into
 terminal is still the workload's standard input if the caller passed it, and it can read and write it; use a null
 standard input for programs that need none.
 
+The price of a new session is **no job control and no terminal signals**. `bash -i` inside a cell reports that it cannot
+set the terminal process group, and Ctrl-C, Ctrl-Z and window-size changes at the operator's terminal no longer reach the
+workload: Ctrl-C ends `jlr`, and the cell then dies with it (`PR_SET_PDEATHSIG`) without a chance to handle `SIGINT`.
+Interactive use of a cell is therefore limited today; forwarding those signals from the launcher is the designed fix.
+
 ## 10. What a workload cannot do
 
-Tested with real cells, and mutation-checked so that removing a control makes a test fail:
+Tested with real cells. The controls listed here were mutation-checked (removing one makes a named test fail), with the
+qualifications stated in the last two bullets:
 
 - see any host path outside its granted binds, including a secret placed in the invoking user's home;
 - write anywhere but `/tmp`, `/dev/shm`, `/run` and granted paths; a write inside the cell never reaches the host;
@@ -165,8 +175,21 @@ Tested with real cells, and mutation-checked so that removing a control makes a 
   (`the_workload_has_no_controlling_terminal_even_when_started_from_one`), type into that terminal
   (`a_terminal_cannot_be_used_to_type_into_the_operators_shell`) or read the host kernel log
   (`the_host_kernel_log_cannot_be_read_from_inside_a_cell`);
-- exceed a destination allow-list: a port that was not granted is unreachable and the granted one works
-  (`the_destination_allow_list_is_enforced_by_landlock_and_reported_as_active`).
+- connect to a TCP port that a destination allow-list did not grant, while the granted port works
+  (`the_destination_allow_list_is_enforced_by_landlock_and_reported_as_active`). **Only TCP.** A workload in this mode can
+  still send UDP anywhere the host can reach; the allow-list is a control on TCP ports, not a network policy.
+
+**What the tests can and cannot tell apart.** Some checks only discriminate on some kernels, and the tests say so when
+they run:
+
+- The terminal test asserts `EPERM` for `TIOCSTI` and four related requests, and for `TIOCSTI` with a high bit set (which a
+  filter comparing 64 bits would miss). Where the kernel would already answer `EPERM` for a process that is not on its
+  controlling terminal (`dev.tty.legacy_tiocsti=1`), the seccomp rule for `TIOCSTI` is not what the test observes; on
+  `legacy_tiocsti=0` it is.
+- The kernel-log test discriminates the `syslog` rule only where `kernel.dmesg_restrict` is `0`. Elsewhere the kernel
+  refuses an unprivileged reader itself, and the test prints a note saying so.
+- The stage-1 and stage-2 descriptor sweeps each mask the other, so the leak test shows the pair works, not each half.
+- Whether `O_CLOEXEC` on the report pipe matters is only visible when two cells are launched at once; no test does that.
 
 ## 11. Escape response
 

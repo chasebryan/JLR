@@ -143,10 +143,13 @@ fn media_pin() -> Option<String> {
             Some(p) => Some(p),
             None => refuse("/etc/jlr/media-id in the initramfs is malformed"),
         },
-        Err(_) => cmdline_flag("jlr.media").map(|v| match parse_pin(&v) {
+        // Only "there is no such file" hands the decision to the command line. A pin file that exists but cannot be
+        // read is a pin that failed to apply, and quietly booting unpinned would be the very thing it exists to stop.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => cmdline_flag("jlr.media").map(|v| match parse_pin(&v) {
             Some(p) => p,
             None => refuse("jlr.media= is malformed"),
         }),
+        Err(e) => refuse(&format!("/etc/jlr/media-id in the initramfs cannot be read: {e}")),
     }
 }
 
@@ -181,9 +184,16 @@ struct Medium {
 fn discover(pin: Option<&str>) -> Vec<Medium> {
     let mut found: Vec<Medium> = Vec::new();
     let mut examined = std::collections::BTreeSet::new();
-    let mut first_found: Option<Instant> = None;
+    let mut listed = std::collections::BTreeSet::new();
+    // Devices appear over a second or two after the kernel starts. Looking stops once one medium is found and no new
+    // device has appeared for a full second, or after five seconds. A device that enumerates later than that is not
+    // seen, which is why real installations pin the medium (docs/BOOT_INSTALLATION.md).
+    let mut last_new_device = Instant::now();
     for _ in 0..50 {
         for name in candidate_devices() {
+            if listed.insert(name.clone()) {
+                last_new_device = Instant::now();
+            }
             if examined.contains(&name) {
                 continue;
             }
@@ -200,6 +210,7 @@ fn discover(pin: Option<&str>) -> Vec<Medium> {
                     continue;
                 }
             }
+            log(&format!("examining {dev} for a /jlr tree"));
             let Some(_fstype) = mount_medium(&dev, false) else { continue };
             if Path::new(&format!("{MEDIA}/jlr")).is_dir() {
                 match media::read_state(Path::new(MEDIA)) {
@@ -215,7 +226,7 @@ fn discover(pin: Option<&str>) -> Vec<Medium> {
             }
             let _ = umount(MEDIA);
         }
-        if !found.is_empty() && first_found.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(500) {
+        if !found.is_empty() && last_new_device.elapsed() >= Duration::from_secs(1) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -280,77 +291,118 @@ fn try_medium(medium: &Medium, floor: u64, anchors: &TrustAnchors) -> Option<Boo
             let _ = umount(MEDIA);
             return None;
         };
-        // The try is spent durably BEFORE the slot is used: a crash from here on falls back next boot. A proven
-        // slot spends nothing, so a read-only medium can still boot it.
-        if choice.next != state {
-            if let Err(e) = persist(&choice.next, &mut writable) {
-                log(&format!("slot={} skipped: cannot record the boot attempt on {dev}: {e}", choice.slot));
+        let (_, m, mb) = verified.iter().find(|(n, _, _)| *n == choice.slot).cloned().expect("chosen slot is verified");
+        log(&format!("trying slot={} epoch={}", choice.slot, m.epoch));
+        let image_path = format!("{MEDIA}/jlr/slot-{}/base.sqfs", choice.slot);
+
+        // The image is read and verified BEFORE a try is spent. A try exists to make a crash while the slot is *in
+        // use* fall back next boot; reading the image is not use, and spending tries on read errors would strand an
+        // unproven update after three USB hiccups.
+        let sink = match load_image(&image_path, &m) {
+            Ok(sink) => sink,
+            Err(LoadFailure::Transient(why)) => {
+                log(&format!("slot={} skipped for this boot: {why}", choice.slot));
+                log(&format!("slot={} is not retired: the failure is not proof that its content is bad", choice.slot));
                 verified.retain(|(n, _, _)| *n != choice.slot);
                 continue;
             }
-            state = choice.next;
-        }
-        let (_, m, mb) = verified.iter().find(|(n, _, _)| *n == choice.slot).cloned().expect("chosen slot is verified");
-        log(&format!("selected slot={} epoch={}", choice.slot, m.epoch));
-
-        let image_path = format!("{MEDIA}/jlr/slot-{}/base.sqfs", choice.slot);
-        let mut sink = match memfd_create("jlr-base", MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING) {
-            Ok(fd) => File::from(fd),
-            Err(e) => {
-                // Not evidence about the slot: nothing is retired, the slot is only skipped for this boot.
-                log(&format!("slot={} skipped: cannot allocate RAM for the base image: {e}", choice.slot));
+            Err(LoadFailure::ProvenBad(e)) => {
+                log(&format!("slot={} REFUSED image: {e}", choice.slot));
+                state.record_image_failure(&choice.slot, &e);
+                if let Err(w) = persist(&state, &mut writable) {
+                    log(&format!("could not record that slot {} is bad: {w}", choice.slot));
+                }
                 verified.retain(|(n, _, _)| *n != choice.slot);
                 continue;
             }
         };
-        let result = File::open(&image_path)
-            .map_err(|e| BootError::Io(format!("{image_path}: {e}")))
-            .and_then(|mut src| verify_image(&m, &mut src, &mut sink));
-        match result {
-            Ok(n) => {
-                log(&format!(
-                    "image verified slot={} bytes={n} sha256={} (now resident in RAM)",
-                    choice.slot,
-                    m.image_digest.hex()
-                ));
-                if let Err(e) = fcntl(
-                    &sink,
-                    FcntlArg::F_ADD_SEALS(
-                        SealFlag::F_SEAL_SEAL
-                            | SealFlag::F_SEAL_SHRINK
-                            | SealFlag::F_SEAL_GROW
-                            | SealFlag::F_SEAL_WRITE,
-                    ),
-                ) {
-                    refuse(&format!("cannot seal the RAM image: {e}"));
-                }
-                return Some(Booted {
-                    slot: choice.slot,
-                    manifest: m,
-                    manifest_bytes: mb,
-                    image: sink,
-                    dev: medium.dev.clone(),
-                    fstype,
-                });
-            }
-            Err(e) => {
-                log(&format!("slot={} REFUSED image: {e}", choice.slot));
-                // Only proof that the content is bad retires the slot for good; an I/O error or memory
-                // exhaustion must not, or one USB hiccup would strand a machine whose slots are fine.
-                if state.record_image_failure(&choice.slot, &e) {
-                    if let Err(w) = persist(&state, &mut writable) {
-                        log(&format!("could not record that slot {} is bad: {w}", choice.slot));
-                    }
-                } else {
-                    log(&format!(
-                        "slot={} is not retired: the failure is not proof that its content is bad",
-                        choice.slot
-                    ));
-                }
-                verified.retain(|(n, _, _)| *n != choice.slot);
-                // The memfd is dropped here, discarding the unverified bytes.
-            }
+        log(&format!(
+            "image verified slot={} bytes={} sha256={} (now resident in RAM)",
+            choice.slot,
+            m.image_size,
+            m.image_digest.hex()
+        ));
+
+        // The try is spent durably BEFORE the slot is used (sealed, mounted, run): a crash from here on falls back
+        // next boot. A proven slot spends nothing, so a read-only medium can still boot it.
+        if choice.next != state
+            && let Err(e) = persist(&choice.next, &mut writable)
+        {
+            log(&format!("slot={} skipped: cannot record the boot attempt on {dev}: {e}", choice.slot));
+            verified.retain(|(n, _, _)| *n != choice.slot);
+            continue;
         }
+        log(&format!("selected slot={} epoch={}", choice.slot, m.epoch));
+        if let Err(e) = fcntl(
+            &sink,
+            FcntlArg::F_ADD_SEALS(
+                SealFlag::F_SEAL_SEAL | SealFlag::F_SEAL_SHRINK | SealFlag::F_SEAL_GROW | SealFlag::F_SEAL_WRITE,
+            ),
+        ) {
+            refuse(&format!("cannot seal the RAM image: {e}"));
+        }
+        return Some(Booted {
+            slot: choice.slot,
+            manifest: m,
+            manifest_bytes: mb,
+            image: sink,
+            dev: medium.dev.clone(),
+            fstype,
+        });
+    }
+}
+
+/// Why an image could not be loaded.
+enum LoadFailure {
+    /// Nothing proves the content is bad: an I/O error, no memory, or reads that disagreed with each other.
+    Transient(String),
+    /// Two reads returned the same wrong bytes: the content is bad, on every boot.
+    ProvenBad(BootError),
+}
+
+/// Reads the image at `path` into a fresh RAM file, hashing while it copies.
+fn read_image(path: &str, m: &ReleaseManifest) -> Result<File, LoadFailure> {
+    let mut sink = match memfd_create("jlr-base", MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING) {
+        Ok(fd) => File::from(fd),
+        Err(e) => return Err(LoadFailure::Transient(format!("cannot allocate RAM for the base image: {e}"))),
+    };
+    let mut src = File::open(path).map_err(|e| LoadFailure::Transient(format!("{path}: {e}")))?;
+    match verify_image(m, &mut src, &mut sink) {
+        Ok(_) => Ok(sink),
+        Err(e) if e.proves_bad_content() => Err(LoadFailure::ProvenBad(e)),
+        Err(e) => Err(LoadFailure::Transient(e.to_string())),
+    }
+}
+
+/// Loads and verifies a slot's image. A mismatch is confirmed by reading once more: flaky media (a bad cable, a dying
+/// stick) can return wrong bytes without any error, and retiring a proven slot for that would strand the machine.
+/// Only the same wrong answer twice is proof; a second read that verifies is used, and one that answers differently
+/// is treated as unreliable media, not as a bad image.
+fn load_image(path: &str, m: &ReleaseManifest) -> Result<File, LoadFailure> {
+    let first = match read_image(path, m) {
+        Err(LoadFailure::ProvenBad(e)) => e,
+        other => return other,
+    };
+    log(&format!("image mismatch ({first}); reading the image once more to confirm"));
+    match read_image(path, m) {
+        Ok(sink) => {
+            log("the second read verified: the first returned different bytes, so this medium is unreliable");
+            Ok(sink)
+        }
+        Err(LoadFailure::ProvenBad(second)) if same_mismatch(&first, &second) => Err(LoadFailure::ProvenBad(first)),
+        Err(LoadFailure::ProvenBad(second)) => Err(LoadFailure::Transient(format!(
+            "two reads of the image disagreed with each other ({first}; {second}): the medium is unreliable"
+        ))),
+        Err(other) => Err(other),
+    }
+}
+
+/// Whether two verification failures are the same wrong answer.
+fn same_mismatch(a: &BootError, b: &BootError) -> bool {
+    match (a, b) {
+        (BootError::ImageDigest { actual: x, .. }, BootError::ImageDigest { actual: y, .. }) => x == y,
+        (BootError::ImageSize { actual: x, .. }, BootError::ImageSize { actual: y, .. }) => x == y,
+        _ => false,
     }
 }
 

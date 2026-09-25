@@ -84,6 +84,9 @@ pub struct Measured {
     pub mtime: i64,
     /// The first bytes of the file, for classification.
     pub head: Vec<u8>,
+    /// MD5 of the same bytes, computed in the same pass as `digest` so that one stamp check covers both. Only
+    /// present when the caller asked for it (dpkg's manifests are MD5, and are compared, not trusted).
+    pub md5_hex: Option<String>,
 }
 
 /// Errors from measurement.
@@ -128,12 +131,22 @@ pub const HEAD_LEN: usize = 64;
 /// before and after reading; a size or mtime change is reported rather than
 /// producing a digest of a moving target.
 pub fn measure_file(file: &mut File, max_size: u64) -> Result<Measured, MeasureError> {
-    measure_file_with(file, max_size, &mut || {})
+    measure_inner(file, max_size, &mut || {}, false)
 }
 
 /// [`measure_file`] with a hook that runs after the last byte is read and before the file's state is
 /// checked again. Tests use it to change the file at the worst possible moment.
+#[cfg(test)]
 fn measure_file_with(file: &mut File, max_size: u64, after_read: &mut dyn FnMut()) -> Result<Measured, MeasureError> {
+    measure_inner(file, max_size, after_read, false)
+}
+
+fn measure_inner(
+    file: &mut File,
+    max_size: u64,
+    after_read: &mut dyn FnMut(),
+    want_md5: bool,
+) -> Result<Measured, MeasureError> {
     let before = file.metadata()?;
     if !before.file_type().is_file() {
         return Err(MeasureError::NotRegular);
@@ -144,6 +157,7 @@ fn measure_file_with(file: &mut File, max_size: u64, after_read: &mut dyn FnMut(
     }
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
+    let mut md5 = want_md5.then(md5::Md5::new);
     let mut buf = vec![0u8; 64 * 1024];
     let mut head = Vec::with_capacity(HEAD_LEN);
     let mut total = 0u64;
@@ -161,6 +175,9 @@ fn measure_file_with(file: &mut File, max_size: u64, after_read: &mut dyn FnMut(
             return Err(MeasureError::TooLarge(total));
         }
         hasher.update(&buf[..n]);
+        if let Some(m) = md5.as_mut() {
+            m.update(&buf[..n]);
+        }
     }
     after_read();
     let after = file.metadata()?;
@@ -181,17 +198,34 @@ fn measure_file_with(file: &mut File, max_size: u64, after_read: &mut dyn FnMut(
         ino: before.ino(),
         mtime: before.mtime(),
         head,
+        md5_hex: md5.map(|m| m.finalize().iter().map(|b| format!("{b:02x}")).collect()),
     })
 }
 
-/// Like [`measure_file`], retrying a few times when the file changes underneath the read.
+/// Files up to this size get a second attempt when they change underneath the read. Larger files get one: the retry
+/// re-reads everything, and an owner who keeps touching a big file must not be able to multiply the gate's work.
+const RETRY_UP_TO: u64 = 16 * 1024 * 1024;
+
+/// Like [`measure_file`], retrying once when a small file changes underneath the read.
 ///
 /// A file that keeps changing is reported as [`MeasureError::ChangedWhileReading`]; the caller
 /// must treat that as "not measurable", never as "fine".
 pub fn measure_file_stable(file: &mut File, max_size: u64) -> Result<Measured, MeasureError> {
+    measure_file_stable_with(file, max_size, false, &mut |_| {})
+}
+
+/// [`measure_file_stable`], optionally also computing MD5 in the same pass, with a hook that receives the attempt
+/// number after each attempt's last byte is read. Tests use the hook to change the file at the worst moment.
+pub(crate) fn measure_file_stable_with(
+    file: &mut File,
+    max_size: u64,
+    want_md5: bool,
+    between: &mut dyn FnMut(usize),
+) -> Result<Measured, MeasureError> {
+    let attempts = if file.metadata().map(|m| m.len()).unwrap_or(u64::MAX) <= RETRY_UP_TO { 2 } else { 1 };
     let mut last = MeasureError::ChangedWhileReading;
-    for _ in 0..3 {
-        match measure_file(file, max_size) {
+    for attempt in 0..attempts {
+        match measure_inner(file, max_size, &mut || between(attempt), want_md5) {
             Err(MeasureError::ChangedWhileReading) => last = MeasureError::ChangedWhileReading,
             other => return other,
         }
@@ -204,6 +238,11 @@ pub fn measure_file_stable(file: &mut File, max_size: u64) -> Result<Measured, M
 /// The returned [`File`] is the very descriptor that was hashed; execute or
 /// map that descriptor, not the path.
 pub fn open_measured(path: &Path, max_size: u64) -> Result<(File, Measured), MeasureError> {
+    open_measured_with(path, max_size, false)
+}
+
+/// [`open_measured`], optionally computing MD5 in the same pass as the SHA-256.
+pub(crate) fn open_measured_with(path: &Path, max_size: u64, want_md5: bool) -> Result<(File, Measured), MeasureError> {
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -213,7 +252,7 @@ pub fn open_measured(path: &Path, max_size: u64) -> Result<(File, Measured), Mea
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(MeasureError::Symlink),
         Err(e) => return Err(e.into()),
     };
-    let m = measure_file_stable(&mut file, max_size)?;
+    let m = measure_file_stable_with(&mut file, max_size, want_md5, &mut |_| {})?;
     Ok((file, m))
 }
 

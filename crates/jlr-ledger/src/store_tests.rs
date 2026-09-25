@@ -433,19 +433,100 @@ fn a_torn_checkpoint_tail_is_quarantined_and_does_not_brick_the_ledger() {
     assert!(Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).is_ok());
 }
 
+/// A sink that accepts `limit` bytes and then fails, as a full disk or a quota does part-way through a frame.
+struct Failing {
+    data: Vec<u8>,
+    limit: usize,
+    truncate_fails: bool,
+}
+
+impl crate::store::FrameSink for Failing {
+    fn len(&mut self) -> std::io::Result<u64> {
+        Ok(self.data.len() as u64)
+    }
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let room = self.limit.saturating_sub(self.data.len());
+        let n = room.min(bytes.len());
+        self.data.extend_from_slice(&bytes[..n]);
+        if n < bytes.len() { Err(std::io::Error::other("no space left on device")) } else { Ok(()) }
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        if self.truncate_fails {
+            return Err(std::io::Error::other("input/output error"));
+        }
+        self.data.truncate(len as usize);
+        Ok(())
+    }
+}
+
 #[test]
 fn a_failed_append_leaves_no_bytes_behind() {
-    use std::io::{Seek, SeekFrom, Write};
+    use crate::store::{AppendError, append_frame};
+    // Room for 6 of the 9 bytes: a genuine partial write, not a write that fails before writing anything.
+    let mut sink = Failing { data: b"good".to_vec(), limit: 4 + 6, truncate_fails: false };
+    let r = append_frame(&mut sink, b"123456789", false);
+    assert!(matches!(r, Err(AppendError::Failed(_))), "{r:?}");
+    assert_eq!(sink.data, b"good", "the six bytes that were written must be taken back");
+
+    // A frame that fits is written whole.
+    let mut sink = Failing { data: b"good".to_vec(), limit: 100, truncate_fails: false };
+    append_frame(&mut sink, b"+more", true).unwrap();
+    assert_eq!(sink.data, b"good+more");
+
+    // A real file: the same guarantee through the production implementation.
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("f");
     let mut file = fs::OpenOptions::new().create(true).append(true).read(true).open(&f).unwrap();
-    file.write_all(b"good").unwrap();
-    // Read-only clone cannot write: simulate the failure by writing through a closed-for-write handle.
-    let mut ro = fs::OpenOptions::new().read(true).open(&f).unwrap();
-    assert!(crate::store::append_frame(&mut ro, b"bad", false).is_err());
-    ro.seek(SeekFrom::Start(0)).unwrap();
-    assert_eq!(fs::read(&f).unwrap(), b"good");
-    // A successful append still works and is durable when asked.
-    crate::store::append_frame(&mut file, b"+more", true).unwrap();
+    append_frame(&mut file, b"good", true).unwrap();
+    append_frame(&mut file, b"+more", true).unwrap();
     assert_eq!(fs::read(&f).unwrap(), b"good+more");
+}
+
+#[test]
+fn a_write_that_cannot_be_rolled_back_is_reported_so_the_ledger_can_stop() {
+    use crate::store::{AppendError, append_frame};
+    let mut sink = Failing { data: b"good".to_vec(), limit: 4 + 3, truncate_fails: true };
+    let r = append_frame(&mut sink, b"123456789", false);
+    assert!(matches!(r, Err(AppendError::RollbackFailed { .. })), "{r:?}");
+    assert_eq!(sink.data, b"good123", "the leftover is exactly what a failed rollback leaves behind");
+}
+
+#[test]
+fn a_reader_that_takes_no_lock_never_sees_a_checkpoint_the_events_do_not_cover() {
+    // `jlr ledger verify` runs beside the daemon. A checkpoint written between reading the events and reading the
+    // checkpoints used to be reported as a truncated ledger.
+    let dir = tempfile::tempdir().unwrap();
+    let mut l = Ledger::create(&path(&dir), NODE, key(), BOOT).unwrap();
+    l.set_sync(false); // fast enough that a checkpoint lands in the reader's window often
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d = path(&dir);
+    let reader_stop = stop.clone();
+    let reader = std::thread::spawn(move || {
+        let (mut ok, mut bad) = (0u32, Vec::new());
+        while !reader_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            match verify_dir(&d, NODE, &anchors(), None) {
+                Ok(_) => ok += 1,
+                Err(e) => bad.push(e.to_string()),
+            }
+        }
+        (ok, bad)
+    });
+    for i in 0..3000 {
+        l.append(EventDraft::new("test", EventKind::Discover, &format!("event {i}"))).unwrap();
+        if i % 2 == 0 {
+            l.checkpoint().unwrap();
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (ok, bad) = reader.join().unwrap();
+    assert!(ok > 0, "the reader never completed a verification");
+    assert!(
+        bad.is_empty(),
+        "verification beside a live writer failed {} times: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(3)]
+    );
 }

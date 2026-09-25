@@ -83,6 +83,9 @@ cp "$OUT/anchors.cbor" "$I/etc/jlr/anchors.cbor"
 # Optional: pin the initramfs to one boot medium (ext4 UUID or FAT volume serial). A pinned initramfs never
 # mounts any other disk. Example: JLR_MEDIA_ID=6f1b2c3d-0000-4444-8888-123456789abc boot/build.sh
 if [ -n "${JLR_MEDIA_ID:-}" ]; then
+  case "$JLR_MEDIA_ID" in
+    *[!0-9A-Fa-f-]*|"") echo "build.sh: JLR_MEDIA_ID must be an ext4 UUID or FAT volume serial (hex digits and hyphens)" >&2; exit 3 ;;
+  esac
   printf 'uuid=%s\n' "$JLR_MEDIA_ID" > "$I/etc/jlr/media-id"
 fi
 find "$I" -exec touch -h -d @"$SOURCE_DATE_EPOCH" {} +

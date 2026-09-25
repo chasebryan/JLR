@@ -134,6 +134,18 @@ pub struct RunResult {
     pub stdout: Vec<u8>,
     /// Captured standard error, when requested.
     pub stderr: Vec<u8>,
+    /// Set when the program ran but its end could not be recorded in the ledger (the ledger stayed locked, the
+    /// disk was full). The program's result is still returned; this says the record is incomplete.
+    pub record_error: Option<String>,
+}
+
+/// What adding a revocation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokeReport {
+    /// Known artifacts moved to `REVOKED`.
+    pub moved: usize,
+    /// Known artifacts that could not be checked against the new entry because their records are missing.
+    pub unchecked: usize,
 }
 
 /// A read-only explanation of what the engine thinks of one file.
@@ -314,13 +326,25 @@ impl Engine {
     /// Long-lived programs (the daemon) never hold the engine for long, so a
     /// short wait lets the command line and the daemon share one state directory.
     pub fn open_wait(paths: Paths, cfg: Config, timeout: std::time::Duration) -> Result<Engine, EngineError> {
+        Engine::open_wait_timed(paths, cfg, timeout).map(|(e, _)| e)
+    }
+
+    /// Like [`Engine::open_wait`], and also returns how long the attempt that succeeded took, which is the work of
+    /// opening (replaying the ledger) without the time spent waiting for someone else's lock. The daemon charges
+    /// users for the former and not the latter.
+    pub fn open_wait_timed(
+        paths: Paths,
+        cfg: Config,
+        timeout: std::time::Duration,
+    ) -> Result<(Engine, std::time::Duration), EngineError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            let started = std::time::Instant::now();
             match Engine::open(paths.clone(), cfg.clone()) {
                 Err(EngineError::Ledger(jlr_ledger::LedgerError::Locked)) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(15));
                 }
-                other => return other,
+                other => return other.map(|e| (e, started.elapsed())),
             }
         }
     }
@@ -348,7 +372,7 @@ impl Engine {
         .map_err(|e| EngineError::Verification(format!("policy: {e}")))?;
         let policy =
             Policy::from_cbor(&v.payload).map_err(|e| EngineError::Verification(format!("policy payload: {e}")))?;
-        policy.validate().map_err(|e| EngineError::Verification(e.to_string()))?;
+        policy.validate_loaded().map_err(|e| EngineError::Verification(e.to_string()))?;
 
         let rev_env = std::fs::read(paths.revocations())?;
         let v = Envelope::verify(
@@ -445,6 +469,19 @@ impl Engine {
             }
         }
 
+        if report.checkpoint_torn_bytes > 0 {
+            // The newest checkpoints, the anti-rollback anchors, may be gone. That is worth a signed trace.
+            let mut d = EventDraft::new(
+                "jlr-engine",
+                EventKind::Degraded,
+                &format!(
+                    "recovered an incomplete checkpoint record of {} bytes; the newest checkpoints may be missing; kept in a quarantine file",
+                    report.checkpoint_torn_bytes
+                ),
+            );
+            d.policy = policy.digest();
+            ledger.append(d)?;
+        }
         if report.torn_tail_bytes > 0 {
             let mut d = EventDraft::new(
                 "jlr-engine",
@@ -533,7 +570,7 @@ impl Engine {
             states,
             index,
             checkpoints: report.checkpoints,
-            torn_tail_bytes: report.torn_tail_bytes,
+            torn_tail_bytes: report.torn_tail_bytes + report.checkpoint_torn_bytes,
         })
     }
 
@@ -759,8 +796,13 @@ impl Engine {
             degraded_prior = degraded;
         }
         let is_new = self.store_record(&seen.record)?;
-        let ev = self.store_evidence(&seen.evidence)?;
         let known = self.states.contains_key(&id);
+        let decision = self.evaluate_now(&seen.record, &seen.evidence, requested);
+        // Evidence is stored (as an object, named by its digest, and it carries the time it was collected) only
+        // when an event is going to cite it. Storing it on every repeat decision made an unchanged file leak one
+        // orphan object per decision.
+        let cited = is_new || !known || self.states.get(&id).copied() != Some(decision.state);
+        let ev = if cited { self.store_evidence(&seen.evidence)? } else { Digest::ZERO };
         if is_new || !known {
             self.log(
                 EventKind::Discover,
@@ -772,7 +814,6 @@ impl Engine {
                 &format!("{} {} at {}", seen.record.class, seen.record.name, seen.path),
             )?;
         }
-        let decision = self.evaluate_now(&seen.record, &seen.evidence, requested);
         transitions += self.apply_decision(&id, &decision, ev, &format!("{} at {}", seen.record.name, seen.path))?;
         // A row may be reused only while the evidence and every authority it relied on are still valid.
         let now = self.now();
@@ -956,7 +997,13 @@ impl Engine {
         decision: &Decision,
     ) -> Result<(), EngineError> {
         let reasons: Vec<String> = decision.reasons.iter().map(ToString::to_string).collect();
-        let detail = format!("exec gate: {verdict} {path}: state {} [{}]", decision.state, reasons.join(","));
+        // The path is the attacker's; bounding it on its own keeps the decision that follows it in the record.
+        let detail = format!(
+            "exec gate: {verdict} {}: state {} [{}]",
+            jlr_model::sanitize_to(path, 300),
+            decision.state,
+            reasons.join(",")
+        );
         self.log(EventKind::Enforcement, id, None, None, vec![], Basis::Policy, &detail)?;
         self.flush()
     }
@@ -1022,10 +1069,15 @@ impl Engine {
         let bytes = baseline.sign(&self.node.node_id, &key);
         let verified = Baseline::verify(&bytes, &self.node.node_id, &self.anchors)
             .map_err(|e| EngineError::Verification(e.to_string()))?;
-        write_atomic(&self.paths.baselines().join(format!("{name}.cose")), &bytes)?;
+        // The new file gets a name of its own (subject and a prefix of its digest), so writing it never overwrites
+        // the file the ledger currently records. The ledger event that makes it current comes next, and only then
+        // are older files removed: a crash or a full disk in between leaves the old authority intact.
+        let file = format!("{name}.{}.cose", &Digest::of(&bytes).hex()[..16]);
+        write_atomic(&self.paths.baselines().join(&file), &bytes)?;
+        let previous = self.baselines.clone();
         self.baselines.retain(|(n, _)| n != name);
         self.baselines.push((name.to_owned(), verified));
-        self.log_subject(
+        if let Err(e) = self.log_subject(
             EventKind::Override,
             Some(format!("baseline:{name}")),
             None,
@@ -1033,7 +1085,12 @@ impl Engine {
             vec![Digest::of(&bytes)],
             Basis::ManualOverride,
             &format!("baseline {name} enrolled by {granted_by}: {count} members"),
-        )?;
+        ) {
+            self.baselines = previous;
+            let _ = std::fs::remove_file(self.paths.baselines().join(&file));
+            return Err(e);
+        }
+        remove_superseded(&self.paths.baselines(), &format!("{name}."), &file);
 
         self.ledger.set_sync(false);
         let mut fail = None;
@@ -1185,7 +1242,14 @@ impl Engine {
         let outcome = execute_prepared(&self.cfg.helper, &prepared, capture);
         self.record_run(&prepared, &outcome.as_ref().map(|(o, _, _)| o.clone()).map_err(ToString::to_string))?;
         let (o, stdout, stderr) = outcome?;
-        Ok(RunResult { decision: prepared.decision, report: o.report, exit_code: o.code, stdout, stderr })
+        Ok(RunResult {
+            decision: prepared.decision,
+            report: o.report,
+            exit_code: o.code,
+            stdout,
+            stderr,
+            record_error: None,
+        })
     }
 
     /// Like [`Engine::run`], but the ledger is **released while the program runs**.
@@ -1207,10 +1271,21 @@ impl Engine {
         let prepared = engine.prepare_run(path, args, env, requested)?;
         drop(engine); // the lock is released here
         let outcome = execute_prepared(&cfg.helper, &prepared, capture);
-        let mut engine = Engine::open_wait(paths, cfg, wait)?;
-        engine.record_run(&prepared, &outcome.as_ref().map(|(o, _, _)| o.clone()).map_err(ToString::to_string))?;
+        // The program has already run, with whatever effects it had. If its end cannot be recorded (the ledger
+        // stayed locked, the disk is full) the caller must still get its exit status and output, with a note
+        // that the record is incomplete, not an error that hides them.
+        let recorded = Engine::open_wait(paths, cfg, wait).and_then(|mut engine| {
+            engine.record_run(&prepared, &outcome.as_ref().map(|(o, _, _)| o.clone()).map_err(ToString::to_string))
+        });
         let (o, stdout, stderr) = outcome?;
-        Ok(RunResult { decision: prepared.decision, report: o.report, exit_code: o.code, stdout, stderr })
+        Ok(RunResult {
+            decision: prepared.decision,
+            report: o.report,
+            exit_code: o.code,
+            stdout,
+            stderr,
+            record_error: recorded.err().map(|e| e.to_string()),
+        })
     }
 
     /// Records an operator approval for a known artifact and applies it.
@@ -1243,9 +1318,11 @@ impl Engine {
         let bytes = approval.sign(&self.node.node_id, &key);
         let verified = Approval::verify(&bytes, &self.node.node_id, &self.anchors)
             .map_err(|e| EngineError::Verification(e.to_string()))?;
-        write_atomic(&self.paths.approvals().join(format!("{}.cose", id.digest.hex())), &bytes)?;
-        self.approvals.insert(id, verified);
-        self.log(
+        // See `enroll_baseline`: a file of its own, then the ledger event, then removal of what it supersedes.
+        let file = format!("{}.{}.cose", id.digest.hex(), &Digest::of(&bytes).hex()[..16]);
+        write_atomic(&self.paths.approvals().join(&file), &bytes)?;
+        let previous = self.approvals.insert(id, verified);
+        if let Err(e) = self.log(
             EventKind::Override,
             Some(&id),
             None,
@@ -1253,7 +1330,15 @@ impl Engine {
             vec![Digest::of(&bytes)],
             Basis::ManualOverride,
             &format!("operator {granted_by} approved {} cell={cell} network={network}", record.name),
-        )?;
+        ) {
+            match previous {
+                Some(p) => self.approvals.insert(id, p),
+                None => self.approvals.remove(&id),
+            };
+            let _ = std::fs::remove_file(self.paths.approvals().join(&file));
+            return Err(e);
+        }
+        remove_superseded(&self.paths.approvals(), &format!("{}.", id.digest.hex()), &file);
         // Re-evaluate with the evidence that is true now.
         let path = self.index.values().find(|r| r.epn == id.to_string()).map(|r| PathBuf::from(&r.path));
         let decision = match path {
@@ -1275,6 +1360,17 @@ impl Engine {
 
     /// Adds a revocation, signs the new list and applies it to known artifacts.
     pub fn revoke(&mut self, kind: RevocationKind, target: &str, reason: &str) -> Result<usize, EngineError> {
+        self.revoke_report(kind, target, reason).map(|r| r.moved)
+    }
+
+    /// Like [`Engine::revoke`], and also says how many known artifacts could not be checked because their records
+    /// are missing from the object store, so "nothing matched" is never reported when nothing could be checked.
+    pub fn revoke_report(
+        &mut self,
+        kind: RevocationKind,
+        target: &str,
+        reason: &str,
+    ) -> Result<RevokeReport, EngineError> {
         // A revocation that names something no artifact can ever match would be signed, ledgered and reported as
         // done while protecting nothing, so the target is validated and put in the one form the matcher compares.
         let target = normalize_revocation_target(kind, target)?;
@@ -1313,7 +1409,24 @@ impl Engine {
         let mut unchecked = 0usize;
         for id in ids {
             let Some(record) = self.load_record(&id) else {
-                unchecked += 1;
+                // An EPN revocation names the identifier itself, which is known without the record, so the
+                // artifact is revoked even when the object store lost it. Other kinds need the record's fields.
+                if kind == RevocationKind::Epn && id.to_string() == target {
+                    let d = Decision {
+                        state: AdmissionState::Revoked,
+                        cell: CellClass::Cell0,
+                        network: NetworkMode::None,
+                        capabilities: vec![],
+                        reasons: vec![ReasonCode::Revoked],
+                        basis: Basis::Policy,
+                        needs_user: None,
+                        policy: self.policy.digest(),
+                    };
+                    let ev = self.store_evidence(&[])?;
+                    n += self.apply_decision(&id, &d, ev, &format!("revoked: {reason}"))?;
+                } else {
+                    unchecked += 1;
+                }
                 continue;
             };
             if self.revocations.hit(&record).is_some() {
@@ -1335,7 +1448,7 @@ impl Engine {
             )?;
         }
         self.flush()?;
-        Ok(n)
+        Ok(RevokeReport { moved: n, unchecked })
     }
 
     /// Installs a new signed policy. The epoch must be strictly greater than the current one.
@@ -1514,6 +1627,19 @@ pub fn list_artifacts(roots: &[PathBuf], opts: &ScanOptions) -> Result<Vec<PathB
         all.extend(walk(root, &wo)?);
     }
     Ok(all)
+}
+
+/// Removes the signed files in `dir` whose names start with `prefix`, except `keep`. Best effort: a file that cannot
+/// be removed is harmless, because only the file the ledger names is honoured, and it is reported once when read.
+fn remove_superseded(dir: &Path, prefix: &str, keep: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) && name.ends_with(".cose") && name != keep {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {

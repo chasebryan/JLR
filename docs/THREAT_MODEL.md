@@ -62,12 +62,13 @@ provides evidence, not repair.
 *Can:* write the boot medium (a removable stick, a shared disk) but does not hold the release key.
 *JLR today:* cannot boot a chosen image (manifest signature, role and image digest are checked before use), cannot make the
 machine run a validly signed **older** release once the floor has risen while any medium that recorded the raised floor is
-attached (the highest floor on any attached medium applies) or at all when the initramfs is pinned to the real medium, and
-cannot cause anything from the media to run after a refusal. A read error or a damaged state file stops the boot; it never
+attached and seen in time (the highest floor on any attached medium applies), and cannot cause anything from the media to
+run after a refusal. Pinning the initramfs to the real medium's identifier keeps other disks from being considered at all,
+but the identifier is copyable, so a cloned identifier with the real medium absent is the same residual risk as unpinned. A read error or a damaged state file stops the boot; it never
 reads as "fresh" and never resets the floor, and only proof that an image is bad (digest or size) retires a slot.
 *Remains:* replace the initramfs (and with it the anchors), lower the floor and the boot state on every attached medium at
-once, offer an older release when the real medium is absent and the initramfs is unpinned, or deny service (a state file
-with a very high floor, or a damaged one). The first three need the authenticated-boot milestone or the TPM counter.
+once (or on the pinned one), offer an older release when the real medium is absent and either the initramfs is unpinned or
+the pinned identifier is cloned, or deny service (a state file with a very high floor, or a damaged one). The first three need the authenticated-boot milestone or the TPM counter.
 
 ### A8 - Local co-tenant and workload in a cell (added)
 
@@ -136,8 +137,8 @@ Every case must have a test or an explicit gap.
 | 19 | A stale cached verdict outliving a policy change | The daemon clears its cache on signed-state changes and expires verdicts by age; the QEMU audit-to-enforce flip |
 | 20 | An unverified image reaching the mount | Image hashed while copied into RAM; refusal scenarios; nothing runs after a refusal |
 | 21 | A user makes measurement fail (pad a file past the limit, touch it in a loop, use a FIFO) to slip past the gate | Unmeasurable files are decisions and are denied when enforcing (`a_file_that_cannot_be_measured_is_a_denial_not_an_internal_error`); QEMU `enforce unmeasurable: BLOCKED` |
-| 22 | A file system mounted after the gate started | QEMU `late mount stranger: BLOCKED`. **Gap:** mounts in another mount namespace (limitation 5 in SECURITY_BOUNDARIES) |
-| 23 | An unprivileged user floods the gate with new executables to stall everyone or grow governance state | Per-user slow-path budget; bounded caches; a repeat exec of an unchanged file writes nothing (`a_repeat_exec_decision_for_an_unchanged_file_writes_nothing`); O(1) prefix roots in the ledger. **Gap:** the gate is one thread, and root is not throttled |
+| 22 | A file system mounted after the gate started, including one that reuses a device number or has an unusual mount-point name | QEMU: `late mount stranger`, `remounted stranger`, `odd name stranger` all `BLOCKED`. **Gap:** mounts in another mount namespace (limitation 5 in SECURITY_BOUNDARIES) |
+| 23 | An unprivileged user floods the gate with new executables to stall everyone or grow governance state | Per-user slow-path budget plus a cap on all unprivileged users together (so subordinate ids do not multiply it), charged only for work and not for lock waits; a throttled user leaves a summary event; bounded caches; a repeat exec of an unchanged file writes neither events, index nor evidence objects (`a_repeat_exec_decision_for_an_unchanged_file_writes_nothing`); O(1) prefix roots in the ledger. **Gaps:** the gate is one thread, root is not throttled, and each *unique* unknown executable still costs an engine open (on the order of 100 ms at 6,000 events (a one-off measurement, not a benchmark)) and adds an evidence object and events; growth is rate-bounded per user, not capped |
 | 24 | Hostile file, policy or revocation text forges terminal or ledger lines, or moves the policy epoch floor | `sanitize` on every printed and logged attacker-influenced string; policy and tier names are a plain alphabet; the epoch floor is parsed from fixed fields (`the_policy_epoch_floor_ignores_prose_an_author_controls`, `attacker_chosen_names_cannot_inject_control_characters_into_the_ledger`) |
 | 25 | A cell workload types into the operator's terminal, uses a leaked descriptor, or reads the host kernel log | Cell tests for each, mutation-checked |
 | 26 | A second attached disk offers an older release or shadows the real medium | QEMU: `a_second_disk_with_an_older_release_cannot_downgrade_the_machine`, `a_pinned_boot_never_uses_or_mounts_another_disk` |

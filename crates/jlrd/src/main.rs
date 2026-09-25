@@ -129,7 +129,28 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-/// Real file systems to mark, one path per distinct device.
+/// Decodes the octal escapes `/proc/self/mountinfo` uses for a space (`\040`), tab (`\011`), newline (`\012`) and
+/// backslash (`\134`) in a mount point. Decoding only the space would leave a file system mounted at any other
+/// name unmarked, and unmarked means ungated.
+fn unescape_mountinfo(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let v = u32::from(b[i + 1] - b'0') * 64 + u32::from(b[i + 2] - b'0') * 8 + u32::from(b[i + 3] - b'0');
+            out.push((v & 0xff) as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+
+/// Real file systems to mark, one path per distinct device in the current mount table.
 fn discover_marks() -> Vec<PathBuf> {
     let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let mut seen: HashSet<u64> = HashSet::new();
@@ -140,11 +161,18 @@ fn discover_marks() -> Vec<PathBuf> {
         if PSEUDO_FS.contains(&fstype) {
             continue;
         }
-        let mountpoint = pre.split_whitespace().nth(4).unwrap_or("");
-        let mountpoint = mountpoint.replace("\\040", " ");
-        let Ok(meta) = std::fs::metadata(&mountpoint) else { continue };
-        if seen.insert(meta.dev()) {
-            out.push(PathBuf::from(mountpoint));
+        let mountpoint = unescape_mountinfo(pre.split_whitespace().nth(4).unwrap_or(""));
+        match std::fs::metadata(&mountpoint) {
+            Ok(meta) => {
+                if seen.insert(meta.dev()) {
+                    out.push(mountpoint);
+                }
+            }
+            // A real file system that cannot be examined cannot be marked; say so instead of skipping it silently.
+            Err(e) => say(&format!(
+                "cannot examine mount point {}: {e}",
+                jlr_model::sanitize(&mountpoint.display().to_string())
+            )),
         }
     }
     out
@@ -198,21 +226,19 @@ fn run() -> Result<(), String> {
         EventFFlags::O_RDONLY | EventFFlags::O_LARGEFILE | EventFFlags::O_CLOEXEC,
     )
     .map_err(|e| format!("fanotify_init: {e} (needs root / CAP_SYS_ADMIN)"))?;
-    let root = File::open("/").map_err(|e| e.to_string())?;
-    let mut marked_devs: HashSet<u64> = HashSet::new();
+    let fan = Arc::new(fan);
+    let root = Arc::new(File::open("/").map_err(|e| e.to_string())?);
     let explicit = !args.marks.is_empty();
     let marks = if explicit { args.marks.clone() } else { discover_marks() };
-    let marked = mark_filesystems(&fan, &root, &marks, &mut marked_devs);
+    let marked = mark_filesystems(&fan, &root, &marks);
     if marked == 0 {
         return Err("no file system could be marked".into());
     }
     say(&format!("exec gate active on {marked} file systems"));
-    // A file system mounted after this point is invisible to the gate until it is marked, so the mount
-    // table is watched: the kernel raises POLLPRI on /proc/self/mountinfo whenever it changes.
-    let mut mountinfo = File::open("/proc/self/mountinfo").map_err(|e| e.to_string())?;
-    {
-        let mut sink = String::new();
-        let _ = mountinfo.read_to_string(&mut sink); // arm the change counter
+    // A file system mounted after this point is invisible to the gate until it is marked.
+    if !explicit {
+        let (f, r, sd) = (fan.clone(), root.clone(), shutdown.clone());
+        std::thread::spawn(move || mount_watcher(f, r, sd));
     }
 
     // ---- state watcher ----
@@ -240,8 +266,13 @@ fn run() -> Result<(), String> {
     let self_pid = std::process::id() as i32;
     let mut cache: HashMap<(u64, u64), CacheEntry> = HashMap::new();
     let mut tally: HashMap<String, Tally> = HashMap::new();
-    let mut budgets = Budgets::new(args.slow_budget, Duration::from_secs(60));
+    // Each user may spend `slow_budget` of slow-path time a minute; all unprivileged users together may spend half of
+    // the gate's time, so that many accounts (subordinate ids, user namespaces) cannot multiply the allowance.
+    let mut budgets = Budgets::new(args.slow_budget, Duration::from_secs(30), Duration::from_secs(60));
     let mut throttled_noted: HashSet<u32> = HashSet::new();
+    let mut throttled_count: HashMap<u32, u64> = HashMap::new();
+    // Records that could not be written because the ledger was busy; written at the next opportunity.
+    let mut pending_events: Vec<String> = Vec::new();
     let mut last_flush = Instant::now();
     let mut seen_gen = generation.load(Ordering::SeqCst);
     // The mode the policy last said; used only to answer throttled events, which are never measured.
@@ -254,30 +285,14 @@ fn run() -> Result<(), String> {
     while !shutdown.load(Ordering::SeqCst) {
         // Readiness is copied out so the poll array (which borrows the descriptors) is dropped before
         // any of them is read or written.
-        let (fan_ready, ino_ready, mounts_changed) = {
-            let mut fds = [
-                PollFd::new(fan.as_fd(), PollFlags::POLLIN),
-                PollFd::new(ino.as_fd(), PollFlags::POLLIN),
-                PollFd::new(mountinfo.as_fd(), PollFlags::POLLPRI | PollFlags::POLLERR),
-            ];
+        let (fan_ready, ino_ready) = {
+            let mut fds = [PollFd::new(fan.as_fd(), PollFlags::POLLIN), PollFd::new(ino.as_fd(), PollFlags::POLLIN)];
             let _ = poll(&mut fds, PollTimeout::from(250u16));
             (
                 fds[0].revents().is_some_and(|r| r.contains(PollFlags::POLLIN)),
                 fds[1].revents().is_some_and(|r| r.contains(PollFlags::POLLIN)),
-                fds[2].revents().is_some_and(|r| r.intersects(PollFlags::POLLPRI | PollFlags::POLLERR)),
             )
         };
-        if mounts_changed && !explicit {
-            // Re-read to re-arm, then mark whatever is new.
-            let _ = mountinfo.seek(SeekFrom::Start(0));
-            let mut sink = String::new();
-            let _ = mountinfo.read_to_string(&mut sink);
-            let fresh: Vec<PathBuf> = discover_marks();
-            let n = mark_filesystems(&fan, &root, &fresh, &mut marked_devs);
-            if n > 0 {
-                say(&format!("marked {n} newly mounted file system(s)"));
-            }
-        }
         if ino_ready {
             let _ = ino.read_events();
             generation.fetch_add(1, Ordering::SeqCst);
@@ -338,19 +353,25 @@ fn run() -> Result<(), String> {
                 // A user who has spent their slow-path allowance does not get to make others wait: their
                 // unmeasured execution is answered by policy without doing any work for it.
                 let uid = uid_of_pid(ev.pid());
-                let started = Instant::now();
-                if uid != 0 && budgets.exhausted(uid, started) {
+                if uid != 0 && budgets.exhausted(uid, Instant::now()) {
                     if throttled_noted.insert(uid) {
                         say(&format!(
                             "uid {uid} exceeded its slow-path budget; unknown executions are answered by policy, unmeasured"
                         ));
                     }
-                    respond(!enforce_hint);
+                    if throttled_count.len() < 4096 {
+                        *throttled_count.entry(uid).or_default() += 1;
+                    }
+                    // A file this daemon already judged allowable, and that has not changed since, is not made
+                    // to pay for its user's other executions: the verdict merely aged out.
+                    let known_good = cache.get(&key).is_some_and(|c| c.stamp == stamp && c.generation == g && c.allow);
+                    respond(known_good || !enforce_hint);
                     continue;
                 }
-                let outcome = decide(&args, &path, file);
+                let mut worked = Duration::ZERO;
+                let outcome = decide(&args, &path, file, &mut worked);
                 if uid != 0 {
-                    budgets.charge(uid, started.elapsed(), Instant::now());
+                    budgets.charge(uid, worked, Instant::now());
                 }
                 if throttled_noted.len() > 1024 {
                     throttled_noted.clear();
@@ -394,8 +415,15 @@ fn run() -> Result<(), String> {
                             "internal error for {shown}: {msg} (fail-{})",
                             if args.fail_closed { "closed" } else { "open" }
                         ));
-                        if let Ok(mut e) = open_engine(&args.state, Duration::from_millis(500)) {
-                            let _ = e.record_degraded(&format!("exec gate error for {shown}: {msg}"));
+                        let text = format!("exec gate error for {shown}: {msg}");
+                        match open_engine(&args.state, Duration::from_millis(500)) {
+                            Ok(mut e) => {
+                                let _ = e.record_degraded(&text);
+                            }
+                            // The usual cause is the ledger lock, which whoever holds it will release; the record
+                            // is kept and written at the next opportunity instead of being lost.
+                            Err(_) if pending_events.len() < 256 => pending_events.push(text),
+                            Err(_) => {}
                         }
                         !args.fail_closed
                     }
@@ -404,12 +432,24 @@ fn run() -> Result<(), String> {
             }
         }
         // Summarise repeated attempts so a denied binary in a loop is visible without flooding the ledger.
-        if last_flush.elapsed() > Duration::from_secs(30) && !tally.is_empty() {
+        if last_flush.elapsed() > Duration::from_secs(30)
+            && (!tally.is_empty() || !pending_events.is_empty() || !throttled_count.is_empty())
+        {
             if let Ok(mut e) = open_engine(&args.state, args.lock_wait) {
+                for text in pending_events.drain(..) {
+                    let _ = e.record_degraded(&text);
+                }
+                for (uid, n) in throttled_count.drain() {
+                    let _ = e.record_degraded(&format!(
+                        "exec gate: uid {uid} exceeded its slow-path budget; {n} executions were answered by policy without being measured"
+                    ));
+                }
                 for (id, t) in tally.iter().filter(|(_, t)| t.audited + t.denied > 0) {
                     let _ = e.record_degraded(&format!(
                         "exec gate summary {id} {}: audited {} denied {}",
-                        t.path, t.audited, t.denied
+                        jlr_model::sanitize_to(&t.path, 300),
+                        t.audited,
+                        t.denied
                     ));
                 }
             }
@@ -427,30 +467,58 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Marks each file system in `paths` that is not already marked. Returns how many were newly marked.
-fn mark_filesystems(fan: &Fanotify, root: &File, paths: &[PathBuf], marked_devs: &mut HashSet<u64>) -> usize {
+/// Marks the file system under each path. Marking is idempotent, so it is repeated for every mount-table change
+/// instead of being skipped for a device number seen before: the mark belongs to the superblock and disappears with
+/// it, while a device number is reused by the next file system mounted (the next stick is `sdb1` again), so
+/// remembering numbers would leave a replacement file system ungated. Returns how many marks succeeded.
+fn mark_filesystems(fan: &Fanotify, root: &File, paths: &[PathBuf]) -> usize {
     let mut n = 0;
     for m in paths {
-        let dev = std::fs::metadata(m).map(|x| x.dev()).ok();
-        if dev.is_some_and(|d| marked_devs.contains(&d)) {
-            continue;
-        }
         match fan.mark(
             MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
             MaskFlags::FAN_OPEN_EXEC_PERM,
             root,
             Some(m),
         ) {
-            Ok(()) => {
-                if let Some(d) = dev {
-                    marked_devs.insert(d);
-                }
-                n += 1;
-            }
-            Err(e) => say(&format!("cannot mark {}: {e}", m.display())),
+            Ok(()) => n += 1,
+            Err(e) => say(&format!("cannot mark {}: {e}", jlr_model::sanitize(&m.display().to_string()))),
         }
     }
     n
+}
+
+/// Watches the mount table on its own thread, so a file system mounted while the gate is busy with a batch of
+/// events (each of which can take a while) is still marked promptly. The kernel raises `POLLPRI` on
+/// `/proc/self/mountinfo` whenever the table changes.
+fn mount_watcher(fan: Arc<Fanotify>, root: Arc<File>, shutdown: Arc<AtomicBool>) {
+    let Ok(mut mountinfo) = File::open("/proc/self/mountinfo") else {
+        say("cannot watch the mount table; file systems mounted later will not be gated");
+        return;
+    };
+    let mut sink = String::new();
+    let _ = mountinfo.read_to_string(&mut sink); // arm the change counter
+    let mut known: HashSet<PathBuf> = discover_marks().into_iter().collect();
+    while !shutdown.load(Ordering::SeqCst) {
+        let changed = {
+            let mut fds = [PollFd::new(mountinfo.as_fd(), PollFlags::POLLPRI | PollFlags::POLLERR)];
+            let _ = poll(&mut fds, PollTimeout::from(250u16));
+            fds[0].revents().is_some_and(|r| r.intersects(PollFlags::POLLPRI | PollFlags::POLLERR))
+        };
+        if !changed {
+            continue;
+        }
+        let _ = mountinfo.seek(SeekFrom::Start(0));
+        sink.clear();
+        let _ = mountinfo.read_to_string(&mut sink);
+        let now = discover_marks();
+        // Everything currently mounted is marked again; only the message depends on what looks new.
+        let n = mark_filesystems(&fan, &root, &now);
+        let fresh = now.iter().filter(|p| !known.contains(*p)).count();
+        if fresh > 0 {
+            say(&format!("marked {fresh} newly mounted file system(s) ({n} marks refreshed)"));
+        }
+        known = now.into_iter().collect();
+    }
 }
 
 /// The owner of the process's `/proc` entry, which is its effective uid. A process that has already exited
@@ -460,9 +528,22 @@ fn uid_of_pid(pid: i32) -> u32 {
 }
 
 /// Asks the engine, and turns its verdict into allow/deny according to the mode.
-fn decide(args: &Args, path: &Path, file: File) -> Result<(jlr_engine::ExecVerdict, bool), String> {
-    let mut engine = open_engine(&args.state, args.lock_wait).map_err(|e| e.to_string())?;
-    let v = engine.decide_exec(file, path).map_err(|e| e.to_string())?;
+///
+/// `worked` receives the time spent doing the work (opening the engine and deciding), **not** the time spent waiting
+/// for the ledger lock, which the user did not cause and must not be charged for.
+fn decide(
+    args: &Args,
+    path: &Path,
+    file: File,
+    worked: &mut Duration,
+) -> Result<(jlr_engine::ExecVerdict, bool), String> {
+    let (mut engine, open_time) =
+        Engine::open_wait_timed(args.state.clone(), Config::default(), args.lock_wait).map_err(|e| e.to_string())?;
+    *worked = open_time;
+    let started = Instant::now();
+    let v = engine.decide_exec(file, path);
+    *worked += started.elapsed();
+    let v = v.map_err(|e| e.to_string())?;
     let deny = v.enforce && !args.force_audit && !v.allowed;
     Ok((v, !deny))
 }
@@ -490,7 +571,10 @@ fn rescan_loop(paths: Paths, roots: Vec<PathBuf>, every: u64, generation: Arc<At
                         Ok(r) => {
                             changed += r.transitions;
                             for d in &r.degraded {
-                                say(&format!("DEGRADED {} changed after it was trusted", d.display()));
+                                say(&format!(
+                                    "DEGRADED {} changed after it was trusted",
+                                    jlr_model::sanitize(&d.display().to_string())
+                                ));
                             }
                         }
                         Err(e) => say(&format!("rescan slice failed: {e}")),
@@ -512,5 +596,47 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("jlrd: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn every_mountinfo_escape_is_decoded_so_no_file_system_is_left_unmarked() {
+        // The kernel writes a space, tab, newline and backslash in a mount point as octal escapes.
+        for (escaped, plain) in [
+            ("/mnt/plain", "/mnt/plain"),
+            ("/mnt/sp\\040ace", "/mnt/sp ace"),
+            ("/mnt/tab\\011x", "/mnt/tab\tx"),
+            ("/mnt/nl\\012z", "/mnt/nl\nz"),
+            ("/mnt/bs\\134y", "/mnt/bs\\y"),
+            ("/mnt/a\\040b\\011c\\012d\\134e", "/mnt/a b\tc\nd\\e"),
+            ("/mnt/trailing\\", "/mnt/trailing\\"),
+            ("/mnt/short\\04", "/mnt/short\\04"),
+            ("/mnt/notoctal\\089", "/mnt/notoctal\\089"),
+        ] {
+            assert_eq!(unescape_mountinfo(escaped).as_os_str().as_bytes(), plain.as_bytes(), "{escaped}");
+        }
+    }
+
+    #[test]
+    fn decoding_is_the_inverse_of_what_the_kernel_writes_for_real_mounts() {
+        // Not a model of the kernel: read this machine's own table and require that no entry is mangled into a path
+        // that does not exist while its raw form contains an escape.
+        let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let mut checked = 0;
+        for line in text.lines() {
+            let Some((pre, _)) = line.split_once(" - ") else { continue };
+            let raw = pre.split_whitespace().nth(4).unwrap_or("");
+            if raw.contains('\\') {
+                continue;
+            }
+            assert_eq!(unescape_mountinfo(raw).to_string_lossy(), raw);
+            checked += 1;
+        }
+        assert!(checked > 0, "the mount table was empty");
     }
 }

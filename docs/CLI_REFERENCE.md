@@ -55,7 +55,9 @@ the question.
 ## `jlr run [--cap CAP]... PROGRAM [ARG...]`
 
 Measures `PROGRAM`, evaluates policy, and if the decision permits execution, seals the measured bytes into a memfd and
-runs them in the prescribed cell. Prints the decision and the enforcement report to standard error. `--cap` names a
+runs them in the prescribed cell. Prints the decision and the enforcement report to standard error. If the program ran but its end could not be recorded in
+the ledger (it stayed locked for 20 seconds, or the disk is full), the program's exit status is still returned, with a
+warning that the record is incomplete. `--cap` names a
 capability the program requests; high-risk capabilities are withheld unless an approval grants them.
 
 The ledger lock is held only while the program is measured and its start and end are recorded, not while it runs,
@@ -82,7 +84,10 @@ An approval never lifts a revocation or a policy prohibition. Default: `CELL-1`,
 
 Adds an entry to the signed revocation list (epoch + 1) and moves matching known artifacts to `REVOKED`. The target
 is validated and stored in the one form the matcher compares: a digest is 64 hex digits with or without a `sha256:`
-prefix in any case, an EPN is accepted in any case, and anything else is refused without consuming an epoch. A signer
+prefix in any case, an EPN is accepted in any case, and anything else is refused without consuming an epoch. An EPN
+revocation takes effect even for an artifact whose record has been lost from the object store; a digest or signer
+revocation needs the record, so the command reports how many known artifacts it could not check and does not claim that
+"nothing matched". A signer
 revocation is accepted but matches nothing today, because no source adapter records a signer identity yet; the command
 says so. Revoke the digests or EPNs you know are affected as well.
 
@@ -109,9 +114,13 @@ the default is to allow and record a DEGRADED event. `--scan-every 0` disables t
 A file the gate cannot measure (over the size limit, changing while it is read, not a regular file, a FIFO) is a
 **decision**, not an internal error: it is denied when enforcing and recorded as "would deny" when auditing, whatever
 `--fail-closed` says, because the user who runs a file controls those conditions. `--slow-budget-secs` (default 10)
-bounds how much unmeasured-file work each non-root user may cost per minute; beyond it their unknown executions are
-answered by policy without being measured, so one user cannot stall everyone's `exec`. `--lock-wait-ms` (default 3000)
-bounds how long the gate waits for the ledger lock; a timeout is a recorded DEGRADED event and follows `--fail-closed`.
+bounds how much work each non-root user may cost per minute (opening the engine and deciding, **not** time spent waiting for
+the ledger lock), and all non-root users together may use half a minute of it; beyond that their unknown executions are
+answered at once by policy without being measured (denied when enforcing, allowed and counted when auditing), so one user,
+or one person with many uids, cannot stall everyone's `exec`. A file the daemon already allowed and that has not changed
+is still allowed. Each throttled user leaves a summary event. `--lock-wait-ms` (default 3000) bounds how long the gate
+waits for the ledger lock; a timeout follows `--fail-closed`, and is recorded as a DEGRADED event as soon as the ledger
+can be opened (it is kept in memory and written at the next opportunity, not lost).
 
 ## `jlr-release`
 

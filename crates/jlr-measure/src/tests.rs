@@ -356,25 +356,81 @@ fn an_edit_that_restores_mtime_is_still_detected_because_ctime_cannot_be_restore
     assert!(matches!(r, Err(MeasureError::ChangedWhileReading)), "mtime-restoring edit went unnoticed: {r:?}");
 }
 
+/// Rewrites the first byte of `path` from inside the measurement, after the bytes were read and before the state is
+/// checked again. The pause makes sure the change lands in a later clock tick than the file's last change, which
+/// matters on kernels whose timestamps are a few milliseconds coarse.
+fn change_during_read(writer: &fs::File, value: u8) {
+    use std::os::unix::fs::FileExt;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    writer.write_all_at(&[value], 0).unwrap();
+}
+
 #[test]
 fn a_file_that_keeps_changing_is_reported_not_measured() {
-    use std::os::unix::fs::FileExt;
     let d = tempfile::tempdir().unwrap();
     let p = write(d.path(), "moving", b"#!/bin/sh\n", 0o755);
     let mut f = fs::OpenOptions::new().read(true).open(&p).unwrap();
     let writer = fs::OpenOptions::new().write(true).open(&p).unwrap();
-    let mut counter = 0u8;
-    let mut always = || {
-        counter = counter.wrapping_add(1);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        writer.write_all_at(&[counter], 0).unwrap();
-    };
-    // Each attempt changes the file after reading, so every retry fails and the result is an error.
-    let mut last = Ok(());
-    for _ in 0..3 {
-        last = measure_file_with(&mut f, 1 << 20, &mut always).map(drop);
-    }
-    assert!(matches!(last, Err(MeasureError::ChangedWhileReading)));
+    let mut attempts = 0usize;
+    // The production retry loop, with a file that changes during every attempt.
+    let r = measure_file_stable_with(&mut f, 1 << 20, false, &mut |_| {
+        attempts += 1;
+        change_during_read(&writer, attempts as u8);
+    });
+    assert!(matches!(r, Err(MeasureError::ChangedWhileReading)), "{r:?}");
+    assert_eq!(attempts, 2, "a small file gets one retry and no more");
+}
+
+#[test]
+fn a_file_that_settles_is_measured_on_the_retry() {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "settling", b"#!/bin/sh\n", 0o755);
+    let mut f = fs::OpenOptions::new().read(true).open(&p).unwrap();
+    let writer = fs::OpenOptions::new().write(true).open(&p).unwrap();
+    // Changes during the first attempt only: the second sees a stable file and its digest is of the new content.
+    let m = measure_file_stable_with(&mut f, 1 << 20, false, &mut |attempt| {
+        if attempt == 0 {
+            change_during_read(&writer, b'X');
+        }
+    })
+    .expect("a file that stops changing must be measurable");
+    assert_eq!(m.digest, jlr_crypto::Digest::of(&fs::read(&p).unwrap()));
+    assert_eq!(fs::read(&p).unwrap()[0], b'X');
+}
+
+#[test]
+fn a_large_file_that_keeps_changing_is_read_once_not_repeatedly() {
+    // A file over the retry limit is read a single time: an owner who keeps touching a big file must not be able
+    // to multiply the gate's hashing work.
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("big");
+    let big = fs::File::create(&p).unwrap();
+    big.set_len(20 * 1024 * 1024).unwrap(); // sparse
+    let mut f = fs::OpenOptions::new().read(true).open(&p).unwrap();
+    let writer = fs::OpenOptions::new().write(true).open(&p).unwrap();
+    let mut attempts = 0usize;
+    let r = measure_file_stable_with(&mut f, 1 << 30, false, &mut |_| {
+        attempts += 1;
+        change_during_read(&writer, 1);
+    });
+    assert!(matches!(r, Err(MeasureError::ChangedWhileReading)), "{r:?}");
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn the_package_checksum_comes_from_the_same_read_as_the_digest() {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "pkgfile", b"tool-bytes", 0o755);
+    let mut f = fs::OpenOptions::new().read(true).open(&p).unwrap();
+    let m = measure_file_stable_with(&mut f, 1 << 20, true, &mut |_| {}).unwrap();
+    assert_eq!(m.md5_hex.as_deref(), Some(dpkg::md5_hex(b"tool-bytes").as_str()));
+    let m = measure_file_stable_with(&mut f, 1 << 20, false, &mut |_| {}).unwrap();
+    assert_eq!(m.md5_hex, None, "MD5 is computed only when a package manifest asks for it");
+    // Because both hashes come from one pass, one stamp check covers both: a change during the read is refused
+    // even though an MD5 was being computed.
+    let writer = fs::OpenOptions::new().write(true).open(&p).unwrap();
+    let r = measure_file_stable_with(&mut f, 1 << 20, true, &mut |_| change_during_read(&writer, b'Z'));
+    assert!(matches!(r, Err(MeasureError::ChangedWhileReading)), "{r:?}");
 }
 
 #[test]

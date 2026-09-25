@@ -120,6 +120,32 @@ fn id_of(e: &Engine, path: &Path) -> EpnId {
     e.explain(path).unwrap().record.id()
 }
 
+/// The one signed file in `dir` named `<prefix>.*.cose`. Approval and baseline files carry the digest of their
+/// content in the name, so the file the ledger currently records is found by its subject.
+fn signed_file(dir: &Path, prefix: &str) -> PathBuf {
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n.starts_with(&format!("{prefix}.")) && n.ends_with(".cose")
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "expected exactly one signed file for {prefix} in {}: {found:?}", dir.display());
+    found.pop().unwrap()
+}
+
+fn approval_file(lab: &Lab, id: &EpnId) -> PathBuf {
+    signed_file(&lab.paths().approvals(), &id.digest.hex())
+}
+
+fn count_files(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| if e.path().is_dir() { count_files(&e.path()) } else { 1 }).sum())
+        .unwrap_or(0)
+}
+
 fn events(lab: &Lab) -> Vec<jlr_model::Event> {
     let anchors = jlr_crypto::TrustAnchors::from_cbor(&fs::read(lab.paths().anchors()).unwrap()).unwrap();
     let info: NodeInfo = jlr_cbor::Cbor::from_cbor(&fs::read(lab.paths().node()).unwrap()).unwrap();
@@ -414,7 +440,7 @@ fn unverifiable_approvals_grant_nothing_and_are_logged() {
         id = id_of(&e, &exe);
         e.approve(&id.to_string(), CellClass::Cell1, NetworkMode::None, vec![], 3600, "alice").unwrap();
     }
-    let f = lab.paths().approvals().join(format!("{}.cose", id.digest.hex()));
+    let f = approval_file(&lab, &id);
     let mut b = fs::read(&f).unwrap();
     let last = b.len() - 3;
     b[last] ^= 1;
@@ -707,6 +733,7 @@ fn a_repeat_exec_decision_for_an_unchanged_file_writes_nothing() {
     let first = e.decide_exec(fs::File::open(&exe).unwrap(), &exe).unwrap();
     let events_after_first = e.status().ledger_events;
     let index_after_first = fs::read(lab.paths().index()).unwrap();
+    let objects_after_first = count_files(&lab.paths().objects());
 
     lab.clock.fetch_add(30, Ordering::SeqCst);
     for _ in 0..5 {
@@ -720,6 +747,15 @@ fn a_repeat_exec_decision_for_an_unchanged_file_writes_nothing() {
         index_after_first,
         "nor rewrite the index: every exec by any user would otherwise cost a full-file write"
     );
+    assert_eq!(
+        count_files(&lab.paths().objects()),
+        objects_after_first,
+        "nor store a new evidence object: evidence carries the time it was collected, so each decision used to leave an orphan"
+    );
+    // A scan of unchanged files, once evidence is stale and everything is re-measured, is no different.
+    lab.clock.fetch_add(30 * 86_400, Ordering::SeqCst);
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    assert_eq!(count_files(&lab.paths().objects()), objects_after_first, "a re-scan must not leak objects either");
 }
 
 #[test]
@@ -903,7 +939,13 @@ fn run_detached_gives_the_ledger_back_while_the_workload_runs() {
     }
     let result = worker.join().unwrap();
     match result {
-        Err(EngineError::Cell(jlr_cell::CellError::Refused(_))) => return, // kernel cannot host cells here
+        Err(EngineError::Cell(jlr_cell::CellError::Refused(r))) => {
+            eprintln!(
+                "SKIPPED: this kernel cannot host cells here, so the lock behaviour was not exercised: {:?}",
+                r.unavailable
+            );
+            return;
+        }
         Err(e) => panic!("{e}"),
         Ok(_) => {}
     }
@@ -913,55 +955,59 @@ fn run_detached_gives_the_ledger_back_while_the_workload_runs() {
 
 #[test]
 fn a_withdrawn_approval_cannot_be_put_back_from_a_copy() {
+    // Workstation, not Strict: its `max_manual_cell` is CELL-2, so a broad approval is honoured as written and
+    // differs observably from a narrow one. Under Strict both are capped to CELL-1 and the test could not tell.
     let lab = Lab::new();
-    lab.init(PolicyKind::Strict);
+    lab.init(PolicyKind::Workstation);
     let exe = lab.file("opt/tool", &elf());
-    let (id, old_copy);
+    let (id, old_name, old_copy);
+    let broad = (CellClass::Cell2, NetworkMode::FullUserNetwork);
+    let narrow = (CellClass::Cell1, NetworkMode::None);
+    let fallback = (CellClass::Cell0, NetworkMode::None); // what policy alone gives an unknown file
     {
         let mut e = lab.open();
         e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
         id = id_of(&e, &exe);
-        e.approve(&id.to_string(), CellClass::Cell2, NetworkMode::FullUserNetwork, vec![], 720 * 3600, "alice")
-            .unwrap();
-        assert_eq!(e.state_of(&id), Some(S::Admitted));
-        // The operator keeps a copy of the broad grant, then narrows it (a shorter, smaller approval).
-        let f = lab.paths().approvals().join(format!("{}.cose", id.digest.hex()));
+        let d = e.approve(&id.to_string(), broad.0, broad.1, vec![], 720 * 3600, "alice").unwrap();
+        assert_eq!((d.cell, d.network), broad, "precondition: the broad approval is honoured as written");
+        // The operator keeps a copy of the broad grant, then narrows it.
+        let f = approval_file(&lab, &id);
+        old_name = f.file_name().unwrap().to_owned();
         old_copy = fs::read(&f).unwrap();
         lab.clock.fetch_add(1, Ordering::SeqCst);
-        e.approve(&id.to_string(), CellClass::Cell0, NetworkMode::None, vec![], 1, "alice").unwrap();
+        let d = e.approve(&id.to_string(), narrow.0, narrow.1, vec![], 720 * 3600, "alice").unwrap();
+        assert_eq!((d.cell, d.network), narrow);
     }
-    let f = lab.paths().approvals().join(format!("{}.cose", id.digest.hex()));
-    let narrowed = fs::read(&f).unwrap();
-    assert_ne!(old_copy, narrowed);
-
-    // Someone puts the old, still-unexpired, correctly signed grant back over the file.
-    fs::write(&f, &old_copy).unwrap();
-    let e = lab.open();
-    let d = e.explain(&exe).unwrap().decision;
-    assert_ne!(
-        (d.cell, d.network),
-        (CellClass::Cell2, NetworkMode::FullUserNetwork),
-        "a superseded approval came back to life: {d:?}"
-    );
+    let current = approval_file(&lab, &id);
+    assert_ne!(current.file_name().unwrap(), old_name, "the new approval has a file of its own");
+    let current_bytes = fs::read(&current).unwrap();
     let noted = |lab: &Lab| {
         events(lab)
             .iter()
             .filter(|x| x.kind == EventKind::Degraded && x.detail.contains("not the approval the ledger records"))
             .count()
     };
+    let effective = |lab: &Lab| {
+        let d = lab.open().explain(&exe).unwrap().decision;
+        (d.cell, d.network)
+    };
+
+    // (a) Someone replaces the current approval with the old, still unexpired, correctly signed broad one.
+    fs::remove_file(&current).unwrap();
+    fs::write(lab.paths().approvals().join(&old_name), &old_copy).unwrap();
+    assert_eq!(effective(&lab), fallback, "a superseded approval came back to life");
     assert_eq!(noted(&lab), 1, "the ignored file must be reported");
-    drop(e);
-    // ...and reported once, not once per start.
+    // ...reported once, not once per start.
     drop(lab.open());
     drop(lab.open());
     assert_eq!(noted(&lab), 1, "the same problem must not be logged again on every open");
 
-    // A copy stored under another name, sorting after the real file, cannot shadow the current approval.
-    fs::write(&f, &narrowed).unwrap();
+    // (b) The current approval is present and a copy of the old one sits beside it under a name that sorts last, so
+    // a "last file wins" loader would prefer it.
+    fs::write(&current, &current_bytes).unwrap();
+    fs::remove_file(lab.paths().approvals().join(&old_name)).unwrap();
     fs::write(lab.paths().approvals().join("zzz-copy.cose"), &old_copy).unwrap();
-    let e = lab.open();
-    let d = e.explain(&exe).unwrap().decision;
-    assert_ne!((d.cell, d.network), (CellClass::Cell2, NetworkMode::FullUserNetwork), "{d:?}");
+    assert_eq!(effective(&lab), narrow, "a copy under another name shadowed the current approval");
 }
 
 #[test]
@@ -976,14 +1022,16 @@ fn a_superseded_baseline_cannot_be_restored_from_a_copy() {
     let tool_a = lab.file("usr/bin/a", &a);
     let tool_b = lab.file("usr/bin/b", &b);
     lab.package("both", &[(&tool_a, &a), (&tool_b, &b)]);
-    let old_copy;
+    let (old_name, old_copy);
     {
         let mut e = lab.open();
         let (_, n) = e
             .enroll_baseline(std::slice::from_ref(&lab.sys), &enroll("host", "operator", false), &Lab::scan_opts())
             .unwrap();
         assert_eq!(n, 2);
-        old_copy = fs::read(lab.paths().baselines().join("host.cose")).unwrap();
+        let f = signed_file(&lab.paths().baselines(), "host");
+        old_name = f.file_name().unwrap().to_owned();
+        old_copy = fs::read(&f).unwrap();
     }
     // The operator drops b (removes it, re-enrols the baseline under the same name), then someone restores the copy.
     fs::remove_file(&tool_b).unwrap();
@@ -995,9 +1043,10 @@ fn a_superseded_baseline_cannot_be_restored_from_a_copy() {
             .unwrap();
         assert_eq!(n, 1, "only a remains");
     }
-    let current = fs::read(lab.paths().baselines().join("host.cose")).unwrap();
-    assert_ne!(current, old_copy);
-    fs::write(lab.paths().baselines().join("host.cose"), &old_copy).unwrap();
+    let current = signed_file(&lab.paths().baselines(), "host");
+    assert_ne!(current.file_name().unwrap(), old_name, "the new baseline has a file of its own");
+    fs::remove_file(&current).unwrap();
+    fs::write(lab.paths().baselines().join(&old_name), &old_copy).unwrap();
     let e = lab.open();
     assert_eq!(e.status().baselines.iter().map(|(_, n)| *n).sum::<usize>(), 0, "the restored baseline must not count");
     assert!(
@@ -1005,6 +1054,30 @@ fn a_superseded_baseline_cannot_be_restored_from_a_copy() {
             .iter()
             .any(|x| x.kind == EventKind::Degraded && x.detail.contains("not the baseline the ledger records"))
     );
+}
+
+#[test]
+fn a_new_approval_never_overwrites_the_file_the_ledger_currently_records() {
+    // The new file is written first under its own name, then the ledger event makes it current, then the older
+    // file is removed. Until the event exists the old approval must still be there and still be honoured, so a
+    // crash or a full disk between the steps cannot take away authority that was legitimately granted.
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let exe = lab.file("opt/tool", &elf());
+    let mut e = lab.open();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    e.approve(&id.to_string(), CellClass::Cell2, NetworkMode::FullUserNetwork, vec![], 3600, "alice").unwrap();
+    let first = approval_file(&lab, &id);
+    let first_bytes = fs::read(&first).unwrap();
+    lab.clock.fetch_add(1, Ordering::SeqCst);
+    e.approve(&id.to_string(), CellClass::Cell1, NetworkMode::None, vec![], 3600, "alice").unwrap();
+    let second = approval_file(&lab, &id);
+    assert_ne!(first, second, "each approval is stored under a name of its own");
+    assert!(!first.exists(), "the superseded file is removed once the event is recorded");
+    // The file names carry a prefix of the content digest, which is what makes the two distinct.
+    let tag = jlr_crypto::Digest::of(&first_bytes).hex();
+    assert!(first.file_name().unwrap().to_string_lossy().contains(&tag[..16]));
 }
 
 #[test]
@@ -1071,4 +1144,185 @@ fn a_truncated_object_is_rewritten_the_next_time_the_artifact_is_seen() {
     assert!(e.explain(&exe).is_ok());
     e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(fs::read(&obj).unwrap(), good, "an object with the wrong length must be written again");
+}
+
+#[test]
+fn a_repaired_checkpoint_tail_is_recorded_and_degrades_the_posture() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    lab.file("opt/tool", &elf());
+    {
+        let mut e = lab.open();
+        e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+        e.checkpoint().unwrap();
+    }
+    // A crash in the middle of writing a checkpoint leaves a valid header and part of the body.
+    let cp = lab.paths().ledger().join("checkpoints.log");
+    let good = fs::read(&cp).unwrap();
+    let mut torn = good.clone();
+    torn.extend_from_slice(&good[..20]);
+    fs::write(&cp, torn).unwrap();
+    // Verifying reports it without repairing anything.
+    let r = verify_ledger_at(&lab.paths(), None).unwrap();
+    assert_eq!(r.checkpoint_torn_bytes, 20);
+    assert_eq!(fs::read(&cp).unwrap().len(), good.len() + 20, "read-only verification must not repair");
+    // Opening repairs it, keeps the bytes, and leaves a signed trace.
+    let e = lab.open();
+    assert_eq!(fs::read(&cp).unwrap(), good, "the torn tail is trimmed");
+    assert!(
+        fs::read_dir(lab.paths().ledger())
+            .unwrap()
+            .flatten()
+            .any(|f| f.file_name().to_string_lossy().starts_with("checkpoints.log.torn")),
+        "the torn bytes are kept in a quarantine file"
+    );
+    assert!(
+        events(&lab).iter().any(|x| x.kind == EventKind::Degraded && x.detail.contains("incomplete checkpoint record"))
+    );
+    assert_eq!(e.status().posture, Posture::Degraded);
+    assert!(e.status().torn_tail_bytes >= 20);
+}
+
+#[test]
+fn an_epn_revocation_works_when_the_record_is_missing_and_a_digest_revocation_says_it_could_not_check() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let exe = lab.file("opt/tool", &elf());
+    let mut e = lab.open();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    let digest = e.explain(&exe).unwrap().record.digest.hex();
+    // The object store is a cache; lose the record.
+    let hex = id.digest.hex();
+    fs::remove_file(lab.paths().objects().join("epn").join(&hex[..2]).join(format!("{}.cbor", &hex[2..]))).unwrap();
+
+    // A digest revocation needs the record's fields. It must say it could not look, not "nothing matched".
+    let r = e.revoke_report(RevocationKind::Digest, &digest, "x").unwrap();
+    assert_eq!((r.moved, r.unchecked), (0, 1), "{r:?}");
+    assert_eq!(e.state_of(&id), Some(S::Observed), "an artifact that could not be checked is not cleared or revoked");
+
+    // An EPN revocation names the identifier itself, which is known without the record.
+    let r = e.revoke_report(RevocationKind::Epn, &id.to_string(), "x").unwrap();
+    assert_eq!(r.moved, 1, "{r:?}");
+    assert_eq!(e.state_of(&id), Some(S::Revoked));
+}
+
+#[test]
+fn an_installation_whose_signed_policy_predates_the_name_rules_still_opens() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    // A policy installed before names were restricted: spaces and punctuation in the name.
+    let mut old = jlr_policy::Policy::workstation(1);
+    old.name = "site policy: main".into();
+    assert!(old.validate().is_err(), "new policies must use the restricted alphabet");
+    assert!(old.validate_loaded().is_ok());
+    let key = jlr_crypto::SigningKeypair::load(&lab.paths().policy_key()).unwrap();
+    fs::write(
+        lab.paths().policy(),
+        jlr_crypto::Envelope::sign(jlr_model::record_type::POLICY, "*", &old.to_cbor(), &key),
+    )
+    .unwrap();
+    let mut e = lab.open();
+    assert_eq!(e.policy().name, "site policy: main");
+    // The way forward is a new policy, which must follow the rules.
+    e.set_policy(jlr_policy::Policy::workstation(2)).unwrap();
+    assert_eq!(e.policy().epoch, 2);
+}
+
+#[test]
+fn a_cached_verdict_never_outlives_the_approval_that_earned_it() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation); // evidence stays valid for 7 days
+    let exe = lab.file("opt/tool", &elf());
+    let mut e = lab.open();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    e.approve(&id.to_string(), CellClass::Cell1, NetworkMode::None, vec![], 90, "alice").unwrap();
+    let v = e.decide_exec(fs::File::open(&exe).unwrap(), &exe).unwrap();
+    assert!(v.allowed);
+    assert!(
+        v.max_age_secs <= 90,
+        "the daemon caches an allow for max_age_secs; it must not outlast the 90 s approval: {}",
+        v.max_age_secs
+    );
+    // Without an approval to expire, the verdict may be cached for as long as the evidence is valid.
+    let other = lab.file("opt/other", &{
+        let mut o = elf();
+        o[90] = 5;
+        o
+    });
+    let v2 = e.decide_exec(fs::File::open(&other).unwrap(), &other).unwrap();
+    assert!(v2.max_age_secs > 90, "{}", v2.max_age_secs);
+}
+
+#[test]
+fn ledger_verification_needs_no_key_no_lock_and_writes_nothing() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    lab.file("opt/tool", &elf());
+    let held = {
+        let mut e = lab.open();
+        e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+        e.checkpoint().unwrap();
+        e
+    };
+    // The engine still holds the exclusive ledger lock, and the signing keys are gone: as on a machine that is
+    // being examined from recovery media, or read-only storage.
+    fs::remove_dir_all(lab.paths().keys()).unwrap();
+    let snapshot = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(d: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries: Vec<_> = fs::read_dir(d).unwrap().flatten().map(|e| e.path()).collect();
+            entries.sort();
+            for p in entries {
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.file_name().is_some_and(|n| n != "lock") {
+                    out.push((p.clone(), fs::read(&p).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out
+    };
+    let before = snapshot(lab.paths().root());
+    let r = verify_ledger_at(&lab.paths(), None).expect("verification must work beside a writer and without keys");
+    assert!(r.events > 0 && r.checkpoints > 0);
+    assert_eq!(snapshot(lab.paths().root()), before, "verification wrote to the state directory");
+    drop(held);
+}
+
+#[test]
+fn a_very_long_hostile_path_cannot_push_the_decision_out_of_an_exec_gate_record() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let exe = lab.file("opt/tool", &elf());
+    let v = e.decide_exec(fs::File::open(&exe).unwrap(), &exe).unwrap();
+    let long = format!("/{}", "d/".repeat(2000)); // 4,000 characters
+    e.record_exec(v.id.as_ref(), &long, "denied", &v.decision).unwrap();
+    let ev = events(&lab).into_iter().rev().find(|x| x.detail.starts_with("exec gate: denied")).unwrap();
+    assert!(ev.detail.len() < 500, "the path is bounded on its own: {} bytes", ev.detail.len());
+    assert!(
+        ev.detail.ends_with(&format!(
+            "state {} [{}]",
+            v.decision.state,
+            v.decision.reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+        )),
+        "the decision must survive a long path: {}",
+        ev.detail
+    );
+}
+
+#[test]
+fn a_signer_identifier_may_contain_a_backslash_but_not_a_control_character() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    // An RFC 4514 distinguished name escapes a comma with a backslash; that is data, not an attack.
+    e.revoke(RevocationKind::Signer, "CN=Doe\\, John,O=Example", "key stolen").unwrap();
+    assert_eq!(e.revocations().entries.last().unwrap().target, "CN=Doe\\, John,O=Example");
+    for bad in ["a\nb", "a\u{1b}[2Jb", "a\u{202e}b", ""] {
+        assert!(e.revoke(RevocationKind::Signer, bad, "x").is_err(), "{bad:?}");
+    }
 }

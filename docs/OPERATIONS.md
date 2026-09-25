@@ -18,7 +18,7 @@ jlr doctor
 | Finding | Meaning | What to do |
 |---|---|---|
 | `cgroup UNAVAILABLE (memory.max: Permission denied)` | The session has no delegated cgroup, so memory and process ceilings cannot be set | Run the daemon as a system service, or accept `Partial` enforcement. Reports say so. |
-| `mount-ns` or `user-ns` unavailable | Unprivileged user namespaces are blocked | On Ubuntu 24.04 set `kernel.apparmor_restrict_unprivileged_userns=0`, or run jlr as root |
+| `mount-ns` or `user-ns` unavailable | Unprivileged user namespaces are blocked | Run jlr as root, or on Ubuntu 24.04 set `kernel.apparmor_restrict_unprivileged_userns=0`. **That setting re-enables the one way a local user can escape the exec gate** (mounting a file system in their own namespace, SECURITY_BOUNDARIES 5): prefer running as root where the gate matters |
 | `landlock NOT present` | Kernel lacks Landlock | Cells run without the write-confinement layer; the mount namespace still applies |
 | `TPM 2.0 no device`, `Secure Boot disabled` | No hardware anchor | Ledger checkpoints are software counters only; say so in your own risk notes |
 
@@ -80,7 +80,9 @@ The exec gate has two modes, chosen by the signed policy:
 A file the gate cannot measure (padded past the size limit, changing while it is read, not a regular file) is treated as a
 decision, not a fault: it is denied when enforcing and logged as "would deny (unmeasurable)" when auditing. A file system
 mounted after `jlrd` started is marked as soon as the kernel reports it. A user who makes the gate do a great deal of
-unmeasured work is throttled (`--slow-budget-secs`) so that their `exec` calls, not everyone's, wait.
+unmeasured work is throttled (`--slow-budget-secs`, and unprivileged users together may use at most half the gate's time):
+their unknown executions are answered at once by policy, without being measured, so one user cannot stall everyone's `exec`.
+That answer is a denial when enforcing and an allow, counted in a summary event, when auditing.
 
 ```sh
 sudo jlrd --state /var/lib/jlr &           # or install contrib/jlrd.service
@@ -118,6 +120,23 @@ exec gate   audit (records what it would deny; nothing is blocked)
 
 `PROVEN` is always scoped to the named things; it never means "free of malware". It turns `DEGRADED` when an artifact that
 was trusted changes, or when the ledger had to quarantine an incomplete record at start.
+
+## 5a. Upgrading from an earlier build
+
+Approvals and baselines are now stored under names that carry a digest and are honoured only when the ledger records them as
+current. **Baselines enrolled by an earlier build carry no such record and are ignored until they are enrolled again**, and on
+an enforcing machine that means everything a baseline admitted (including `jlr` itself) is denied. Upgrade in this order:
+
+```sh
+jlr policy enforce off      # before upgrading, so nothing is denied meanwhile
+# ...install the new build, restart jlrd...
+jlr baseline enroll /usr --name initial-host --include-unmanaged   # as originally enrolled
+jlr policy enforce on
+```
+
+The path index gains fields, so the first start also logs one `the path index was missing or damaged` event and rebuilds it
+from the ledger; run `jlr scan --full` afterwards. A signed policy whose name contains spaces or punctuation still loads (the
+alphabet rule applies to new policies only); replace it with `jlr policy set` when convenient.
 
 ## 6. Software updates
 
@@ -211,7 +230,7 @@ release is signed with a release key that never touches the build host's network
 | A ledger event says `ignored unverifiable object: … not the approval (or baseline) the ledger records as current` | An approval or baseline file is not the one the ledger records last: a superseded copy was restored, or the file was edited | It grants nothing. Restore the file the ledger expects, or approve or enrol again |
 | A ledger event says `the path index was missing or damaged` | The cache of paths was deleted or corrupted | JLR rebuilt it from the ledger. Run `jlr scan --full`; if a trusted file was replaced meanwhile it will be reported |
 | Boot prints `boot media is not pinned` | The initramfs accepts any attached disk with a `/jlr` tree | Pin it: build with `JLR_MEDIA_ID=<ext4 UUID or FAT serial>` |
-| Boot prints `slot=… skipped` | A slot could not be used on this boot (medium is write-protected, or a read error) | Nothing was retired. Fix the medium; the slot is tried again next boot |
+| Boot prints `slot=… skipped` | A slot could not be used on this boot (medium is write-protected, a read error, reads that disagree) | Nothing was retired, and no try was spent unless the message says the attempt could not be recorded. Fix the medium; the slot is tried again next boot |
 | Boot prints `REFUSED reason=...` and `RECOVERY-RESTRICTED` | The base image, manifest, signer or rollback floor failed | Nothing from the media was run. Boot independent recovery media. The reason line names the check |
 | `jlr run` says `denied` | The decision does not allow it to run | `jlr explain PATH`; approve, or leave it |
 | Everything is slow after months | Very large ledger | Opening verifies events after the last checkpoint and hashes the rest; see the roadmap for persisted tree state |

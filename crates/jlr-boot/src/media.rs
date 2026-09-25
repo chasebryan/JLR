@@ -76,7 +76,9 @@ impl StateRead {
 /// Only "the file does not exist" means a fresh medium. Every other failure (an I/O error, a damaged file,
 /// a directory in its place) is an error, because treating it as fresh would reset the rollback floor to
 /// zero and let an older release boot. A missing file with a complete `.new` beside it is what a power cut
-/// during a rename on a FAT volume leaves behind, and the `.new` is used.
+/// during a rename on a FAT volume leaves behind, and the `.new` is used. A `.new` that does not parse, beside no
+/// state file, proves only that a first write was cut short (a `.new` is synced before it replaces anything, so a
+/// torn one means the replacement never began), which is a fresh medium, not a damaged one.
 pub fn read_state(media: &Path) -> Result<StateRead, BootError> {
     let path = media.join("jlr").join(STATE_FILE);
     let parse = |b: &[u8]| BootState::from_cbor(b).map_err(|e| BootError::Io(format!("boot state is damaged: {e}")));
@@ -85,7 +87,10 @@ pub fn read_state(media: &Path) -> Result<StateRead, BootError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let pending = media.join("jlr").join(format!("{STATE_FILE}.new"));
             match fs::read(&pending) {
-                Ok(b) => parse(&b).map(StateRead::Recovered),
+                Ok(b) => Ok(match BootState::from_cbor(&b) {
+                    Ok(state) => StateRead::Recovered(state),
+                    Err(_) => StateRead::Fresh(BootState::fresh()),
+                }),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(StateRead::Fresh(BootState::fresh())),
                 Err(e) => Err(BootError::Io(format!("{}: {e}", pending.display()))),
             }
@@ -96,13 +101,34 @@ pub fn read_state(media: &Path) -> Result<StateRead, BootError> {
 
 /// Writes the boot state durably: the new file is synced before it replaces the old one, and the directory is
 /// synced afterwards.
+///
+/// Two precautions keep the floor from being lost to a failed write. If a previous cut-short rename left a complete
+/// `.new` and no state file, that `.new` is the only copy of the state, so it is promoted before anything is
+/// written (creating a new `.new` would truncate it). And when a write fails, its partial `.new` is removed,
+/// because a leftover torn `.new` is noise the next boot would have to explain.
 pub fn write_state(media: &Path, state: &BootState) -> io::Result<()> {
     let dir = media.join("jlr");
     let path = dir.join(STATE_FILE);
     let tmp = dir.join(format!("{STATE_FILE}.new"));
-    let mut f = File::create(&tmp)?;
-    f.write_all(&state.to_cbor())?;
-    f.sync_all()?;
-    fs::rename(&tmp, &path)?;
-    File::open(&dir).and_then(|d| d.sync_all())
+    if !path.exists() && tmp.exists() {
+        match fs::read(&tmp).map(|b| BootState::from_cbor(&b).is_ok()) {
+            Ok(true) => fs::rename(&tmp, &path)?,
+            _ => {
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    }
+    let result = (|| {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&state.to_cbor())?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        File::open(&dir).and_then(|d| d.sync_all())
+    })();
+    if result.is_err() && path.exists() {
+        // The state file is intact, so the partial replacement is only clutter. (With no state file the `.new` may
+        // be the only copy and is left for the next read to recover.)
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }

@@ -331,12 +331,18 @@ fn run(cli: Cli) -> Result<u8, String> {
                         r.report.status,
                         r.report.unavailable.join("; ")
                     );
+                    if let Some(why) = &r.record_error {
+                        eprintln!(
+                            "jlr: warning: the program ran, but its end could not be recorded in the ledger: {}",
+                            jlr_model::sanitize(why)
+                        );
+                    }
                     Ok(r.exit_code.clamp(0, 255) as u8)
                 }
                 Err(EngineError::NotRunnable(d)) => {
                     eprintln!("jlr: denied: {}", describe(&d));
                     if let Some(q) = &d.needs_user {
-                        eprintln!("jlr: {q}");
+                        eprintln!("jlr: {}", jlr_model::sanitize(q));
                         eprintln!(
                             "jlr: to allow it: jlr explain {} ; jlr approve <EPN>",
                             jlr_model::sanitize(&path.display().to_string())
@@ -392,15 +398,22 @@ fn run(cli: Cli) -> Result<u8, String> {
                 (None, None, Some(p)) => (RevocationKind::Epn, p.clone()),
                 _ => return Err("give exactly one of --digest, --signer or --epn".into()),
             };
-            let n = eng.revoke(kind, &target, &a.reason).map_err(e)?;
+            let r = eng.revoke_report(kind, &target, &a.reason).map_err(e)?;
+            let n = r.moved;
             println!("revoked {}; {n} known artifacts moved to REVOKED", jlr_model::sanitize(target.trim()));
+            if r.unchecked > 0 {
+                println!(
+                    "warning: {} known artifacts could not be checked against this entry because their records are missing from the object store; they were NOT cleared. Run `jlr scan --full` to re-measure them",
+                    r.unchecked
+                );
+            }
             if kind == RevocationKind::Signer {
                 println!(
                     "note: no source adapter records a signer identity yet, so a signer revocation matches nothing today. \
                      Revoke the digests or EPNs you know are affected as well."
                 );
             }
-            if n == 0 {
+            if n == 0 && r.unchecked == 0 {
                 println!("note: nothing known to this installation matched; the entry still blocks a match in future");
             }
             Ok(0)
@@ -456,6 +469,12 @@ fn run(cli: Cli) -> Result<u8, String> {
             );
             if r.torn_tail_bytes > 0 {
                 println!("warning: {} bytes of an incomplete final record are present", r.torn_tail_bytes);
+            }
+            if r.checkpoint_torn_bytes > 0 {
+                println!(
+                    "warning: {} bytes of an incomplete final checkpoint are present; the newest checkpoints may be missing",
+                    r.checkpoint_torn_bytes
+                );
             }
             Ok(0)
         }

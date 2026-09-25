@@ -70,7 +70,9 @@ impl Builder {
             spec,
             active: Vec::new(),
             unavailable: Vec::new(),
-            landlock_abi: None,
+            // The kernel's Landlock ABI is a fact about the machine, so every report carries it, including a
+            // refusal that happens before Landlock is applied.
+            landlock_abi: sys::landlock_abi(),
             seccomp_denied: 0,
             skipped: Vec::new(),
         }
@@ -285,7 +287,8 @@ fn assembly_dir(spec: &CellSpec) -> Result<&'static str, String> {
         })
         .collect();
     let overlaps = |dir: &str, p: &str| {
-        let within = |a: &str, b: &str| a == b || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'));
+        // `/` contains every path, and `strip_prefix("/")` leaves a remainder that does not start with a slash.
+        let within = |a: &str, b: &str| b == "/" || a == b || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'));
         within(p, dir) || within(dir, p)
     };
     ["/tmp", "/mnt", "/media", "/srv", "/opt", "/run"]
@@ -438,10 +441,10 @@ fn build_root(spec: &CellSpec) -> Result<Layout, String> {
     for c in &spec.capabilities {
         match c {
             Capability::FsRead(p) | Capability::FsWrite(p) => {
+                // Paths were validated (absolute, normalised) when the spec was decoded, so what can go wrong
+                // here is the world: the path does not exist, or cannot be examined.
                 let write = matches!(c, Capability::FsWrite(_));
-                if !p.starts_with('/') || p.split('/').any(|s| s == "..") {
-                    layout.skipped.push(format!("{c} not applied: the path is not absolute and normalised"));
-                } else if let Err(e) = fs::metadata(p) {
+                if let Err(e) = fs::metadata(p) {
                     layout.skipped.push(format!("{c} not applied: {e}"));
                 } else {
                     bind(p, &format!("{nr}{p}"), !write)?;
@@ -612,7 +615,6 @@ fn stage2(spec: CellSpec, ns_note: &str, cgroup_name: &str) -> i32 {
         write: &layout.write,
         tcp: (spec.network == NetworkMode::DestinationAllowlist).then_some((connect.as_slice(), bind_ports.as_slice())),
     };
-    b.landlock_abi = sys::landlock_abi();
     match apply_landlock(&plan) {
         Ok(o) => {
             if o.fs {
@@ -705,6 +707,40 @@ pub fn cell_main() -> i32 {
         other => {
             eprintln!("jlr-cell: unknown stage {other}");
             2
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jlr_model::{AdmissionState, Basis, CellClass, Decision, ReasonCode};
+
+    fn spec_with(caps: &[&str]) -> CellSpec {
+        let d = Decision {
+            state: AdmissionState::Verified,
+            cell: CellClass::Cell1,
+            network: NetworkMode::None,
+            capabilities: caps.iter().map(|c| Capability::parse(c).unwrap()).collect(),
+            reasons: vec![ReasonCode::DefaultTier],
+            basis: Basis::None,
+            needs_user: None,
+            policy: jlr_crypto::Digest::ZERO,
+        };
+        CellSpec::from_decision(&d, vec!["x".into()], vec![]).unwrap()
+    }
+
+    #[test]
+    fn the_private_root_is_never_assembled_over_a_granted_path() {
+        assert_eq!(assembly_dir(&spec_with(&[])).unwrap(), "/tmp", "without grants /tmp is the first choice");
+        for grant in ["FS_WRITE:/tmp/data", "FS_READ:/tmp", "FS_WRITE:/tmp/a/b/c"] {
+            let dir = assembly_dir(&spec_with(&[grant])).unwrap();
+            assert_ne!(dir, "/tmp", "{grant} would be hidden by a tmpfs mounted over /tmp");
+        }
+        // A grant that contains a candidate hides it too, as does one that contains all of them.
+        for grant in ["FS_READ:/", "FS_WRITE:/"] {
+            let r = assembly_dir(&spec_with(&[grant]));
+            assert!(r.is_err(), "{grant} contains every candidate directory, so none is free: {r:?}");
         }
     }
 }

@@ -26,7 +26,13 @@ a deliberate, reviewed event; see `docs/INTEGRITY_PROTOCOL.md`.
   refuse `syslog` and terminal-injection `ioctl`s; approvals and baselines are bound to the ledger; the ledger repairs a
   torn checkpoint log; `jlr ledger verify` is read-only; `jlr run` releases the ledger lock while the program runs.
 - **State compatibility:** baselines enrolled before this change carry no ledger subject and are ignored until they are
-  enrolled again (`jlr baseline enroll`). `jlr scan` exits 3 when it could not measure everything.
+  enrolled again (`jlr baseline enroll`); on an enforcing machine that denies everything a baseline admitted, including `jlr`,
+  so turn enforcement off first (docs/OPERATIONS.md section 5a). Approval and baseline files are now named by digest. The path
+  index gained two fields, so the first start rebuilds it from the ledger. Policies whose name uses spaces or punctuation
+  still load; new policies must use `A-Za-z0-9._-`. `jlr scan` exits 3 when it could not measure everything.
+- A second independent review of these fixes (66 agents, 61 findings reported, 57 confirmed) led to further changes recorded
+  in `docs/REVIEW_2026-09.md`: the mount watcher, the gate budget, verify-before-spend in boot, ledger rollback and
+  concurrent verification, evidence objects, and several tests that had passed without the fix they cited.
 
 ### Security
 - The measured bytes are the executed bytes: launches run a sealed memfd copy that was hashed while it was copied.

@@ -1,8 +1,8 @@
 //! Turning a path into an EPN record plus evidence.
 
-use crate::dpkg::{DpkgDb, md5_file};
+use crate::dpkg::DpkgDb;
 use crate::facts::{Trust, path_facts};
-use crate::{MeasureError, classify, open_measured};
+use crate::{MeasureError, classify, measure_file_stable_with, open_measured_with};
 use jlr_model::{ArtifactClass, EpnRecord, EvidenceItem, EvidenceKind, ProvenanceRank, Source};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -49,9 +49,19 @@ fn item(kind: EvidenceKind, source: &str, at: u64, detail: &str) -> EvidenceItem
 /// a file merely listed by dpkg is `SourceKnown`, because dpkg's database is
 /// unauthenticated. Stronger provenance arrives only through signed baselines,
 /// pinned vendor signatures or verified package signatures.
-pub fn observe(path: &Path, dpkg: Option<&mut DpkgDb>, opts: &ObserveOptions) -> Result<Observation, MeasureError> {
-    let (file, m) = open_measured(path, opts.max_size)?;
+pub fn observe(path: &Path, mut dpkg: Option<&mut DpkgDb>, opts: &ObserveOptions) -> Result<Observation, MeasureError> {
+    let want_md5 = wants_md5(dpkg.as_deref_mut(), path);
+    let (file, m) = open_measured_with(path, opts.max_size, want_md5)?;
     observe_measured(file, m, path, dpkg, opts)
+}
+
+/// Whether dpkg lists a checksum for this path. If so it is computed in the same read as the SHA-256, so a single
+/// check that the file did not change covers both; reading the file a second time for MD5 would let its owner
+/// change it in between and make the package evidence describe different bytes than the digest.
+fn wants_md5(dpkg: Option<&mut DpkgDb>, path: &Path) -> bool {
+    let Some(db) = dpkg else { return false };
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    db.ownership(&real.to_string_lossy()).is_some_and(|o| o.manifest_md5.is_some())
 }
 
 /// Like [`observe`], for a descriptor the caller already holds, such as the file
@@ -62,15 +72,16 @@ pub fn observe(path: &Path, dpkg: Option<&mut DpkgDb>, opts: &ObserveOptions) ->
 pub fn observe_open(
     mut file: File,
     path: &Path,
-    dpkg: Option<&mut DpkgDb>,
+    mut dpkg: Option<&mut DpkgDb>,
     opts: &ObserveOptions,
 ) -> Result<Observation, MeasureError> {
-    let m = crate::measure_file_stable(&mut file, opts.max_size)?;
+    let want_md5 = wants_md5(dpkg.as_deref_mut(), path);
+    let m = measure_file_stable_with(&mut file, opts.max_size, want_md5, &mut |_| {})?;
     observe_measured(file, m, path, dpkg, opts)
 }
 
 fn observe_measured(
-    mut file: File,
+    file: File,
     m: crate::Measured,
     path: &Path,
     dpkg: Option<&mut DpkgDb>,
@@ -97,7 +108,10 @@ fn observe_measured(
         evidence.push(item(EvidenceKind::ManagedInstaller, "dpkg", opts.now, &format!("owned by {}", own.package)));
         match own.manifest_md5 {
             Some(expected) => {
-                let actual = md5_file(&mut file)?;
+                let actual = m
+                    .md5_hex
+                    .clone()
+                    .ok_or_else(|| MeasureError::Io(std::io::Error::other("the package checksum was not computed")))?;
                 if actual == expected {
                     evidence.push(item(
                         EvidenceKind::PackageManifestMatch,

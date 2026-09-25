@@ -27,7 +27,7 @@ A release MAY claim a security property only when a reproducible test or procedu
 | A file system mounted after the daemon started is gated too | QEMU `late mount stranger: BLOCKED` |
 | An extra attached disk cannot lower the rollback floor, and a pinned initramfs never mounts another disk | QEMU two-disk and pinned-medium tests |
 | A transient read error or a damaged state file cannot retire a good slot or reset the floor | Boot unit tests; QEMU unreadable-state test |
-| A cell workload has no controlling terminal, inherits no descriptor beyond its own image, cannot type into the operator's terminal or read the host kernel log | Cell tests, mutation-checked |
+| A cell workload has no controlling terminal, inherits no descriptor beyond its own image, cannot type into the operator's terminal or read the host kernel log | Cell tests, mutation-checked, with the qualifications in JAIL_MODEL section 10 |
 | A hostile file name, policy name or revocation text cannot forge ledger or terminal lines or move the policy epoch floor | Model, policy and engine tests |
 | A superseded or withdrawn approval or baseline cannot be put back from a copy: only the file whose digest the ledger records as the latest override counts | Engine tests, mutation-checked |
 | Losing the path index cannot hide that a trusted file was replaced | Engine test, mutation-checked |
@@ -55,10 +55,30 @@ Every item below is a boundary a reader must know about. None is hidden elsewher
 4. **Internal gate errors fail open** unless `--fail-closed`. A file the gate cannot measure is *not* an internal error: it
    is denied when enforcing, because the user who runs a file controls its size and how it changes.
 5. **The gate cannot see every file system.** One mounted in another mount namespace (for example a tmpfs an unprivileged
-   user mounts inside their own user namespace) is not marked, so executables there are not gated. Where that matters,
-   restrict unprivileged user namespaces (`kernel.unprivileged_userns_clone=0`, or the AppArmor restriction on recent
-   Ubuntu). A file system mounted in the host's namespace is marked when the kernel reports the mount-table change;
-   an exec in the few milliseconds before that is not gated.
+   user mounts inside their own user namespace) is not marked, so executables there are not gated: **on a host where
+   unprivileged user namespaces stay enabled, any local user can run unmeasured code from such a mount.** Restricting them
+   (`kernel.unprivileged_userns_clone=0`, or the AppArmor restriction on recent Ubuntu) closes it, at the price of the
+   unprivileged companion-mode cells, which need user namespaces (limitation 21); root-run cells and the exec gate
+   itself are not affected. Choose one; `docs/OPERATIONS.md` section 1 says the same. A file system mounted in the host's
+   namespace is marked by a watcher thread as soon as the kernel reports the change, and marking is repeated for every
+   change (a device number is reused by the next file system mounted, so remembering numbers would leave a replacement
+   ungated). An `exec` between the mount and the mark is not gated; the window is scheduling latency, not bounded by
+   any measurement.
+5a. **The gate's throttle is per user and overall, and it is not a guarantee.** A user who exhausts the per-user slow-path
+   allowance, or all unprivileged users together (they may spend at most half of the gate's time), have unknown
+   executions answered by policy without measurement: denied when enforcing, allowed and counted when auditing. Each
+   throttled user leaves a summary event. A file the daemon already allowed and that has not changed is still allowed. Root
+   is not throttled, and the gate is one thread.
+5b. **Measurement is a stamp check, not a lock.** A file is measured by hashing the bytes and comparing its size, both times
+   and inode before and after. `ctime` cannot be set by the owner, but its resolution is the kernel's: before Linux 6.13, and
+   on file systems without fine-grained timestamps (NFS, FUSE, FAT), it is a tick of milliseconds to seconds, and an edit
+   that lands in the same tick as the file's previous change is indistinguishable. Between the measurement and the kernel
+   reading the file to execute it there is also a short window in which the owner can still write. The stamp is checked
+   again by the retry, not at the moment the permission event is answered.
+5c. **The scanner's directory walk is not race-free.** It refuses to follow a symlink for a file it opens, but a directory
+   swapped for a symlink between the listing and the read redirects the walk, so a file outside the scan root can be
+   measured and recorded under a path inside it. A file that was reached that way is still just a measured file; the
+   record's path is wrong. Walking by descriptor is the designed fix.
 
 **Boot**
 
@@ -66,15 +86,29 @@ Every item below is a boundary a reader must know about. None is hidden elsewher
    Fix: signed unified kernel image (designed).
 7. **The rollback floor is on the boot media.** The same attacker can lower it. Fix: TPM NV counter (designed).
 8. **The boot state file is unauthenticated** for the same reason.
-9. **Which disk supplies the rollback floor.** Every attached disk with a `/jlr` tree is examined, and the highest floor on
-   any of them applies to all of them, so a stale or foreign disk cannot lower it. That holds only for media that are
-   attached: with the real medium absent nothing records what the floor should have been, and an older, validly signed
-   release on another disk will boot. An initramfs pinned to one medium (`jlr.media=` or `/etc/jlr/media-id`) never
-   mounts any other disk and refuses when the pinned one is missing. Unpinned, an attached disk can still deny service (a
-   state file with a very high floor, or a damaged one) because the boot stops rather than guess a floor. The fix that
-   removes the dependence on media is the TPM counter (designed).
-10. **Write-protected media boot only a proven slot.** An unproven update needs its "try spent" record written first, so
-    on a medium that cannot be written it is skipped and the proven slot boots. Success cannot be recorded there either.
+9. **Which disk supplies the rollback floor.** Every attached disk with a `/jlr` tree that enumerates while the initramfs is
+   looking (until one is found and no new device has appeared for a second, at most five seconds) is examined, and the
+   highest floor on any of them applies to all of them, so a stale or foreign disk cannot lower it. That holds only for
+   media that are attached and seen in time: with the real medium absent or late, nothing records what the floor should
+   have been, and an older, validly signed release on another disk will boot. Unpinned, an attached disk can also deny
+   service (a state file with a very high floor, or a damaged one) because the boot stops rather than guess a floor. The
+   fix that removes the dependence on media is the TPM counter (designed).
+9a. **A pin is an identifier, not authentication.** An initramfs pinned to one medium (`jlr.media=` or
+   `/etc/jlr/media-id`) reads the first bytes of every other device to learn its identifier and never mounts it, and it
+   refuses when no attached device carries the pinned identifier. But an ext4 UUID or FAT serial is chosen by whoever
+   formats a disk and is printed at every boot. Anyone who can attach a disk **with the same identifier** while the real
+   medium is absent gets the same outcome as an unpinned boot, and anyone who can write the pinned medium can lower its
+   state file. The pin removes other people's disks from consideration; it does not make the medium trustworthy.
+10. **Read-only mounts can still write.** Media are mounted read-only and remounted read-write only to write state, but an
+    ext4 file system that was not unmounted cleanly has its journal replayed by a read-only mount when the device is
+    writable, so an unpinned boot can change a disk it then does not use. What is guaranteed is that no *state* is written
+    to a medium that is not the one booted. A medium that cannot be written at all mounts read-only or is skipped.
+10a. **Write-protected media boot only a proven slot.** An unproven update needs its "try spent" record written, so on a
+    medium that cannot be written it is skipped and the proven slot boots. Success cannot be recorded there either.
+10b. **The image is read again before a mismatch condemns a slot.** A digest or size mismatch is confirmed by a second read;
+    the same wrong answer twice retires the slot, a second read that verifies is used, and reads that disagree with each
+    other are treated as unreliable media and change nothing. A stick that consistently returns the same wrong bytes
+    (corruption on the write side) is, correctly, indistinguishable from a bad image.
 
 **Evidence and provenance**
 

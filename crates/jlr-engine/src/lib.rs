@@ -18,7 +18,7 @@ mod setup;
 mod store;
 
 pub use engine::{
-    Config, Engine, EnrollOptions, ExecVerdict, Explanation, RunResult, ScanOptions, ScanReport, Status,
+    Config, Engine, EnrollOptions, ExecVerdict, Explanation, RevokeReport, RunResult, ScanOptions, ScanReport, Status,
     list_artifacts, verify_ledger_at,
 };
 pub use error::EngineError;

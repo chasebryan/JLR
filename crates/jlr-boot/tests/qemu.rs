@@ -399,7 +399,7 @@ fn a_broken_update_falls_back_to_the_proven_slot() {
     let disk = build_disk(&env, dir.path(), &[a, b_slot], Some(&state));
     let b = boot(&env, Some(&disk), "");
     assert!(!b.timed_out, "{}", b.dump());
-    let sel_b = b.pos("selected slot=b").expect("B is tried first");
+    let sel_b = b.pos("trying slot=b").expect("B is tried first");
     let bad_b = b.pos("slot=b REFUSED image").expect("B's image is refused");
     let sel_a = b.pos("selected slot=a").expect("then A is selected");
     assert!(sel_b < bad_b && bad_b < sel_a, "{}", b.dump());
@@ -513,6 +513,8 @@ fn the_exec_gate_audits_then_enforces_and_notices_tampering_under_a_real_kernel(
         // A file the gate cannot measure is denied, and so is anything on a file system mounted later.
         "GUEST: enforce unmeasurable: BLOCKED",
         "GUEST: late mount stranger: BLOCKED",
+        "GUEST: remounted stranger: BLOCKED",
+        "GUEST: odd name stranger: BLOCKED",
         // Tampering with an enrolled binary revokes its standing.
         "GUEST: tampered known: BLOCKED",
         // A blocked program can still run, confined.
@@ -576,6 +578,7 @@ fn a_second_disk_with_an_older_release_cannot_downgrade_the_machine() {
         );
         assert!(!b.has("selected slot=a epoch=1"), "an older release booted:\n{}", b.dump());
         assert!(b.has("media=2 rollback floor=2"), "the highest floor on any medium applies:\n{}", b.dump());
+        assert!(b.has("examining /dev/vda") && b.has("examining /dev/vdb"), "unpinned, every disk is looked at");
         if attacker_first {
             // The old disk is looked at first and refused on the floor learned from the other one.
             assert!(b.has("slot=a REFUSED rollback"), "the old release is refused as a rollback:\n{}", b.dump());
@@ -620,7 +623,14 @@ fn a_pinned_boot_never_uses_or_mounts_another_disk() {
     // The other disk carries a *newer*, validly signed release; the pin still keeps it out.
     assert!(b.has("selected slot=a epoch=2") && !b.has("epoch=3"), "{}", b.dump());
     assert!(b.has("JLR-STAGE2: ready"), "{}", b.dump());
-    assert_eq!(file_digest(&other), other_before, "the unpinned disk must not even be mounted");
+    // The boot log says which devices were opened to look for a /jlr tree; the other disk must not be one of them.
+    assert!(b.has("examining /dev/vdb for a /jlr tree"), "{}", b.dump());
+    assert!(
+        !b.has("examining /dev/vda"),
+        "the disk that is not the pinned medium must never be mounted:\n{}",
+        b.dump()
+    );
+    assert_eq!(file_digest(&other), other_before, "and it must not have been written");
 
     // A pin that matches nothing attached is a refusal, never a fall back to whatever is there.
     let b = boot_disks(&env, &[(&other, false), (&real, false)], "jlr.media=uuid=99999999-9999-9999-9999-999999999999");
@@ -642,14 +652,21 @@ fn a_write_protected_medium_boots_its_proven_slot_and_skips_an_unproven_one() {
         Some(&state),
         None,
     );
-    let before = file_digest(&disk);
     let b = boot_disks(&env, &[(&disk, true)], "");
     assert!(!b.timed_out, "{}", b.dump());
     assert!(b.has("slot=b skipped: cannot record the boot attempt"), "{}", b.dump());
+    // The image is read and verified first; only then is the try recorded (and here, refused).
+    let (verified, skipped) = (b.pos("image verified slot=b"), b.pos("slot=b skipped: cannot record"));
+    assert!(
+        verified.is_some() && verified < skipped,
+        "a try must not be spent before the image was read:\n{}",
+        b.dump()
+    );
     assert!(b.has("selected slot=a epoch=1"), "the proven slot must still boot:\n{}", b.dump());
     assert!(!b.has("selected slot=b"), "an update must not run without its try being recorded:\n{}", b.dump());
     assert!(b.has("JLR-STAGE2: ready"), "{}", b.dump());
-    assert_eq!(file_digest(&disk), before, "the write-protected medium must be untouched");
+    // (The drive is attached `readonly=on`, so QEMU itself keeps the image unchanged; what this test shows is what
+    // the boot does about a medium it cannot write.)
 }
 
 #[test]
@@ -676,4 +693,23 @@ fn an_unreadable_boot_state_stops_the_boot_instead_of_resetting_the_floor() {
     );
     let b = boot(&env, Some(&img), "");
     assert_refused_without_running(&b, "boot state of /dev/vda cannot be read");
+}
+
+#[test]
+fn the_highest_floor_on_any_medium_is_written_to_the_medium_that_boots() {
+    let Some(env) = env() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    // The booting disk's release has epoch 6 but a `min_epoch` of only 4, and its own state says floor 0. The other
+    // disk recorded floor 5. After the boot proves itself, the booting disk must record 5, not the 4 that its own
+    // release would raise it to: the floor that applied to this boot must not be lost from the medium that ran it.
+    let image = fs::read(env.out.join("base.sqfs")).unwrap();
+    let slot = Slot { name: "a", manifest: manifest(&image, 6, 4, &release_key()), image };
+    let booting = build_named_disk(&env, dir.path(), "boot", &[slot], None, None);
+    let other = build_named_disk(&env, dir.path(), "other", &[good_slot(&env, "a", 5)], Some(&proven_state(5)), None);
+    let b = boot_disks(&env, &[(&booting, false), (&other, false)], "");
+    assert!(!b.timed_out, "{}", b.dump());
+    assert!(b.has("media=2 rollback floor=5"), "{}", b.dump());
+    assert!(b.has("selected slot=a epoch=6"), "{}", b.dump());
+    assert!(b.has("slot a marked successful; rollback floor is now 5"), "{}", b.dump());
+    assert_eq!(read_state(&env, &booting).floor, 5);
 }
