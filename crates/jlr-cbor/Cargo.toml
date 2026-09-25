@@ -1,0 +1,17 @@
+[package]
+name = "jlr-cbor"
+description = "JLR-DCBOR/1: strict deterministic CBOR (RFC 8949 section 4.2.1 subset) for JLR signed records"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

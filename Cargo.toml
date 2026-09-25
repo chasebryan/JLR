@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/jlr-cbor",
+    "crates/jlr-crypto",
+    "crates/jlr-model",
+    "crates/jlr-ledger",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "AGPL-3.0-only"
+repository = "https://github.com/chasebryan/JLR"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+jlr-cbor = { path = "crates/jlr-cbor" }
+jlr-crypto = { path = "crates/jlr-crypto" }
+jlr-model = { path = "crates/jlr-model" }
+jlr-ledger = { path = "crates/jlr-ledger" }
+jlr-policy = { path = "crates/jlr-policy" }
+jlr-measure = { path = "crates/jlr-measure" }
+jlr-cell = { path = "crates/jlr-cell" }
+jlr-engine = { path = "crates/jlr-engine" }
+
+# Cryptography (pure Rust in the trusted computing base)
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize", "fast"] }
+sha2 = "0.11.0"
+getrandom = "0.4.3"
+zeroize = { version = "1.9.0", features = ["derive"] }
+subtle = "2.6.1"
+
+# Linux system interfaces
+libc = "0.2"
+nix = { version = "0.31.3", features = ["fs", "mount", "sched", "process", "signal", "user", "socket", "uio", "inotify", "hostname", "resource", "term", "ioctl", "fanotify", "poll", "time", "reboot", "kmod", "dir"] }
+landlock = "0.4.7"
+seccompiler = "0.5.0"
+
+# Authoring formats and tooling (outside the signed-record path)
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
+serde_json = "1.0.151"
+clap = { version = "4.6.7", features = ["derive"] }
+thiserror = "2.0.21"
+hex = "0.4.3"
+base64 = "0.23.1"
+
+# Test-only
+proptest = "1.11.0"
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false
+
+[profile.dev]
+panic = "unwind"
+
+# Optimize dependencies (notably the elliptic-curve code) even in debug builds
+# so cryptographic test suites stay fast. Workspace crates stay unoptimized.
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
