@@ -186,6 +186,7 @@ pub struct VerifyReport {
 }
 
 struct Replayed {
+    events_parsed: Vec<Event>,
     tree: Tree,
     last_env: Digest,
     events: u64,
@@ -274,6 +275,7 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors) -> Result<Replayed, Le
     let mut tree = Tree::new();
     let mut prev = Digest::ZERO;
     let mut boot_ids: Vec<[u8; 16]> = Vec::new();
+    let mut parsed: Vec<Event> = Vec::with_capacity(frames.len());
     for (i, env) in frames.iter().enumerate() {
         let seq = i as u64;
         let v =
@@ -298,6 +300,7 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors) -> Result<Replayed, Le
         }
         prev = v.envelope_digest;
         tree.push(leaf_hash(env));
+        parsed.push(ev);
     }
 
     let cp_data = read_all(&dir.join(CHECKPOINTS))?;
@@ -334,6 +337,7 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors) -> Result<Replayed, Le
     let _ = cp_torn; // A torn checkpoint tail only loses the newest checkpoint.
 
     Ok(Replayed {
+        events_parsed: parsed,
         tree,
         last_env: prev,
         events: frames.len() as u64,
@@ -394,6 +398,18 @@ pub fn verify_dir(
         torn_tail_bytes: r.torn,
         anchor: r.checkpoints.last().map(|c| c.anchor),
     })
+}
+
+/// Reads and fully verifies every event of a ledger directory.
+///
+/// Verification is identical to [`verify_dir`]; the events are returned only
+/// when every signature, link and checkpoint is valid.
+pub fn read_events(dir: &Path, node: &str, anchors: &TrustAnchors) -> Result<Vec<Event>, LedgerError> {
+    let r = replay(dir, node, anchors)?;
+    if r.events == 0 {
+        return Err(LedgerError::Empty);
+    }
+    Ok(r.events_parsed)
 }
 
 /// A ledger open for appending.
@@ -526,6 +542,15 @@ impl Ledger {
     /// Disables `fsync` after each append. For tests and bulk import only.
     pub fn set_sync(&mut self, sync: bool) {
         self.sync = sync;
+    }
+
+    /// Flushes appended events to stable storage.
+    ///
+    /// Use after a batch written with [`Ledger::set_sync`]`(false)`.
+    pub fn sync(&mut self) -> Result<(), LedgerError> {
+        self.events.sync_data()?;
+        self.checkpoints.sync_data()?;
+        Ok(())
     }
 
     /// Number of events in the ledger.

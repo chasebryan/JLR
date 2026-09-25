@@ -18,7 +18,9 @@ mod store;
 
 pub mod merkle;
 
-pub use store::{Anchor, Checkpoint, EventDraft, Ledger, LedgerError, OpenReport, VerifyReport, verify_dir};
+pub use store::{
+    Anchor, Checkpoint, EventDraft, Ledger, LedgerError, OpenReport, VerifyReport, read_events, verify_dir,
+};
 
 #[cfg(test)]
 mod merkle_tests;

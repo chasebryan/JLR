@@ -269,6 +269,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jlr-engine"
+version = "0.1.0"
+dependencies = [
+ "jlr-cbor",
+ "jlr-cell",
+ "jlr-crypto",
+ "jlr-ledger",
+ "jlr-measure",
+ "jlr-model",
+ "jlr-policy",
+ "tempfile",
+]
+
+[[package]]
 name = "jlr-ledger"
 version = "0.1.0"
 dependencies = [

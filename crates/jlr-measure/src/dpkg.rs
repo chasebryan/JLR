@@ -142,6 +142,7 @@ impl DpkgDb {
 
 /// MD5 of a byte slice as lowercase hex. MD5 is used only to compare against
 /// dpkg's own manifests; it is not a security primitive in JLR.
+#[cfg(test)]
 pub fn md5_hex(data: &[u8]) -> String {
     Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }

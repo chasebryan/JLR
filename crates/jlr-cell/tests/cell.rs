@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Integration tests that launch real cells and check that confinement holds.
 //!
 //! They use the host's own `sh` and `bash` as workloads. Where the kernel does

@@ -279,3 +279,20 @@ fn permissions_are_private() {
     assert_eq!(mode(path(&dir).join("events.log")), 0o600);
     assert_eq!(mode(path(&dir).join("checkpoints.log")), 0o600);
 }
+
+#[test]
+fn read_events_returns_verified_history_in_order() {
+    let (dir, l) = fresh(3);
+    drop(l);
+    let evs = crate::read_events(&path(&dir), NODE, &anchors()).unwrap();
+    assert_eq!(evs.len(), 4);
+    assert_eq!(evs[0].kind, EventKind::Genesis);
+    assert!(evs.iter().enumerate().all(|(i, e)| e.seq == i as u64));
+    // A damaged ledger yields no events at all, never a partial list.
+    let file = path(&dir).join("events.log");
+    let mut data = fs::read(&file).unwrap();
+    let mid = data.len() / 2;
+    data[mid] ^= 1;
+    fs::write(&file, data).unwrap();
+    assert!(crate::read_events(&path(&dir), NODE, &anchors()).is_err());
+}
