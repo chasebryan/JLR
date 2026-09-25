@@ -336,3 +336,53 @@ fn damaged_or_truncated_caches_are_ignored_not_trusted() {
     let mut db = DpkgDb::load_cached(sys.path(), &cache).unwrap();
     assert!(db.ownership("/usr/bin/tool").is_some());
 }
+
+#[test]
+fn an_edit_that_restores_mtime_is_still_detected_because_ctime_cannot_be_restored() {
+    use std::os::unix::fs::FileExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "victim", &vec![7u8; 300_000], 0o755);
+    let mut f = fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+    let original_mtime = f.metadata().unwrap().modified().unwrap();
+    // The worst moment: after the bytes were hashed, before the state is re-checked, the owner rewrites
+    // hashed bytes and puts the old mtime back. Size and mtime are then identical to before.
+    let writer = fs::OpenOptions::new().write(true).open(&p).unwrap();
+    let mut evil = || {
+        std::thread::sleep(std::time::Duration::from_millis(20)); // ensure ctime moves on coarse clocks
+        writer.write_all_at(&[0xee; 4096], 0).unwrap();
+        writer.set_modified(original_mtime).unwrap();
+    };
+    let r = measure_file_with(&mut f, 1 << 20, &mut evil);
+    assert!(matches!(r, Err(MeasureError::ChangedWhileReading)), "mtime-restoring edit went unnoticed: {r:?}");
+}
+
+#[test]
+fn a_file_that_keeps_changing_is_reported_not_measured() {
+    use std::os::unix::fs::FileExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "moving", b"#!/bin/sh\n", 0o755);
+    let mut f = fs::OpenOptions::new().read(true).open(&p).unwrap();
+    let writer = fs::OpenOptions::new().write(true).open(&p).unwrap();
+    let mut counter = 0u8;
+    let mut always = || {
+        counter = counter.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        writer.write_all_at(&[counter], 0).unwrap();
+    };
+    // Each attempt changes the file after reading, so every retry fails and the result is an error.
+    let mut last = Ok(());
+    for _ in 0..3 {
+        last = measure_file_with(&mut f, 1 << 20, &mut always).map(drop);
+    }
+    assert!(matches!(last, Err(MeasureError::ChangedWhileReading)));
+}
+
+#[test]
+fn stamps_record_state_before_hashing() {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "s", b"abc", 0o644);
+    let (_f, m) = open_measured(&p, 1 << 20).unwrap();
+    assert_eq!(m.stamp.size, 3);
+    assert!(m.stamp.ctime_ns > 0 && m.stamp.mtime_ns > 0);
+    assert_eq!(m.stamp.ino, std::os::unix::fs::MetadataExt::ino(&fs::metadata(&p).unwrap()));
+}

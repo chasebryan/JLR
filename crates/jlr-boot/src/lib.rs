@@ -24,6 +24,7 @@
 #![deny(unsafe_code)]
 
 mod manifest;
+pub mod media;
 mod state;
 #[allow(unsafe_code)]
 pub mod sys;

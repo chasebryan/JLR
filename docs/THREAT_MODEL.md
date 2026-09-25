@@ -61,9 +61,13 @@ provides evidence, not repair.
 
 *Can:* write the boot medium (a removable stick, a shared disk) but does not hold the release key.
 *JLR today:* cannot boot a chosen image (manifest signature, role and image digest are checked before use), cannot make the
-machine run a validly signed **older** release once the floor has risen, and cannot cause anything from the media to run after
-a refusal. *Remains:* replace the initramfs (and with it the anchors), lower the floor and the boot state, or deny service by
-corrupting every slot. The first two need the authenticated-boot milestone.
+machine run a validly signed **older** release once the floor has risen while any medium that recorded the raised floor is
+attached (the highest floor on any attached medium applies) or at all when the initramfs is pinned to the real medium, and
+cannot cause anything from the media to run after a refusal. A read error or a damaged state file stops the boot; it never
+reads as "fresh" and never resets the floor, and only proof that an image is bad (digest or size) retires a slot.
+*Remains:* replace the initramfs (and with it the anchors), lower the floor and the boot state on every attached medium at
+once, offer an older release when the real medium is absent and the initramfs is unpinned, or deny service (a state file
+with a very high floor, or a damaged one). The first three need the authenticated-boot milestone or the TPM counter.
 
 ### A8 - Local co-tenant and workload in a cell (added)
 
@@ -114,7 +118,7 @@ Every case must have a test or an explicit gap.
 | 1 | Modified admitted executable | Engine tamper test; QEMU `tampered known: BLOCKED` |
 | 2 | Symlink or path replacement between measurement and use | Symlink refusal; descriptor-measurement tests; sealed-exec tests |
 | 3 | The package database lies about file identity | Manifest mismatch is evidence; a *consistent* lie yields only `SOURCE_KNOWN`, which policy cannot admit. **Gap:** an operator baseline enrols what the database vouches for |
-| 4 | Stolen or revoked signing key | Revocation by signer; tests for every revocation kind |
+| 4 | Stolen or revoked signing key | Revocation by digest and EPN, in every accepted spelling, with malformed targets refused (`revocation_targets_are_validated_and_put_in_the_form_the_matcher_compares`). **Gap:** revocation by signer is accepted, but no source adapter records a signer identity yet, so it matches nothing today; the command says so |
 | 5 | Jail attempts host namespace entry | Cell tests: no `unshare`, no `chroot`, no host paths, PID isolation |
 | 6 | Hostile process writes an executable into a trusted path | `WRITABLE_PATH` evidence caps the cell; the gate denies the new file when enforcing |
 | 7 | Host root tries to change JLR policy | Tampered, wrong-role and rolled-back policy are refused. **Gap:** in companion mode root holds the policy key |
@@ -131,6 +135,17 @@ Every case must have a test or an explicit gap.
 | 18 | A signed policy replayed as a release, or the reverse | Envelope type-confusion tests, including in QEMU |
 | 19 | A stale cached verdict outliving a policy change | The daemon clears its cache on signed-state changes and expires verdicts by age; the QEMU audit-to-enforce flip |
 | 20 | An unverified image reaching the mount | Image hashed while copied into RAM; refusal scenarios; nothing runs after a refusal |
+| 21 | A user makes measurement fail (pad a file past the limit, touch it in a loop, use a FIFO) to slip past the gate | Unmeasurable files are decisions and are denied when enforcing (`a_file_that_cannot_be_measured_is_a_denial_not_an_internal_error`); QEMU `enforce unmeasurable: BLOCKED` |
+| 22 | A file system mounted after the gate started | QEMU `late mount stranger: BLOCKED`. **Gap:** mounts in another mount namespace (limitation 5 in SECURITY_BOUNDARIES) |
+| 23 | An unprivileged user floods the gate with new executables to stall everyone or grow governance state | Per-user slow-path budget; bounded caches; a repeat exec of an unchanged file writes nothing (`a_repeat_exec_decision_for_an_unchanged_file_writes_nothing`); O(1) prefix roots in the ledger. **Gap:** the gate is one thread, and root is not throttled |
+| 24 | Hostile file, policy or revocation text forges terminal or ledger lines, or moves the policy epoch floor | `sanitize` on every printed and logged attacker-influenced string; policy and tier names are a plain alphabet; the epoch floor is parsed from fixed fields (`the_policy_epoch_floor_ignores_prose_an_author_controls`, `attacker_chosen_names_cannot_inject_control_characters_into_the_ledger`) |
+| 25 | A cell workload types into the operator's terminal, uses a leaked descriptor, or reads the host kernel log | Cell tests for each, mutation-checked |
+| 26 | A second attached disk offers an older release or shadows the real medium | QEMU: `a_second_disk_with_an_older_release_cannot_downgrade_the_machine`, `a_pinned_boot_never_uses_or_mounts_another_disk` |
+| 27 | A transient I/O error or a damaged state file retires a good slot or resets the floor | Boot unit tests and the QEMU unreadable-state and write-protected-medium scenarios |
+| 28 | A crash or full disk leaves a torn checkpoint and the next checkpoint corrupts the log | `a_torn_checkpoint_tail_is_quarantined_and_does_not_brick_the_ledger`, `a_failed_append_leaves_no_bytes_behind` |
+| 29 | An edit that restores the modification time, or a file that keeps changing, is measured as if stable | `an_edit_that_restores_mtime_is_still_detected_because_ctime_cannot_be_restored`, `a_file_that_keeps_changing_is_reported_not_measured` |
+| 30 | A withdrawn or superseded approval or baseline is restored from a copy, or a copy under another name shadows the current one | `a_withdrawn_approval_cannot_be_put_back_from_a_copy`, `a_superseded_baseline_cannot_be_restored_from_a_copy` |
+| 31 | The path index or an object is deleted or truncated to hide a replaced file | `losing_the_path_index_does_not_hide_that_a_trusted_file_was_replaced`, `losing_the_object_store_still_degrades_a_trusted_file_that_changes`, `a_truncated_object_is_rewritten_the_next_time_the_artifact_is_seen` |
 
 ## 7. Response principle
 

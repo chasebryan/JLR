@@ -66,6 +66,45 @@ pub fn place_fds(src_a: RawFd, a: RawFd, src_b: RawFd, b: RawFd) -> io::Result<(
     Ok(())
 }
 
+/// Closes every descriptor numbered `first` or higher.
+///
+/// The helper is started by arbitrary callers (a shell, a desktop launcher, a service manager), and any
+/// descriptor they left open without close-on-exec would otherwise reach the workload: a directory
+/// descriptor bypasses the private root, and a socket bypasses the network policy. Uses `close_range(2)`
+/// and, on kernels older than 5.9, closes numerically up to the open-file limit.
+pub fn close_from(first: RawFd) {
+    // SAFETY: close_range takes three integers; closing descriptors this process owns is sound because the
+    // caller passes only numbers it does not use itself.
+    let r =
+        unsafe { libc::syscall(libc::SYS_close_range, first as libc::c_uint, libc::c_uint::MAX, 0 as libc::c_uint) };
+    if r == 0 {
+        return;
+    }
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `lim` is a valid, writable rlimit.
+    let max =
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 { lim.rlim_cur.min(1 << 16) } else { 1024 };
+    for fd in first..max as RawFd {
+        // SAFETY: close on an integer; EBADF for descriptors that are not open is ignored.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// The Landlock ABI version the running kernel supports, or `None` when Landlock is unavailable.
+pub fn landlock_abi() -> Option<u32> {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1;
+    // SAFETY: with a null attribute pointer, size 0 and the VERSION flag the call only returns a number.
+    let v = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0 as libc::size_t,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    u32::try_from(v).ok().filter(|v| *v > 0)
+}
+
 /// Takes ownership of an inherited descriptor after checking that it is open.
 ///
 /// # Safety

@@ -19,6 +19,14 @@ a deliberate, reviewed event; see `docs/INTEGRITY_PROTOCOL.md`.
 
 ### Changed
 - Reconciled the two divergent design sets into one vocabulary; see `docs/DECISIONS.md`.
+- Follow-up to the adversarial review of the first implementation (`docs/REVIEW_2026-09.md`, 35 findings): the exec gate
+  treats unmeasurable files as decisions, marks file systems mounted later, and bounds each user's slow-path cost; boot
+  applies the highest rollback floor on any attached medium, can be pinned to one medium, boots from write-protected
+  media, and retires a slot only on proof its image is bad; cells get their own session, sweep inherited descriptors, and
+  refuse `syslog` and terminal-injection `ioctl`s; approvals and baselines are bound to the ledger; the ledger repairs a
+  torn checkpoint log; `jlr ledger verify` is read-only; `jlr run` releases the ledger lock while the program runs.
+- **State compatibility:** baselines enrolled before this change carry no ledger subject and are ignored until they are
+  enrolled again (`jlr baseline enroll`). `jlr scan` exits 3 when it could not measure everything.
 
 ### Security
 - The measured bytes are the executed bytes: launches run a sealed memfd copy that was hashed while it was copied.

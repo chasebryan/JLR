@@ -35,6 +35,8 @@ pub struct Observation {
     pub evidence: Vec<EvidenceItem>,
     /// The path that was observed.
     pub path: PathBuf,
+    /// The file's state before it was hashed (see [`crate::Stamp`]).
+    pub stamp: crate::Stamp,
 }
 
 fn item(kind: EvidenceKind, source: &str, at: u64, detail: &str) -> EvidenceItem {
@@ -63,7 +65,7 @@ pub fn observe_open(
     dpkg: Option<&mut DpkgDb>,
     opts: &ObserveOptions,
 ) -> Result<Observation, MeasureError> {
-    let m = crate::measure_file(&mut file, opts.max_size)?;
+    let m = crate::measure_file_stable(&mut file, opts.max_size)?;
     observe_measured(file, m, path, dpkg, opts)
 }
 
@@ -150,5 +152,5 @@ fn observe_measured(
         dependencies: Vec::new(),
     };
     let _ = ArtifactClass::Other;
-    Ok(Observation { file, record, evidence, path: real })
+    Ok(Observation { file, record, evidence, path: real, stamp: m.stamp })
 }

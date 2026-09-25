@@ -146,3 +146,17 @@ fn leaf_and_node_hashes_are_domain_separated() {
     concat.extend_from_slice(&b.0);
     assert_ne!(leaf_hash(&concat), node);
 }
+
+#[test]
+fn prefix_roots_are_constant_time_lookups_that_match_the_recursive_definition() {
+    let all = leaves(50);
+    let mut t = Tree::new();
+    assert_eq!(t.root_at(0), Some(empty_root()));
+    for l in &all {
+        t.push(*l);
+    }
+    for size in 0..=50 {
+        assert_eq!(t.root_at(size), Some(root_of(&all[..size])), "size {size}");
+    }
+    assert_eq!(t.root_at(51), None);
+}

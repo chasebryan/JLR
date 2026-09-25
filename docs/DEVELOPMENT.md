@@ -52,7 +52,7 @@ static `busybox`, `mksquashfs`, `mke2fs` and `debugfs`. They look for `JLR_QEMU`
 
 ```sh
 cargo build --workspace
-cargo test  --workspace                     # ~190 tests; the QEMU boots take about 15 s
+cargo test  --workspace                     # ~240 tests; the QEMU boots take about 15 s
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ./boot/build.sh                             # boot artifacts into out/boot/

@@ -16,12 +16,14 @@ disk and registers a host. Each is specified below and none is claimed.
 ```mermaid
 flowchart TB
     A["kernel + initramfs<br/>(trust anchors baked in)"] --> B["stage 1 (jlr-init)"]
-    B --> C["find media with /jlr"]
+    B --> C["find every medium with /jlr<br/>(only the pinned one, if pinned);<br/>highest rollback floor applies to all"]
     C --> D["verify each slot's manifest:<br/>signature, release role, floor"]
     D --> E["choose slot (A/B rules);<br/>spend a try durably"]
     E --> F["read image into a memfd,<br/>hash while copying,<br/>size and digest must match"]
-    F -->|mismatch| G["mark slot bad, try next slot"]
+    F -->|"digest or size mismatch"| G["retire slot, try next slot"]
+    F -->|"I/O error, no memory"| G2["skip slot for this boot only"]
     G --> E
+    G2 --> E
     F --> H["seal memfd; attach loop device;<br/>mount squashfs read-only"]
     H --> I["release the boot media"]
     I --> J["switch root; exec /sbin/init"]
@@ -36,8 +38,10 @@ flowchart TB
 |---|---|---|
 | Trust anchors present and non-empty | initramfs | `REFUSED` |
 | Manifest signature, release role, `epoch >= floor`, `min_epoch <= epoch` | stage 1, per slot | Slot not considered; logged |
-| Boot attempt recorded | stage 1, before the image is used | `REFUSED` (cannot record) |
-| Image size equals the manifest, digest equals the manifest | stage 1, while copying into RAM | Slot marked bad; next slot |
+| Boot state readable | stage 1, per medium | `REFUSED`: any failure other than "the file does not exist" (which is a fresh medium) stops the boot, because guessing would reset the rollback floor |
+| Boot attempt recorded | stage 1, before an unproven slot is used | Slot skipped for this boot (a write-protected medium cannot record it); `REFUSED` only if no slot is left |
+| Image size equals the manifest, digest equals the manifest | stage 1, while copying into RAM | Slot retired for good; next slot |
+| Image could be read and RAM allocated | stage 1 | Slot skipped for this boot, **not** retired: an I/O error or memory exhaustion is not evidence that the slot is bad |
 | Sealing, loop attach, mount | stage 1 | `REFUSED` |
 | Root is read-only; run is writable and memory-backed; manifest present; tools present | stage 2 | Slot stays unproven |
 
@@ -54,6 +58,20 @@ machine waits (or powers off or reboots, per `jlr.onfail`). The independent reco
 ```
 
 The boot media is ext4 (or vfat or iso9660, read-only) and needs no special handling: nothing on it is trusted until verified.
+Media are mounted read-only and remounted read-write only at the moment state must be written, so a disk that holds nothing
+bootable is never modified. A write-protected medium boots a proven slot; an unproven update needs its "try spent" record
+written first and is skipped there.
+
+**Which disk.** Every attached disk with a `/jlr` tree is examined and the highest rollback floor on any of them applies to
+all, so an extra disk cannot lower it. To go further, pin the initramfs to one medium by its file system identifier (the
+ext4 UUID or the FAT volume serial): `JLR_MEDIA_ID=<id> boot/build.sh` writes `/etc/jlr/media-id` into the initramfs, or
+`jlr.media=uuid=<id>` on the kernel command line does the same when no file is present. A pinned initramfs reads the first
+bytes of each other device to learn its identifier and **never mounts it**, and it refuses when the pinned medium is missing
+rather than falling back. Without a pin the console says so at every boot. Pin every real installation.
+
+**State file.** `bootstate.cbor` is replaced through `bootstate.cbor.new`. A missing file beside a complete `.new` is what a
+power cut during a rename on FAT leaves behind, and the `.new` is used, so the floor survives.
+
 The **base image** is a zstd squashfs containing BusyBox, `jlr`, `jlrd`, `jlr-cell-init`, `jlr-release` and `jlr-init` as
 `/sbin/init`, all static musl. The **initramfs** contains `jlr-init` as `/init` and `etc/jlr/anchors.cbor`, the release
 public key(s) the boot will accept.
@@ -70,12 +88,17 @@ The rules follow ChromeOS's slot triple because they need nothing from a possibl
   `min_epoch`. Raising it earlier would let a bad update strand a machine with no bootable slot;
 - installing a new release gives it maximum priority and demotes the previous one, so the update is tried first but the
   previous proven slot stays the fallback;
-- a slot whose image fails is marked bad (priority 0) and is never tried again.
+- a slot whose image is **proven bad** (digest or size mismatch) is marked bad (priority 0) and is never tried again. A
+  read error or an out-of-memory condition proves nothing about the slot: it is skipped for that boot and tried again on
+  the next, because retiring a good slot over one USB hiccup would strand the machine.
 
 Every one of these is a QEMU scenario: valid boot; tampered image; truncated image; tampered manifest; unknown signer;
 right key with the wrong record type; rollback below the floor; a broken update falling back to the proven slot; a good
 update proving itself and raising the floor, after which the old slot is refused as a rollback on the next boot; missing
-media; media without `/jlr`. A companion set of property tests covers the selection function over generated states.
+media; media without `/jlr`; a second disk carrying an older release, attached before and after the real one; a pinned
+initramfs that ignores a newer release on another disk and refuses when the pinned disk is absent; a write-protected
+medium that boots its proven slot and skips an unproven one; and an unreadable state file that stops the boot. A companion
+set of property tests covers the selection function over generated states, and unit tests cover the state file rules.
 
 **Rollback.** A validly signed old release is refused once the floor has risen. That is what stops an attacker reinstalling
 a known-vulnerable signed image.

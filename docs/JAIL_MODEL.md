@@ -45,7 +45,7 @@ and `RLIMIT_CPU`, `RLIMIT_NOFILE` and a wall-clock timer still apply.
 | `net-ns` | See section 3 | when the mode is `NONE` or `LOOPBACK_ONLY` | Stage 1 |
 | `no-new-privs` | `PR_SET_NO_NEW_PRIVS`; setuid binaries cannot elevate | yes | Stage 2 |
 | `cap-drop` | Bounding set emptied, all sets cleared, then **verified** (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SETUID` must be gone) | yes | Stage 2 |
-| `seccomp` | Deny-list filter, 50 syscalls, see section 6 | yes | Stage 2 |
+| `seccomp` | Deny-list filter, 52 entries, see section 6 | yes | Stage 2 |
 | `landlock-fs` | Write confinement to granted paths, see section 5 | no | Stage 2 |
 | `landlock-net` | TCP port rules | when the mode is `DESTINATION_ALLOWLIST` | Stage 2 |
 | `rlimits` | `RLIMIT_CORE=0`, `NOFILE`, `CPU` | no | Stage 2 |
@@ -56,7 +56,11 @@ and `RLIMIT_CPU`, `RLIMIT_NOFILE` and a wall-clock timer still apply.
 ## 5. The private root
 
 Built in a mount namespace on a tmpfs, then `pivot_root`ed into, with the old root unmounted and the new root
-remounted read-only:
+remounted read-only. The tmpfs is mounted over the first of `/tmp`, `/mnt`, `/media`, `/srv`, `/opt`, `/run` that exists
+and neither contains nor lies inside a granted path, because whatever is below it is hidden while the root is assembled
+(a grant under `/tmp` used to vanish; it is now applied). A grant that cannot be applied (a missing path, a path that is
+not absolute and normalised) does not stop the launch, but it is listed in the report as `capability: … not applied` and
+makes the status `Partial`.
 
 | Path | Contents |
 |---|---|
@@ -70,12 +74,15 @@ remounted read-only:
 Absent: `/home`, `/root`, `/var`, `/sys`, the state directory and every key. **What a cell can see is decided by the
 mount namespace.** Landlock is scoped to what it can express cleanly: it confines *writes* to the granted paths and
 handles TCP ports. Landlock rules are recursive, so allowing a directory listing of `/` would allow everything beneath it;
-reads are therefore left to the mount namespace. `EXECUTE` is deliberately not handled, because a sealed memfd has no
+reads are therefore left to the mount namespace. A rule that names a *file* (`/dev/null`) carries file rights only;
+giving it directory rights makes the library report a partly enforced ruleset, which used to hide whether the TCP rules
+had taken effect. The report now carries the kernel's real Landlock ABI, and `landlock-net` is active only when the
+whole ruleset, including the port rules, is enforced. `EXECUTE` is deliberately not handled, because a sealed memfd has no
 place in the file hierarchy for a path rule to name; executability is controlled by read-only, `noexec` mounts.
 
 ## 6. seccomp
 
-A **deny list**, installed after capabilities are dropped, with `EPERM` for the 49 denied syscalls and `ENOSYS` for
+A **deny list**, installed after capabilities are dropped, with `EPERM` for the 51 denied entries and `ENOSYS` for
 `clone3` (so libc falls back to `clone`, whose flags a filter can inspect). It removes what gives a process authority over
 the kernel, other processes, the namespace layout or the clock and leaves ordinary application behaviour alone:
 
@@ -87,7 +94,11 @@ the kernel, other processes, the namespace layout or the clock and leaves ordina
 - the attack surface that is hard to bound: `bpf`, `perf_event_open`, `userfaultfd`, the `keyctl` family, `io_uring_*`,
   `open_by_handle_at`, `name_to_handle_at`;
 - the clock and machine identity: `settimeofday`, `clock_settime`, `clock_adjtime`, `adjtimex`, `sethostname`,
-  `setdomainname`, `iopl`, `ioperm`.
+  `setdomainname`, `iopl`, `ioperm`;
+- the host kernel log: `syslog`, which needs no capability while `kernel.dmesg_restrict` is 0 and names other users'
+  processes and paths;
+- terminal control: the `ioctl` requests `TIOCSTI` (queue input as if typed), `TIOCSCTTY`, `TIOCLINUX`, `TIOCCONS` and
+  `TIOCSETD`, compared on the low 32 bits as the kernel does.
 
 A deny list is less strict than an allow list and misses syscalls added after it was written. It is used first because an
 allow list needs to know what real workloads require, and the observation cells are what will tell it. A CELL-0 allow-list
@@ -126,7 +137,16 @@ a pipe **before** `exec`, and exits with status 126 without running anything if 
 enforces the wall-clock limit and kills the namespace by killing PID 1; both stages die if the launcher dies
 (`PR_SET_PDEATHSIG`).
 
-Inherited descriptors are fixed: 3 is the sealed executable, 4 is the report pipe.
+Inherited descriptors are fixed: 3 is the sealed executable, 4 is the report pipe. Everything else is closed. The
+launcher creates the pipe close-on-exec, stage 1 calls `close_range` for descriptors 5 and above before doing anything,
+and stage 2 sweeps again just before `exec`, because a directory or socket descriptor that a shell redirection or a
+launcher left open would otherwise bypass the private root or the network policy. Descriptor 3 stays open in the workload:
+it is the program's own write-sealed image, and a script's interpreter opens it through `/proc/self/fd/3`.
+
+Stage 1 also calls `setsid`, so the workload has no controlling terminal. Without it a program started from an operator's
+shell shares that terminal, and `TIOCSTI` on a permissive kernel would type into the shell after the cell exits. The
+terminal is still the workload's standard input if the caller passed it, and it can read and write it; use a null
+standard input for programs that need none.
 
 ## 10. What a workload cannot do
 
@@ -139,7 +159,14 @@ Tested with real cells, and mutation-checked so that removing a control makes a 
   `NoNewPrivs` is 1);
 - see host processes (it is PID 1 and `/proc` lists a handful);
 - inherit the caller's environment (only the variables in the spec);
-- run a different program than the one that was measured, even if the path is replaced and the original file edited.
+- run a different program than the one that was measured, even if the path is replaced and the original file edited;
+- use a leaked descriptor (`descriptors_left_open_by_the_launcher_do_not_reach_the_workload`), open the report pipe
+  (`the_report_pipe_is_not_open_in_the_workload`), keep the operator's controlling terminal
+  (`the_workload_has_no_controlling_terminal_even_when_started_from_one`), type into that terminal
+  (`a_terminal_cannot_be_used_to_type_into_the_operators_shell`) or read the host kernel log
+  (`the_host_kernel_log_cannot_be_read_from_inside_a_cell`);
+- exceed a destination allow-list: a port that was not granted is unreachable and the granted one works
+  (`the_destination_allow_list_is_enforced_by_landlock_and_reported_as_active`).
 
 ## 11. Escape response
 

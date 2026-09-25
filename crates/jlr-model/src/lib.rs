@@ -27,6 +27,34 @@ pub use decision::{Decision, EvidenceItem, EvidenceKind, ReasonCode};
 pub use event::{Basis, Event, EventKind};
 pub use state::{AdmissionState, Assurance, Posture, TransitionError};
 
+/// Makes untrusted text safe to store in an event and to print on a terminal.
+///
+/// File names, paths and error strings come from whoever controls the file system. Left raw they can
+/// carry newlines (forging ledger rows in `jlr ledger log`), terminal escape sequences, and Unicode
+/// bidirectional or zero-width controls that make one string read as another. Backslashes, control
+/// characters and those format characters are written as `\\` and `\u{..}` escapes, and overlong text is
+/// truncated, so the result is one line of visible text.
+pub fn sanitize(s: &str) -> String {
+    use std::fmt::Write as _;
+    const LIMIT: usize = 1024;
+    let mut out = String::with_capacity(s.len().min(LIMIT + 16));
+    for c in s.chars() {
+        if out.len() >= LIMIT {
+            out.push_str("\u{2026}[truncated]");
+            break;
+        }
+        let format_control = matches!(c as u32, 0x00AD | 0x061C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB);
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c.is_control() || format_control {
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Record-type names used in envelope headers and signing scope.
 pub mod record_type {
     use jlr_crypto::Role;

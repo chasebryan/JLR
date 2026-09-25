@@ -240,3 +240,18 @@ fn identity_is_stable_across_observations() {
     assert_eq!(a.id(), b.id());
     assert_eq!(a.to_cbor(), b.to_cbor());
 }
+
+#[test]
+fn sanitize_makes_untrusted_text_one_line_of_visible_characters() {
+    assert_eq!(sanitize("/usr/bin/ls"), "/usr/bin/ls");
+    assert_eq!(sanitize("a\nb"), "a\\u{a}b", "a newline must not be able to start a forged ledger row");
+    assert_eq!(sanitize("x\x1b[2Jy"), "x\\u{1b}[2Jy", "terminal escapes are neutralised");
+    assert_eq!(sanitize("a\\b"), "a\\\\b", "backslashes are escaped so escapes stay unambiguous");
+    // Bidirectional overrides and zero-width characters can make one name read as another.
+    assert_eq!(sanitize("exe\u{202e}gpj.txt"), "exe\\u{202e}gpj.txt");
+    assert_eq!(sanitize("a\u{200b}b"), "a\\u{200b}b");
+    assert_eq!(sanitize("caf\u{e9}"), "caf\u{e9}", "ordinary non-ASCII text is kept");
+    let long = "x".repeat(5000);
+    assert!(sanitize(&long).len() < 1100 && sanitize(&long).ends_with("[truncated]"));
+    assert!(!sanitize("\r\n\t\0").chars().any(char::is_control));
+}

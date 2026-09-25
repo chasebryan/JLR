@@ -37,6 +37,19 @@ cp /bin/busybox /tmp/opt/stranger2/busybox
 try "enforce stranger2" /tmp/opt/stranger2/busybox
 try "enforce system tool" /bin/busybox
 
+# A file the gate cannot measure (padded past the size limit by whoever owns it) is DENIED, never waved through.
+mkdir -p /tmp/opt/padded
+cp /bin/busybox /tmp/opt/padded/busybox
+truncate -s 600M /tmp/opt/padded/busybox
+try "enforce unmeasurable" /tmp/opt/padded/busybox
+
+# A file system mounted AFTER the daemon started is gated as well.
+mkdir -p /tmp/late
+mount -t tmpfs tmpfs /tmp/late
+cp /bin/busybox /tmp/late/busybox
+sleep 1
+try "late mount stranger" /tmp/late/busybox
+
 # Tamper with an enrolled binary: it must stop being trusted.
 echo tampered >> /tmp/opt/known/busybox
 try "tampered known" /tmp/opt/known/busybox

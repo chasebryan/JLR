@@ -69,6 +69,14 @@ impl fmt::Display for PolicyError {
 }
 impl std::error::Error for PolicyError {}
 
+/// Names reach the ledger and operator terminals. Keeping them to a plain alphabet means a name can never carry
+/// control characters, line breaks or text that reads like another field (for example `epoch=9`).
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 fn bad<T>(msg: impl Into<String>) -> Result<T, PolicyError> {
     Err(PolicyError(msg.into()))
 }
@@ -89,8 +97,8 @@ impl Policy {
         if self.schema != Self::SCHEMA {
             return bad(format!("unsupported schema {}", self.schema));
         }
-        if self.name.is_empty() || self.name.len() > 128 {
-            return bad("name must be 1 to 128 bytes");
+        if !plain_name(&self.name) {
+            return bad("name must be 1 to 128 characters from A-Z a-z 0-9 . _ -");
         }
         if self.epoch == 0 {
             return bad("epoch must be positive");
@@ -110,8 +118,11 @@ impl Policy {
         }
         let mut seen = std::collections::BTreeSet::new();
         for t in &self.tiers {
-            if t.name.is_empty() || !seen.insert(t.name.as_str()) {
-                return bad(format!("tier names must be unique and non-empty: {:?}", t.name));
+            if !plain_name(&t.name) || !seen.insert(t.name.as_str()) {
+                return bad(format!(
+                    "tier names must be unique, 1 to 128 characters from A-Z a-z 0-9 . _ -: {:?}",
+                    jlr_model::sanitize(&t.name)
+                ));
             }
             let grants_run = t.state.permits_normal_execution();
             if grants_run && !t.max_provenance.satisfies(ProvenanceRank::VerifiedChecksum) {

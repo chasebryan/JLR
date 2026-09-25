@@ -138,7 +138,10 @@ shifted into one another.)
 The check is an *integrity* check on the length field, not a security control. It exists so that a damaged length is an
 **error**, never mistaken for a torn write. A trailing frame that is incomplete, whose header is valid, is a *torn tail*
 (a crash during append): its bytes are copied to `events.log.torn.N`, the file is truncated to the last whole frame, and
-the repair is logged. Torn bytes are never deleted.
+the repair is logged. Torn bytes are never deleted. `checkpoints.log` follows the same rules (`checkpoints.log.torn.N`) and
+is repaired when the ledger is opened, so a later checkpoint is never appended behind garbage. An append that fails part
+way removes what it wrote, so a full disk cannot leave a torn frame in the middle of the log, and the counter advances
+only after the frame is durable.
 
 **Merkle tree.** The tree is RFC 9162: leaf hash `SHA-256(0x00 || envelope)`, node hash `SHA-256(0x01 || left || right)`.
 Inclusion and consistency proofs are as specified there, and are tested for every size and index up to 40, against the

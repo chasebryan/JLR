@@ -403,3 +403,49 @@ fn opening_verifies_only_the_events_since_the_last_checkpoint() {
     let (l, _) = Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).unwrap();
     assert_eq!(l.events_since_checkpoint(), 3, "the checkpoint position survives a reopen");
 }
+
+#[test]
+fn a_torn_checkpoint_tail_is_quarantined_and_does_not_brick_the_ledger() {
+    let (dir, mut l) = fresh(3);
+    l.checkpoint().unwrap();
+    drop(l);
+    let cps = path(&dir).join("checkpoints.log");
+    let whole = fs::read(&cps).unwrap();
+    // A crash mid-append: a valid header announcing 200 bytes, of which 30 arrived.
+    let mut partial = crate::store::frame_header(200).to_vec();
+    partial.extend_from_slice(&[0xab; 30]);
+    let mut torn = whole.clone();
+    torn.extend_from_slice(&partial);
+    fs::write(&cps, &torn).unwrap();
+
+    let (mut l, rep) = Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).unwrap();
+    assert_eq!(rep.checkpoint_torn_bytes, partial.len() as u64);
+    assert_eq!(fs::read(&cps).unwrap(), whole, "the log is cut back to the last whole checkpoint");
+    assert_eq!(fs::read(path(&dir).join("checkpoints.log.torn.0")).unwrap(), partial, "and the bytes are kept");
+
+    // Before the fix the next checkpoint was appended after the garbage and every later open failed.
+    l.checkpoint().unwrap();
+    l.append(EventDraft::new("test", EventKind::Discover, "after repair")).unwrap();
+    l.checkpoint().unwrap();
+    drop(l);
+    let r = verify_dir(&path(&dir), NODE, &anchors(), None).unwrap();
+    assert_eq!(r.checkpoints, 3);
+    assert!(Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).is_ok());
+}
+
+#[test]
+fn a_failed_append_leaves_no_bytes_behind() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f");
+    let mut file = fs::OpenOptions::new().create(true).append(true).read(true).open(&f).unwrap();
+    file.write_all(b"good").unwrap();
+    // Read-only clone cannot write: simulate the failure by writing through a closed-for-write handle.
+    let mut ro = fs::OpenOptions::new().read(true).open(&f).unwrap();
+    assert!(crate::store::append_frame(&mut ro, b"bad", false).is_err());
+    ro.seek(SeekFrom::Start(0)).unwrap();
+    assert_eq!(fs::read(&f).unwrap(), b"good");
+    // A successful append still works and is durable when asked.
+    crate::store::append_frame(&mut file, b"+more", true).unwrap();
+    assert_eq!(fs::read(&f).unwrap(), b"good+more");
+}

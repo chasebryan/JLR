@@ -77,6 +77,11 @@ The exec gate has two modes, chosen by the signed policy:
 | **audit** (default) | Records what it *would* deny. Nothing is blocked. |
 | **enforce** | Denies `exec` of anything whose decision is not `VERIFIED` or `ADMITTED`. |
 
+A file the gate cannot measure (padded past the size limit, changing while it is read, not a regular file) is treated as a
+decision, not a fault: it is denied when enforcing and logged as "would deny (unmeasurable)" when auditing. A file system
+mounted after `jlrd` started is marked as soon as the kernel reports it. A user who makes the gate do a great deal of
+unmeasured work is throttled (`--slow-budget-secs`) so that their `exec` calls, not everyone's, wait.
+
 ```sh
 sudo jlrd --state /var/lib/jlr &           # or install contrib/jlrd.service
 jlr ledger log -n 100 | grep 'exec gate'   # what would have been blocked?
@@ -202,6 +207,11 @@ release is signed with a release key that never touches the build host's network
 | `verification failed: policy: ...` | The signed policy no longer verifies | Do not "fix" by deleting it. Restore the last good policy file or re-sign from the policy key. The engine will not start without a valid one |
 | `rollback refused: policy epoch N is older than ...` | An older validly signed policy was put back | Treat as tampering. Investigate before restoring the newer policy |
 | `posture DEGRADED` after a scan | A trusted binary changed | `jlr scan` lists the paths. Was it an update? If not, isolate the machine |
+| `jlr scan` exits 3 | Some files could not be measured (unreadable, too large, changing) | The output lists the first few. A scan that could not look at everything is not a clean scan |
+| A ledger event says `ignored unverifiable object: … not the approval (or baseline) the ledger records as current` | An approval or baseline file is not the one the ledger records last: a superseded copy was restored, or the file was edited | It grants nothing. Restore the file the ledger expects, or approve or enrol again |
+| A ledger event says `the path index was missing or damaged` | The cache of paths was deleted or corrupted | JLR rebuilt it from the ledger. Run `jlr scan --full`; if a trusted file was replaced meanwhile it will be reported |
+| Boot prints `boot media is not pinned` | The initramfs accepts any attached disk with a `/jlr` tree | Pin it: build with `JLR_MEDIA_ID=<ext4 UUID or FAT serial>` |
+| Boot prints `slot=… skipped` | A slot could not be used on this boot (medium is write-protected, or a read error) | Nothing was retired. Fix the medium; the slot is tried again next boot |
 | Boot prints `REFUSED reason=...` and `RECOVERY-RESTRICTED` | The base image, manifest, signer or rollback floor failed | Nothing from the media was run. Boot independent recovery media. The reason line names the check |
 | `jlr run` says `denied` | The decision does not allow it to run | `jlr explain PATH`; approve, or leave it |
 | Everything is slow after months | Very large ledger | Opening verifies events after the last checkpoint and hashes the rest; see the roadmap for persisted tree state |

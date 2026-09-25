@@ -50,6 +50,8 @@ pub fn root_of(leaves: &[Digest]) -> Digest {
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
     leaves: Vec<Digest>,
+    /// `roots[n - 1]` is the root of the first `n` leaves, so any prefix root is O(1).
+    roots: Vec<Digest>,
     /// Roots of the perfect subtrees covering the leaves, largest first,
     /// as `(height, hash)`. Lets the current root be computed incrementally.
     peaks: Vec<(u32, Digest)>,
@@ -80,6 +82,8 @@ impl Tree {
             height += 1;
         }
         self.peaks.push((height, hash));
+        let root = self.root();
+        self.roots.push(root);
     }
 
     /// Current root in O(log n).
@@ -94,7 +98,11 @@ impl Tree {
 
     /// Root of the first `size` leaves.
     pub fn root_at(&self, size: usize) -> Option<Digest> {
-        (size <= self.size()).then(|| root_of(&self.leaves[..size]))
+        match size {
+            0 => Some(empty_root()),
+            n if n <= self.size() => Some(self.roots[n - 1]),
+            _ => None,
+        }
     }
 
     /// Leaf hash at `index`.

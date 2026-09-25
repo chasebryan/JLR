@@ -259,3 +259,128 @@ proptest! {
         }
     }
 }
+
+// ---- boot media and state files ---------------------------------------------------------------------------
+
+mod media_tests {
+    use crate::media::{StateRead, filesystem_id, parse_pin, read_state, write_state};
+    use crate::{BootError, BootState, SlotState};
+    use jlr_cbor::Cbor;
+    use jlr_crypto::Digest;
+    use std::fs;
+
+    fn media_dir() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("jlr")).unwrap();
+        d
+    }
+
+    fn proven_at(floor: u64) -> BootState {
+        BootState { floor, slots: vec![SlotState { name: "a".into(), priority: 15, tries: 0, successful: true }] }
+    }
+
+    #[test]
+    fn a_missing_state_file_is_a_fresh_medium_and_nothing_else_is() {
+        let d = media_dir();
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Fresh(BootState::fresh()));
+
+        // A damaged file is an error, never "fresh": that would reset the rollback floor to zero.
+        fs::write(d.path().join("jlr/bootstate.cbor"), b"\xff\xff garbage").unwrap();
+        assert!(matches!(read_state(d.path()), Err(BootError::Io(_))));
+        let mut truncated = proven_at(9).to_cbor();
+        truncated.truncate(truncated.len() - 1);
+        fs::write(d.path().join("jlr/bootstate.cbor"), truncated).unwrap();
+        assert!(read_state(d.path()).is_err());
+
+        // So is any other read failure. A directory where the file should be reads as EISDIR.
+        fs::remove_file(d.path().join("jlr/bootstate.cbor")).unwrap();
+        fs::create_dir(d.path().join("jlr/bootstate.cbor")).unwrap();
+        assert!(matches!(read_state(d.path()), Err(BootError::Io(_))), "an unreadable state must not read as fresh");
+    }
+
+    #[test]
+    fn state_round_trips_and_leaves_no_temporary_file() {
+        let d = media_dir();
+        let st = proven_at(7);
+        write_state(d.path(), &st).unwrap();
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(st));
+        assert!(!d.path().join("jlr/bootstate.cbor.new").exists());
+    }
+
+    #[test]
+    fn an_interrupted_rename_does_not_reset_the_floor() {
+        // A power cut in the middle of replacing the file on FAT leaves the complete new file beside a missing
+        // old one. The floor recorded there must survive.
+        let d = media_dir();
+        fs::write(d.path().join("jlr/bootstate.cbor.new"), proven_at(12).to_cbor()).unwrap();
+        match read_state(d.path()).unwrap() {
+            StateRead::Recovered(s) => assert_eq!(s.floor, 12),
+            other => panic!("{other:?}"),
+        }
+        // When both exist the rename did not happen; the file that was renamed earlier is authoritative.
+        fs::write(d.path().join("jlr/bootstate.cbor"), proven_at(3).to_cbor()).unwrap();
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(proven_at(3)));
+        // A torn .new is an error, not a silent reset.
+        fs::remove_file(d.path().join("jlr/bootstate.cbor")).unwrap();
+        fs::write(d.path().join("jlr/bootstate.cbor.new"), b"\x01").unwrap();
+        assert!(read_state(d.path()).is_err());
+    }
+
+    #[test]
+    fn only_content_that_is_provably_bad_retires_a_slot() {
+        let mut st = BootState::fresh();
+        st.install("b");
+        let before = st.clone();
+        assert!(!st.record_image_failure("b", &BootError::Io("read error".into())));
+        assert_eq!(st, before, "an I/O error must not change the state");
+        let bad = BootError::ImageDigest { expected: Digest::of(b"x"), actual: Digest::of(b"y") };
+        assert!(st.record_image_failure("b", &bad));
+        assert_eq!(st.slots.iter().find(|s| s.name == "b").unwrap().priority, 0);
+        let mut st2 = before;
+        assert!(st2.record_image_failure("b", &BootError::ImageSize { expected: 2, actual: 1 }));
+        assert!(
+            !BootError::NoBootableSlot.proves_bad_content() && !BootError::Manifest("x".into()).proves_bad_content()
+        );
+    }
+
+    #[test]
+    fn media_pins_parse_strictly() {
+        assert_eq!(
+            parse_pin("uuid=6F1B2C3D-0000-4444-8888-123456789ABC\n").as_deref(),
+            Some("6f1b2c3d-0000-4444-8888-123456789abc")
+        );
+        assert_eq!(parse_pin(" ABCD-1234 ").as_deref(), Some("abcd-1234"));
+        assert_eq!(parse_pin("id=abcd-1234").as_deref(), Some("abcd-1234"));
+        for bad in ["", "uuid=", "not a uuid", "uuid=xyz", "a b", "../../dev/sda", &"a".repeat(65)] {
+            assert_eq!(parse_pin(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn filesystem_ids_are_read_from_superblocks() {
+        // ext: magic 0xEF53 at superblock+56, UUID at +104.
+        let mut head = vec![0u8; 2048];
+        head[1024 + 56..1024 + 58].copy_from_slice(&[0x53, 0xEF]);
+        let uuid: Vec<u8> = (0..16).collect();
+        head[1024 + 104..1024 + 120].copy_from_slice(&uuid);
+        assert_eq!(filesystem_id(&head).as_deref(), Some("00010203-0405-0607-0809-0a0b0c0d0e0f"));
+        // FAT32: boot signature, "FAT32   " at 82, serial at 67 (little endian, printed high half first).
+        let mut fat = vec![0u8; 2048];
+        fat[510] = 0x55;
+        fat[511] = 0xAA;
+        fat[82..90].copy_from_slice(b"FAT32   ");
+        fat[67..71].copy_from_slice(&[0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(filesystem_id(&fat).as_deref(), Some("1234-5678"));
+        // FAT16 keeps the serial at 39.
+        let mut fat16 = vec![0u8; 2048];
+        fat16[510] = 0x55;
+        fat16[511] = 0xAA;
+        fat16[54..62].copy_from_slice(b"FAT16   ");
+        fat16[39..43].copy_from_slice(&[0xEF, 0xBE, 0xAD, 0xDE]);
+        assert_eq!(filesystem_id(&fat16).as_deref(), Some("dead-beef"));
+        // Nothing recognisable, or too short to hold a superblock: no identifier, so a pinned boot never trusts it.
+        assert_eq!(filesystem_id(&[0u8; 2048]), None);
+        assert_eq!(filesystem_id(&[0u8; 100]), None);
+        assert_eq!(filesystem_id(&[]), None);
+    }
+}

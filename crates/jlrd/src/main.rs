@@ -28,12 +28,16 @@
 
 #![forbid(unsafe_code)]
 
+mod budget;
+
+use budget::Budgets;
 use jlr_engine::{Config, Engine, EngineError, Paths, ScanOptions, list_artifacts};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::fanotify::{EventFFlags, Fanotify, FanotifyResponse, InitFlags, MarkFlags, MaskFlags, Response};
 use nix::sys::inotify::{AddWatchFlags, InitFlags as InoInit, Inotify};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -75,6 +79,9 @@ struct Args {
     force_audit: bool,
     fail_closed: bool,
     lock_wait: Duration,
+    /// Slow-path seconds each non-root user may spend per minute before their unknown executions are
+    /// answered by policy without being measured.
+    slow_budget: Duration,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -86,6 +93,7 @@ fn parse_args() -> Result<Args, String> {
         force_audit: false,
         fail_closed: false,
         lock_wait: Duration::from_secs(3),
+        slow_budget: Duration::from_secs(10),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -97,12 +105,17 @@ fn parse_args() -> Result<Args, String> {
             "--scan-every" => a.scan_every = val("--scan-every")?.parse().map_err(|_| "bad --scan-every")?,
             "--audit" => a.force_audit = true,
             "--fail-closed" => a.fail_closed = true,
+            "--slow-budget-secs" => {
+                a.slow_budget =
+                    Duration::from_secs(val("--slow-budget-secs")?.parse().map_err(|_| "bad --slow-budget-secs")?)
+            }
             "--lock-wait-ms" => {
                 a.lock_wait = Duration::from_millis(val("--lock-wait-ms")?.parse().map_err(|_| "bad --lock-wait-ms")?)
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: jlrd [--state DIR] [--mark PATH]... [--scan-root PATH]... [--scan-every SECS] [--audit] [--fail-closed]"
+                    "usage: jlrd [--state DIR] [--mark PATH]... [--scan-root PATH]... [--scan-every SECS] [--audit] [--fail-closed] \
+                     [--lock-wait-ms N] [--slow-budget-secs N]"
                 );
                 std::process::exit(0);
             }
@@ -185,24 +198,22 @@ fn run() -> Result<(), String> {
         EventFFlags::O_RDONLY | EventFFlags::O_LARGEFILE | EventFFlags::O_CLOEXEC,
     )
     .map_err(|e| format!("fanotify_init: {e} (needs root / CAP_SYS_ADMIN)"))?;
-    let marks = if args.marks.is_empty() { discover_marks() } else { args.marks.clone() };
     let root = File::open("/").map_err(|e| e.to_string())?;
-    let mut marked = 0;
-    for m in &marks {
-        match fan.mark(
-            MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
-            MaskFlags::FAN_OPEN_EXEC_PERM,
-            &root,
-            Some(m),
-        ) {
-            Ok(()) => marked += 1,
-            Err(e) => say(&format!("cannot mark {}: {e}", m.display())),
-        }
-    }
+    let mut marked_devs: HashSet<u64> = HashSet::new();
+    let explicit = !args.marks.is_empty();
+    let marks = if explicit { args.marks.clone() } else { discover_marks() };
+    let marked = mark_filesystems(&fan, &root, &marks, &mut marked_devs);
     if marked == 0 {
         return Err("no file system could be marked".into());
     }
     say(&format!("exec gate active on {marked} file systems"));
+    // A file system mounted after this point is invisible to the gate until it is marked, so the mount
+    // table is watched: the kernel raises POLLPRI on /proc/self/mountinfo whenever it changes.
+    let mut mountinfo = File::open("/proc/self/mountinfo").map_err(|e| e.to_string())?;
+    {
+        let mut sink = String::new();
+        let _ = mountinfo.read_to_string(&mut sink); // arm the change counter
+    }
 
     // ---- state watcher ----
     let ino = Inotify::init(InoInit::IN_CLOEXEC | InoInit::IN_NONBLOCK).map_err(|e| e.to_string())?;
@@ -228,23 +239,60 @@ fn run() -> Result<(), String> {
     // ---- main loop ----
     let self_pid = std::process::id() as i32;
     let mut cache: HashMap<(u64, u64), CacheEntry> = HashMap::new();
-    let mut tally: HashMap<jlr_model::EpnId, Tally> = HashMap::new();
+    let mut tally: HashMap<String, Tally> = HashMap::new();
+    let mut budgets = Budgets::new(args.slow_budget, Duration::from_secs(60));
+    let mut throttled_noted: HashSet<u32> = HashSet::new();
     let mut last_flush = Instant::now();
     let mut seen_gen = generation.load(Ordering::SeqCst);
+    // The mode the policy last said; used only to answer throttled events, which are never measured.
+    let mut enforce_hint =
+        open_engine(&args.state, Duration::from_secs(5)).map(|e| e.policy().enforce_exec).unwrap_or(false)
+            && !args.force_audit;
+    // The caches are bounded so that unique files cannot grow the daemon without limit.
+    const CACHE_LIMIT: usize = 100_000;
+    const TALLY_LIMIT: usize = 50_000;
     while !shutdown.load(Ordering::SeqCst) {
-        let mut fds = [PollFd::new(fan.as_fd(), PollFlags::POLLIN), PollFd::new(ino.as_fd(), PollFlags::POLLIN)];
-        let _ = poll(&mut fds, PollTimeout::from(250u16));
-        if fds[1].revents().is_some_and(|r| r.contains(PollFlags::POLLIN)) {
+        // Readiness is copied out so the poll array (which borrows the descriptors) is dropped before
+        // any of them is read or written.
+        let (fan_ready, ino_ready, mounts_changed) = {
+            let mut fds = [
+                PollFd::new(fan.as_fd(), PollFlags::POLLIN),
+                PollFd::new(ino.as_fd(), PollFlags::POLLIN),
+                PollFd::new(mountinfo.as_fd(), PollFlags::POLLPRI | PollFlags::POLLERR),
+            ];
+            let _ = poll(&mut fds, PollTimeout::from(250u16));
+            (
+                fds[0].revents().is_some_and(|r| r.contains(PollFlags::POLLIN)),
+                fds[1].revents().is_some_and(|r| r.contains(PollFlags::POLLIN)),
+                fds[2].revents().is_some_and(|r| r.intersects(PollFlags::POLLPRI | PollFlags::POLLERR)),
+            )
+        };
+        if mounts_changed && !explicit {
+            // Re-read to re-arm, then mark whatever is new.
+            let _ = mountinfo.seek(SeekFrom::Start(0));
+            let mut sink = String::new();
+            let _ = mountinfo.read_to_string(&mut sink);
+            let fresh: Vec<PathBuf> = discover_marks();
+            let n = mark_filesystems(&fan, &root, &fresh, &mut marked_devs);
+            if n > 0 {
+                say(&format!("marked {n} newly mounted file system(s)"));
+            }
+        }
+        if ino_ready {
             let _ = ino.read_events();
             generation.fetch_add(1, Ordering::SeqCst);
+            enforce_hint = open_engine(&args.state, Duration::from_secs(2))
+                .map(|e| e.policy().enforce_exec)
+                .unwrap_or(enforce_hint)
+                && !args.force_audit;
             say("signed state changed: cache cleared");
         }
         let g = generation.load(Ordering::SeqCst);
-        if g != seen_gen {
+        if g != seen_gen || cache.len() > CACHE_LIMIT {
             cache.clear();
             seen_gen = g;
         }
-        if fds[0].revents().is_some_and(|r| r.contains(PollFlags::POLLIN)) {
+        if fan_ready {
             let events = match fan.read_events() {
                 Ok(e) => e,
                 Err(nix::errno::Errno::EAGAIN) => continue,
@@ -285,11 +333,38 @@ fn run() -> Result<(), String> {
                 }
                 let path = std::fs::read_link(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd)))
                     .unwrap_or_else(|_| PathBuf::from("<unknown>"));
-                let allow = match decide(&args, &path, file) {
+                let shown = jlr_model::sanitize(&path.display().to_string());
+
+                // A user who has spent their slow-path allowance does not get to make others wait: their
+                // unmeasured execution is answered by policy without doing any work for it.
+                let uid = uid_of_pid(ev.pid());
+                let started = Instant::now();
+                if uid != 0 && budgets.exhausted(uid, started) {
+                    if throttled_noted.insert(uid) {
+                        say(&format!(
+                            "uid {uid} exceeded its slow-path budget; unknown executions are answered by policy, unmeasured"
+                        ));
+                    }
+                    respond(!enforce_hint);
+                    continue;
+                }
+                let outcome = decide(&args, &path, file);
+                if uid != 0 {
+                    budgets.charge(uid, started.elapsed(), Instant::now());
+                }
+                if throttled_noted.len() > 1024 {
+                    throttled_noted.clear();
+                }
+                let allow = match outcome {
                     Ok((v, allow)) => {
-                        let first = !tally.contains_key(&v.id);
-                        let t = tally.entry(v.id).or_default();
-                        t.path = path.display().to_string();
+                        enforce_hint = v.enforce && !args.force_audit;
+                        let tally_key = v.id.map_or_else(|| format!("unmeasurable:{shown}"), |i| i.to_string());
+                        let first = !tally.contains_key(&tally_key);
+                        if tally.len() > TALLY_LIMIT {
+                            tally.clear();
+                        }
+                        let t = tally.entry(tally_key).or_default();
+                        t.path = shown.clone();
                         if !v.allowed {
                             if allow {
                                 t.audited += 1;
@@ -298,9 +373,14 @@ fn run() -> Result<(), String> {
                             }
                         }
                         if first && !v.allowed {
-                            let verdict = if allow { "audit: would deny" } else { "denied" };
+                            let verdict = match (&v.unmeasurable, allow) {
+                                (Some(_), true) => "audit: would deny (unmeasurable)",
+                                (Some(_), false) => "denied (unmeasurable)",
+                                (None, true) => "audit: would deny",
+                                (None, false) => "denied",
+                            };
                             if let Ok(mut e) = open_engine(&args.state, args.lock_wait) {
-                                let _ = e.record_exec(&v.id, &t.path, verdict, &v.decision);
+                                let _ = e.record_exec(v.id.as_ref(), &t.path, verdict, &v.decision);
                             }
                             say(&format!("{verdict} {}", t.path));
                         }
@@ -311,12 +391,11 @@ fn run() -> Result<(), String> {
                     }
                     Err(msg) => {
                         say(&format!(
-                            "internal error for {}: {msg} (fail-{})",
-                            path.display(),
+                            "internal error for {shown}: {msg} (fail-{})",
                             if args.fail_closed { "closed" } else { "open" }
                         ));
                         if let Ok(mut e) = open_engine(&args.state, Duration::from_millis(500)) {
-                            let _ = e.record_degraded(&format!("exec gate error for {}: {msg}", path.display()));
+                            let _ = e.record_degraded(&format!("exec gate error for {shown}: {msg}"));
                         }
                         !args.fail_closed
                     }
@@ -346,6 +425,38 @@ fn run() -> Result<(), String> {
         let _ = e.record_degraded("exec gate stopped");
     }
     Ok(())
+}
+
+/// Marks each file system in `paths` that is not already marked. Returns how many were newly marked.
+fn mark_filesystems(fan: &Fanotify, root: &File, paths: &[PathBuf], marked_devs: &mut HashSet<u64>) -> usize {
+    let mut n = 0;
+    for m in paths {
+        let dev = std::fs::metadata(m).map(|x| x.dev()).ok();
+        if dev.is_some_and(|d| marked_devs.contains(&d)) {
+            continue;
+        }
+        match fan.mark(
+            MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
+            MaskFlags::FAN_OPEN_EXEC_PERM,
+            root,
+            Some(m),
+        ) {
+            Ok(()) => {
+                if let Some(d) = dev {
+                    marked_devs.insert(d);
+                }
+                n += 1;
+            }
+            Err(e) => say(&format!("cannot mark {}: {e}", m.display())),
+        }
+    }
+    n
+}
+
+/// The owner of the process's `/proc` entry, which is its effective uid. A process that has already exited
+/// falls into a shared "unknown" bucket rather than being mistaken for root.
+fn uid_of_pid(pid: i32) -> u32 {
+    std::fs::metadata(format!("/proc/{pid}")).map(|m| m.uid()).unwrap_or(u32::MAX)
 }
 
 /// Asks the engine, and turns its verdict into allow/deny according to the mode.

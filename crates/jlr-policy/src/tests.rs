@@ -135,6 +135,18 @@ fn validation_rejects_unsafe_policies() {
     p.max_manual_cell = CellClass::CellR;
     cases.push(("manual cell-R", p));
 
+    for hostile in ["site epoch=900000", "a\nb", "esc\u{1b}[2J", "bidi\u{202e}txt", "semi;colon", "", "é"] {
+        let mut p = base.clone();
+        p.name = hostile.into();
+        cases.push(("hostile policy name", p));
+        let mut p = base.clone();
+        p.tiers[0].name = hostile.into();
+        cases.push(("hostile tier name", p));
+    }
+    let mut p = base.clone();
+    p.name = "n".repeat(129);
+    cases.push(("overlong policy name", p));
+
     let mut p = base;
     p.schema = 9;
     cases.push(("bad schema", p));

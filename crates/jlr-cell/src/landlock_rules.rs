@@ -49,7 +49,12 @@ pub fn apply(plan: &LandlockPlan<'_>) -> Result<LandlockOutcome, String> {
 
     for p in plan.write {
         if let Ok(fd) = PathFd::new(p) {
-            created = created.add_rule(PathBeneath::new(fd, handled_fs)).map_err(|e| e.to_string())?;
+            // A rule that names a file (a device node such as /dev/null) may carry only file rights. Giving it
+            // directory rights makes the library downgrade the ruleset to "partially enforced", which would
+            // make a fully enforced ruleset look incomplete and hide whether the network rules took effect.
+            let is_dir = std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(true);
+            let access = if is_dir { handled_fs } else { handled_fs & AccessFs::from_file(abi) };
+            created = created.add_rule(PathBeneath::new(fd, access)).map_err(|e| e.to_string())?;
         }
     }
     if let Some((connect, bind)) = plan.tcp {

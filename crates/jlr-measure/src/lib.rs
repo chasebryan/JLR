@@ -27,9 +27,45 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
+/// The observable state of a file: size, both times to the nanosecond, inode and device.
+///
+/// A stamp is taken before hashing and compared after, and it is what an incremental scan
+/// records. `mtime` alone is settable by the file's owner; `ctime` is not, so a change that
+/// restores `mtime` still changes the stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time, nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+    /// Change time, nanoseconds since the Unix epoch.
+    pub ctime_ns: u64,
+    /// Inode number.
+    pub ino: u64,
+    /// Device number.
+    pub dev: u64,
+}
+
+impl Stamp {
+    /// The stamp of a file's metadata.
+    pub fn of(m: &std::fs::Metadata) -> Stamp {
+        let ns = |s: i64, n: i64| (s.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(n.max(0) as u64);
+        Stamp {
+            size: m.len(),
+            mtime_ns: ns(m.mtime(), m.mtime_nsec()),
+            ctime_ns: ns(m.ctime(), m.ctime_nsec()),
+            ino: m.ino(),
+            dev: m.dev(),
+        }
+    }
+}
+
 /// What was measured through a file descriptor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Measured {
+    /// The state of the file **before** it was hashed. The hash is only reported if the state
+    /// was identical afterwards.
+    pub stamp: Stamp,
     /// SHA-256 of the full content.
     pub digest: Digest,
     /// Size in bytes.
@@ -92,10 +128,17 @@ pub const HEAD_LEN: usize = 64;
 /// before and after reading; a size or mtime change is reported rather than
 /// producing a digest of a moving target.
 pub fn measure_file(file: &mut File, max_size: u64) -> Result<Measured, MeasureError> {
+    measure_file_with(file, max_size, &mut || {})
+}
+
+/// [`measure_file`] with a hook that runs after the last byte is read and before the file's state is
+/// checked again. Tests use it to change the file at the worst possible moment.
+fn measure_file_with(file: &mut File, max_size: u64, after_read: &mut dyn FnMut()) -> Result<Measured, MeasureError> {
     let before = file.metadata()?;
     if !before.file_type().is_file() {
         return Err(MeasureError::NotRegular);
     }
+    let stamp = Stamp::of(&before);
     if before.len() > max_size {
         return Err(MeasureError::TooLarge(before.len()));
     }
@@ -119,12 +162,16 @@ pub fn measure_file(file: &mut File, max_size: u64) -> Result<Measured, MeasureE
         }
         hasher.update(&buf[..n]);
     }
+    after_read();
     let after = file.metadata()?;
-    if after.len() != total || after.mtime() != before.mtime() || after.mtime_nsec() != before.mtime_nsec() {
+    // Every observable field must match, including ctime and the inode. Comparing mtime alone
+    // lets the file's owner rewrite already-hashed bytes and put the old mtime back.
+    if Stamp::of(&after) != stamp || after.len() != total {
         return Err(MeasureError::ChangedWhileReading);
     }
     file.seek(SeekFrom::Start(0))?;
     Ok(Measured {
+        stamp,
         digest: Digest(hasher.finalize().into()),
         size: total,
         mode: before.mode(),
@@ -135,6 +182,21 @@ pub fn measure_file(file: &mut File, max_size: u64) -> Result<Measured, MeasureE
         mtime: before.mtime(),
         head,
     })
+}
+
+/// Like [`measure_file`], retrying a few times when the file changes underneath the read.
+///
+/// A file that keeps changing is reported as [`MeasureError::ChangedWhileReading`]; the caller
+/// must treat that as "not measurable", never as "fine".
+pub fn measure_file_stable(file: &mut File, max_size: u64) -> Result<Measured, MeasureError> {
+    let mut last = MeasureError::ChangedWhileReading;
+    for _ in 0..3 {
+        match measure_file(file, max_size) {
+            Err(MeasureError::ChangedWhileReading) => last = MeasureError::ChangedWhileReading,
+            other => return other,
+        }
+    }
+    Err(last)
 }
 
 /// Opens `path` without following a final symlink and measures it.
@@ -151,7 +213,7 @@ pub fn open_measured(path: &Path, max_size: u64) -> Result<(File, Measured), Mea
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(MeasureError::Symlink),
         Err(e) => return Err(e.into()),
     };
-    let m = measure_file(&mut file, max_size)?;
+    let m = measure_file_stable(&mut file, max_size)?;
     Ok((file, m))
 }
 

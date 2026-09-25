@@ -61,6 +61,19 @@ const DENY_EPERM: &[i64] = &[
     libc::SYS_io_uring_enter,
     libc::SYS_io_uring_register,
     libc::SYS_pidfd_getfd,
+    // Reads the host kernel ring buffer (paths and process names of other users) when dmesg_restrict is 0.
+    libc::SYS_syslog,
+];
+
+/// Terminal `ioctl` requests answered with `EPERM`. `TIOCSTI` pushes characters into a terminal's input
+/// queue, which is how a confined program could type commands into the operator's shell; the others
+/// re-target or reconfigure a terminal. Only the low 32 bits of the request are compared, as the kernel does.
+const DENY_IOCTL: &[u32] = &[
+    libc::TIOCSTI as u32,
+    libc::TIOCSCTTY as u32,
+    libc::TIOCLINUX as u32,
+    libc::TIOCCONS as u32,
+    libc::TIOCSETD as u32,
 ];
 
 /// Syscalls answered with `ENOSYS` so that libc falls back to the older call
@@ -110,6 +123,17 @@ pub fn cell_filters() -> Result<Filters, String> {
         );
     }
     eperm.insert(libc::SYS_clone, clone_rules);
+    let mut ioctl_rules = Vec::new();
+    for req in DENY_IOCTL {
+        ioctl_rules.push(
+            SeccompRule::new(vec![
+                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, u64::from(*req))
+                    .map_err(|e| e.to_string())?,
+            ])
+            .map_err(|e| e.to_string())?,
+        );
+    }
+    eperm.insert(libc::SYS_ioctl, ioctl_rules);
     let denied = eperm.len() as u32 + DENY_ENOSYS.len() as u32;
 
     let enosys: BTreeMap<i64, Vec<SeccompRule>> = DENY_ENOSYS.iter().map(|s| (*s, vec![])).collect();

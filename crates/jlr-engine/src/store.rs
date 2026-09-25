@@ -40,9 +40,14 @@ record! {
         6 => ino: u64,
         /// Device.
         7 => dev: u64,
-        /// When the bytes were last actually hashed, in seconds since the Unix epoch.
-        /// Metadata alone is never trusted forever: see the policy's `evidence_max_age_secs`.
+        /// When the bytes were last actually hashed, in seconds since the Unix epoch. Metadata alone is never trusted
+        /// forever: see `valid_until` and the policy's `evidence_max_age_secs`.
         8 => measured_at: u64,
+        /// The row may be reused until this time: the policy's evidence age limit, or the earliest
+        /// expiry of an approval or baseline the decision relied on, whichever comes first.
+        9 => valid_until: u64,
+        /// The policy epoch the decision was made under; a newer policy invalidates the row.
+        10 => policy_epoch: u64,
     }
 }
 
@@ -102,7 +107,10 @@ pub fn put_object(paths: &Paths, kind: &str, data: &[u8]) -> std::io::Result<Dig
     let d = Digest::of(data);
     let hex = d.hex();
     let path = paths.objects().join(kind).join(&hex[..2]).join(format!("{}.cbor", &hex[2..]));
-    if !path.exists() {
+    // An object that exists with the wrong length was truncated (a crash before its data reached the disk). Leaving
+    // it would make the artifact's record permanently unreadable, so it is written again.
+    let intact = fs::metadata(&path).is_ok_and(|m| m.len() == data.len() as u64);
+    if !intact {
         write_atomic_inner(&path, data, false)?;
     }
     Ok(d)
@@ -124,9 +132,17 @@ pub fn get_object(paths: &Paths, kind: &str, d: &Digest) -> std::io::Result<Vec<
     Ok(data)
 }
 
-/// Loads the path index; a missing or damaged index is only a cache miss.
-pub fn load_index(paths: &Paths) -> IndexFile {
-    fs::read(paths.index()).ok().and_then(|b| IndexFile::from_cbor(&b).ok()).unwrap_or_default()
+/// Loads the path index. The second value is whether the index was **lost**: the file is missing or does not
+/// parse. The index is a cache, but it is also what says which artifact used to be at a path, so losing it must
+/// not silently erase the memory of what was trusted there.
+pub fn load_index(paths: &Paths) -> (IndexFile, bool) {
+    match fs::read(paths.index()) {
+        Ok(b) => match IndexFile::from_cbor(&b) {
+            Ok(f) => (f, false),
+            Err(_) => (IndexFile::default(), true),
+        },
+        Err(_) => (IndexFile::default(), true),
+    }
 }
 
 /// Saves the path index atomically.

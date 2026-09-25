@@ -368,3 +368,223 @@ fn decision_to_spec_is_pure_and_refuses_states_that_may_not_run() {
     use jlr_cbor::Cbor;
     assert_eq!(CellSpec::from_cbor(&s.to_cbor()).unwrap(), s);
 }
+
+// ---- adversarial-review follow-ups -------------------------------------------------------------------------
+
+#[test]
+fn descriptors_left_open_by_the_launcher_do_not_reach_the_workload() {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // A directory descriptor that the private root hides, deliberately left inheritable, as a shell redirection
+    // (`9</some/dir`) or a launcher would leave it.
+    let dir = tempfile::Builder::new().prefix("jlr-fd-").tempdir_in(std::env::var("HOME").unwrap()).unwrap();
+    fs::write(dir.path().join("secret"), "top secret").unwrap();
+    let held = fs::File::open(dir.path()).unwrap();
+    let raw = fcntl(&held, FcntlArg::F_DUPFD(100)).unwrap(); // above anything the harness uses
+    // SAFETY: `raw` was just returned by F_DUPFD and nothing else owns it.
+    #[allow(unsafe_code)]
+    let leaked = unsafe { OwnedFd::from_raw_fd(raw) };
+    fcntl(&leaked, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+
+    // Anything numbered 5 or higher is a leak: 0-2 are the streams, 3 the sealed program, and 4 the report
+    // pipe (closed once the report is sent, so the shell's own directory handle lands there).
+    let script = format!(
+        "for f in /proc/self/fd/*; do n=${{f##*/}}; [ \"$n\" -ge 5 ] && echo HIGH:$n; done; \
+         cat /proc/self/fd/{raw}/secret 2>/dev/null && echo LEAK; echo done"
+    );
+    let Some((o, out, err)) = run_sh(&cell0(), &script) else { return };
+    assert_eq!(o.code, 0, "{out} {err}");
+    assert!(out.contains("done"), "{out}");
+    assert!(!out.contains("HIGH:"), "a descriptor beyond the report pipe reached the workload: {out}");
+    assert!(
+        !out.contains("LEAK") && !out.contains("top secret"),
+        "the workload read a host file through a leaked descriptor: {out}"
+    );
+    drop(leaked);
+}
+
+#[test]
+fn the_report_pipe_is_not_open_in_the_workload() {
+    // The workload must not be able to write forged bytes into its own enforcement report.
+    let Some((_, out, _)) = run_sh(&cell0(), "ls /proc/self/fd | tr '\\n' ' '") else { return };
+    let fds: Vec<u32> = out.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+    assert!(fds.iter().all(|f| *f <= 4), "unexpected descriptors in the cell: {out}");
+}
+
+const CTTY_CHILD: &str = "JLR_TEST_CTTY_CHILD";
+
+/// Re-runs the calling test in a child process that is a session leader whose controlling terminal is a fresh
+/// pseudo-terminal, which is what an operator's shell looks like when it runs `jlr run`. Returns `true` in that
+/// child, where the caller does the real work; in the parent it runs the child, asserts it passed and returns
+/// `false`. A test process normally has no controlling terminal (CI, `cargo test` in a pipe), so without this
+/// the terminal checks below would pass vacuously.
+fn in_terminal_session(test: &str) -> bool {
+    use nix::pty::openpty;
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os(CTTY_CHILD).is_some() {
+        let stat = fs::read_to_string("/proc/self/stat").unwrap();
+        let tty_nr: i64 = stat.rsplit_once(')').unwrap().1.split_whitespace().nth(4).unwrap().parse().unwrap();
+        assert_ne!(tty_nr, 0, "test setup: the child must own a controlling terminal: {stat}");
+        return true;
+    }
+    let pty = openpty(None, None).unwrap();
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env(CTTY_CHILD, "1")
+        .stdin(std::process::Stdio::from(pty.slave));
+    // SAFETY: the closure runs between fork and exec and only calls setsid and ioctl, both async-signal-safe.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the terminal-session child failed:\n{text}");
+    assert!(text.contains("1 passed"), "the child did not run the test:\n{text}");
+    drop(pty.master);
+    false
+}
+
+fn run_with_inherited_terminal(path: &str, argv: &[&str]) -> Option<(Outcome, String, String)> {
+    let exe = seal(path);
+    let spec = spec_for(&cell0(), argv);
+    let io = Stdio3 { stdin: std::process::Stdio::inherit(), ..Stdio3::captured() };
+    match launch(Path::new(HELPER), &exe, &spec, io) {
+        Ok(r) => {
+            let (o, out, err) = r.wait_with_output().unwrap();
+            Some((o, String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err).into_owned()))
+        }
+        Err(CellError::Refused(_)) => {
+            eprintln!("SKIPPED: namespaces unavailable");
+            None
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn the_workload_has_no_controlling_terminal_even_when_started_from_one() {
+    if !in_terminal_session("the_workload_has_no_controlling_terminal_even_when_started_from_one") {
+        return;
+    }
+    // Field 7 of /proc/self/stat is tty_nr: zero means no controlling terminal.
+    let script = "read pid comm state ppid pgrp session tty rest < /proc/self/stat; echo tty_nr=$tty; \
+                  [ -t 0 ] && echo stdin-is-a-tty";
+    let Some((o, out, err)) = run_with_inherited_terminal("/bin/sh", &["sh", "-c", script]) else { return };
+    assert_eq!(o.code, 0, "{out} {err}");
+    assert!(out.contains("stdin-is-a-tty"), "the workload must actually be handed the terminal: {out}");
+    assert!(out.contains("tty_nr=0"), "the workload kept the operator's controlling terminal: {out}");
+}
+
+#[test]
+fn a_terminal_cannot_be_used_to_type_into_the_operators_shell() {
+    if !Path::new("/usr/bin/perl").exists() {
+        eprintln!("SKIPPED: perl is not installed");
+        return;
+    }
+    if !in_terminal_session("a_terminal_cannot_be_used_to_type_into_the_operators_shell") {
+        return;
+    }
+    // TIOCSTI (0x5412) queues a character in the terminal's input as if the user had typed it. Some kernels
+    // refuse it themselves (EIO); the cell must refuse it with EPERM regardless of that setting.
+    let probe = "my $c = 'x'; if (ioctl(STDIN, 0x5412, $c)) { print \"INJECTED\\n\" } else { print \"errno=\" . ($!+0) . \"\\n\" }";
+    let Some((_, out, err)) = run_with_inherited_terminal("/usr/bin/perl", &["perl", "-e", probe]) else { return };
+    assert!(!out.contains("INJECTED"), "a character was injected into the operator's terminal: {out}");
+    assert!(
+        out.contains(&format!("errno={}", libc::EPERM)),
+        "TIOCSTI must be refused by the cell (EPERM): {out} {err}"
+    );
+}
+
+#[test]
+fn a_grant_below_tmp_is_applied_even_though_the_root_is_assembled_in_a_tmpfs() {
+    let dir = tempfile::Builder::new().prefix("jlr-grant-").tempdir_in("/tmp").unwrap();
+    fs::write(dir.path().join("in"), "hello").unwrap();
+    let cap = Capability::parse(&format!("FS_WRITE:{}", dir.path().display())).unwrap();
+    let d = decision(CellClass::Cell1, NetworkMode::None, vec![cap], AdmissionState::Verified);
+    let script = format!("cat {p}/in; echo out > {p}/new && echo written", p = dir.path().display());
+    let Some((o, out, err)) = run_sh(&d, &script) else { return };
+    assert!(
+        out.contains("hello") && out.contains("written"),
+        "a grant under /tmp vanished: {out} {err} {:?}",
+        o.report
+    );
+    assert_eq!(fs::read_to_string(dir.path().join("new")).unwrap().trim(), "out");
+}
+
+#[test]
+fn a_grant_that_cannot_be_applied_is_reported_and_makes_the_report_partial() {
+    let missing = "/no/such/directory/jlr-test";
+    let cap = Capability::parse(&format!("FS_READ:{missing}")).unwrap();
+    let d = decision(CellClass::Cell1, NetworkMode::None, vec![cap], AdmissionState::Verified);
+    let Some((o, _, _)) = run_sh(&d, "true") else { return };
+    assert_eq!(o.report.status, Status::Partial, "{:?}", o.report);
+    assert!(
+        o.report.unavailable.iter().any(|u| u.contains(missing) && u.contains("not applied")),
+        "the dropped grant must be listed: {:?}",
+        o.report.unavailable
+    );
+}
+
+#[test]
+fn the_destination_allow_list_is_enforced_by_landlock_and_reported_as_active() {
+    let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let blocked = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (pa, pb) = (allowed.local_addr().unwrap().port(), blocked.local_addr().unwrap().port());
+    let cap = Capability::parse(&format!("NET_CONNECT:127.0.0.1:{pa}")).unwrap();
+    let d = decision(CellClass::Cell1, NetworkMode::DestinationAllowlist, vec![cap], AdmissionState::Verified);
+    let script = format!(
+        "(exec 3<>/dev/tcp/127.0.0.1/{pa}) 2>/dev/null && echo allowed-ok || echo allowed-FAILED; \
+         (exec 3<>/dev/tcp/127.0.0.1/{pb}) 2>/dev/null && echo blocked-REACHED || echo blocked-ok"
+    );
+    let exe = seal("/bin/bash");
+    let spec = spec_for(&d, &["bash", "-c", &script]);
+    match launch(Path::new(HELPER), &exe, &spec, Stdio3::captured()) {
+        Ok(running) => {
+            let (o, out, err) = running.wait_with_output().unwrap();
+            let out = String::from_utf8_lossy(&out);
+            assert!(o.report.active.iter().any(|a| a == "landlock-net"), "{:?}", o.report);
+            assert!(o.report.landlock_abi.is_some_and(|v| v >= 4), "the real kernel ABI is reported: {:?}", o.report);
+            assert!(out.contains("allowed-ok"), "the granted port must work: {out} {}", String::from_utf8_lossy(&err));
+            assert!(
+                out.contains("blocked-ok") && !out.contains("blocked-REACHED"),
+                "an ungranted port was reachable: {out}"
+            );
+        }
+        // A kernel without TCP rules must refuse rather than run the workload unconfined, and must say why.
+        Err(CellError::Refused(r)) if r.landlock_abi.is_none_or(|v| v < 4) => {
+            assert!(r.mandatory_missing.iter().any(|m| m == "landlock-net"), "{r:?}");
+            eprintln!("SKIPPED: kernel Landlock ABI {:?} has no TCP rules", r.landlock_abi);
+        }
+        Err(CellError::Refused(r))
+            if r.unavailable.iter().any(|u| u.starts_with("mount-ns") || u.starts_with("user-ns")) =>
+        {
+            eprintln!("SKIPPED: namespaces unavailable");
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn the_host_kernel_log_cannot_be_read_from_inside_a_cell() {
+    if !Path::new("/usr/bin/perl").exists() {
+        eprintln!("SKIPPED: perl is not installed");
+        return;
+    }
+    // syslog(2) action 3 (READ_ALL) needs no capability when kernel.dmesg_restrict is 0, and the log names other
+    // users' processes and paths. The result must be EPERM from the cell's filter, never data.
+    let probe = format!(
+        "my $b = \"\\0\" x 4096; my $r = syscall({}, 3, $b, 4096); print \"r=$r errno=\" . ($!+0) . \"\\n\"",
+        libc::SYS_syslog
+    );
+    let Some((_, out, err)) = run_prog("/usr/bin/perl", &cell0(), &["perl", "-e", &probe]) else { return };
+    assert!(
+        out.contains("r=-1") && out.contains(&format!("errno={}", libc::EPERM)),
+        "kernel log readable? {out} {err}"
+    );
+}

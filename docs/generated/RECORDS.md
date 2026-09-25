@@ -216,7 +216,9 @@ Source: `crates/jlr-engine/src/store.rs`
 | 5 | `ctime_ns` | `u64` | Change time, nanoseconds since the Unix epoch. |
 | 6 | `ino` | `u64` | Inode. |
 | 7 | `dev` | `u64` | Device. |
-| 8 | `measured_at` | `u64` | When the bytes were last actually hashed, in seconds since the Unix epoch. Metadata alone is never trusted forever: see the policy's `evidence_max_age_secs`. |
+| 8 | `measured_at` | `u64` | When the bytes were last actually hashed, in seconds since the Unix epoch. Metadata alone is never trusted forever: see `valid_until` and the policy's `evidence_max_age_secs`. |
+| 9 | `valid_until` | `u64` | The row may be reused until this time: the policy's evidence age limit, or the earliest expiry of an approval or baseline the decision relied on, whichever comes first. |
+| 10 | `policy_epoch` | `u64` | The policy epoch the decision was made under; a newer policy invalidates the row. |
 
 ### `NodeInfo`
 

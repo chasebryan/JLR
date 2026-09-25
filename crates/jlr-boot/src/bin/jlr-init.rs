@@ -14,8 +14,9 @@
 
 #![forbid(unsafe_code)]
 
+use jlr_boot::media::{self, HEAD_LEN, StateRead, filesystem_id, parse_pin};
 use jlr_boot::sys::{loop_attach, poweroff, restart};
-use jlr_boot::{BootError, BootState, ReleaseManifest, SlotState, choose, verify_image, verify_manifest};
+use jlr_boot::{BootError, BootState, ReleaseManifest, choose, verify_image, verify_manifest};
 use jlr_cbor::Cbor;
 use jlr_crypto::{Digest, TrustAnchors};
 use nix::fcntl::{FcntlArg, SealFlag, fcntl};
@@ -23,11 +24,11 @@ use nix::mount::{MsFlags, mount, umount};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::unistd::{chdir, chroot};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ANCHORS: &str = "/etc/jlr/anchors.cbor";
 /// Where stage 1 mounts the boot media (inside the initramfs).
@@ -99,71 +100,154 @@ fn candidate_devices() -> Vec<String> {
     v
 }
 
-/// Mounts the first device that carries a `/jlr` directory and returns its device path and file system.
-fn find_media(rw: bool) -> Option<(String, &'static str)> {
+/// File systems the initramfs will mount boot media as.
+const FSTYPES: [&str; 3] = ["ext4", "vfat", "iso9660"];
+
+/// Mounts `dev` at [`MEDIA`], read-write when asked and possible, read-only otherwise, and returns the file
+/// system type. A write-protected stick or an iso9660 image mounts read-only instead of not at all.
+fn mount_medium(dev: &str, want_rw: bool) -> Option<&'static str> {
     let _ = fs::create_dir_all(MEDIA);
-    for _ in 0..50 {
-        for name in candidate_devices() {
-            let dev = format!("/dev/{name}");
-            for fstype in ["ext4", "vfat", "iso9660"] {
-                let flags = if rw && fstype != "iso9660" {
-                    MsFlags::MS_NOSUID | MsFlags::MS_NODEV
-                } else {
-                    MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV
-                };
-                if mount(Some(dev.as_str()), MEDIA, Some(fstype), flags, None::<&str>).is_ok() {
-                    if Path::new(&format!("{MEDIA}/jlr")).is_dir() {
-                        return Some((dev, fstype));
-                    }
-                    let _ = umount(MEDIA);
-                }
-            }
+    let base = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    for fstype in FSTYPES {
+        if want_rw && fstype != "iso9660" && mount(Some(dev), MEDIA, Some(fstype), base, None::<&str>).is_ok() {
+            return Some(fstype);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        if mount(Some(dev), MEDIA, Some(fstype), base | MsFlags::MS_RDONLY, None::<&str>).is_ok() {
+            return Some(fstype);
+        }
     }
     None
 }
 
-fn write_state(media: &str, state: &BootState) -> Result<(), String> {
-    let path = format!("{media}/jlr/bootstate.cbor");
-    let tmp = format!("{path}.new");
-    let mut f = File::create(&tmp).map_err(|e| e.to_string())?;
-    f.write_all(&state.to_cbor()).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    File::open(format!("{media}/jlr")).and_then(|d| d.sync_all()).map_err(|e| e.to_string())
+/// The first bytes of a device, read without mounting it.
+fn read_head(dev: &str) -> Option<Vec<u8>> {
+    let mut f = File::open(dev).ok()?;
+    let mut head = vec![0u8; HEAD_LEN];
+    let mut n = 0;
+    while n < head.len() {
+        match f.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(_) => return None,
+        }
+    }
+    head.truncate(n);
+    Some(head)
 }
 
-fn read_state(media: &str) -> BootState {
-    match fs::read(format!("{media}/jlr/bootstate.cbor")) {
-        Ok(b) => match BootState::from_cbor(&b) {
-            Ok(s) => s,
-            Err(e) => refuse(&format!("boot state is damaged: {e}")),
+/// The identifier the initramfs is pinned to, if any. A pin baked into the initramfs (which also holds the
+/// trust anchors) outranks the kernel command line.
+fn media_pin() -> Option<String> {
+    match fs::read_to_string("/etc/jlr/media-id") {
+        Ok(text) => match parse_pin(&text) {
+            Some(p) => Some(p),
+            None => refuse("/etc/jlr/media-id in the initramfs is malformed"),
         },
-        Err(_) => BootState {
-            floor: 0,
-            slots: vec![SlotState { name: "a".into(), priority: 15, tries: 0, successful: true }],
-        },
+        Err(_) => cmdline_flag("jlr.media").map(|v| match parse_pin(&v) {
+            Some(p) => p,
+            None => refuse("jlr.media= is malformed"),
+        }),
     }
 }
 
-fn stage1() -> ! {
-    log("start assurance=prototype (no Secure Boot or TPM anchor: the initramfs itself is not authenticated)");
-    mount_pseudo();
+/// Writes `state` to the medium mounted at [`MEDIA`], remounting it read-write first if it is not yet.
+fn persist(state: &BootState, writable: &mut bool) -> Result<(), String> {
+    if !*writable {
+        mount(
+            None::<&str>,
+            MEDIA,
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            None::<&str>,
+        )
+        .map_err(|e| format!("cannot remount read-write: {e}"))?;
+        *writable = true;
+    }
+    media::write_state(Path::new(MEDIA), state).map_err(|e| e.to_string())
+}
 
-    let anchors = match fs::read(ANCHORS)
-        .map_err(|e| e.to_string())
-        .and_then(|b| TrustAnchors::from_cbor(&b).map_err(|e| e.to_string()))
-    {
-        Ok(a) if !a.is_empty() => a,
-        Ok(_) => refuse("no trust anchors in the initramfs"),
-        Err(e) => refuse(&format!("cannot load trust anchors: {e}")),
+/// A boot medium that carries a `/jlr` tree, as seen before any slot on it is used.
+struct Medium {
+    dev: String,
+    state: BootState,
+}
+
+/// Finds every medium with a `/jlr` directory.
+///
+/// All of them are examined, not just the first, because the rollback floor is stored per medium: taking the
+/// first one that answers would let anyone who can attach a disk choose which floor applies. When the
+/// initramfs is pinned to a medium identifier, other devices are recognised by their identifier and are never
+/// mounted at all.
+fn discover(pin: Option<&str>) -> Vec<Medium> {
+    let mut found: Vec<Medium> = Vec::new();
+    let mut examined = std::collections::BTreeSet::new();
+    let mut first_found: Option<Instant> = None;
+    for _ in 0..50 {
+        for name in candidate_devices() {
+            if examined.contains(&name) {
+                continue;
+            }
+            let dev = format!("/dev/{name}");
+            let Some(head) = read_head(&dev) else { continue }; // not readable yet: look again next pass
+            examined.insert(name);
+            if let Some(pin) = pin {
+                let id = filesystem_id(&head);
+                if id.as_deref() != Some(pin) {
+                    log(&format!(
+                        "ignoring {dev}: not the pinned boot medium (id={})",
+                        id.as_deref().unwrap_or("none")
+                    ));
+                    continue;
+                }
+            }
+            let Some(_fstype) = mount_medium(&dev, false) else { continue };
+            if Path::new(&format!("{MEDIA}/jlr")).is_dir() {
+                match media::read_state(Path::new(MEDIA)) {
+                    Ok(StateRead::Recovered(st)) => {
+                        log(&format!("state of {dev} recovered from an interrupted write"));
+                        found.push(Medium { dev: dev.clone(), state: st });
+                    }
+                    Ok(r) => found.push(Medium { dev: dev.clone(), state: r.into_state() }),
+                    // A medium whose state cannot be read has an unknown floor. Treating it as fresh would
+                    // reset the floor to zero, so the boot stops instead.
+                    Err(e) => refuse(&format!("boot state of {dev} cannot be read: {e}")),
+                }
+            }
+            let _ = umount(MEDIA);
+        }
+        if !found.is_empty() && first_found.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(500) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    found
+}
+
+/// What a successful boot attempt hands to the switch to the new root.
+struct Booted {
+    slot: String,
+    manifest: ReleaseManifest,
+    manifest_bytes: Vec<u8>,
+    image: File,
+    dev: String,
+    fstype: &'static str,
+}
+
+/// Tries the slots of one medium in the A/B order until one verifies end to end. On success the medium is left
+/// mounted at [`MEDIA`]; otherwise it is unmounted and `None` is returned so the next medium can be tried.
+fn try_medium(medium: &Medium, floor: u64, anchors: &TrustAnchors) -> Option<Booted> {
+    let dev = medium.dev.as_str();
+    // Mounted read-only: a medium is remounted read-write only at the moment state must be written, so a disk
+    // that turns out to hold nothing bootable is never modified.
+    let Some(fstype) = mount_medium(dev, false) else {
+        log(&format!("{dev}: cannot be mounted; skipped"));
+        return None;
     };
-    log(&format!("anchors loaded keys={}", anchors.len()));
-
-    let Some((dev, fstype)) = find_media(true) else { refuse("no boot media with a /jlr directory was found") };
+    let mut writable = false;
+    // The floor that applies is the highest one on any medium, not this medium's own.
+    let mut state = medium.state.clone();
+    state.floor = state.floor.max(floor);
     log(&format!("media found dev={dev} fs={fstype}"));
-    let mut state = read_state(MEDIA);
     log(&format!("state floor={} slots={}", state.floor, state.slots.len()));
 
     // Verify every slot's manifest first; image hashing happens only for the chosen slot.
@@ -172,7 +256,7 @@ fn stage1() -> ! {
         let path = format!("{MEDIA}/jlr/slot-{}/manifest.cose", s.name);
         match fs::read(&path) {
             Err(e) => log(&format!("slot={} manifest unreadable: {e}", s.name)),
-            Ok(bytes) => match verify_manifest(&bytes, &anchors, state.floor) {
+            Ok(bytes) => match verify_manifest(&bytes, anchors, state.floor) {
                 Ok(m) => {
                     log(&format!(
                         "slot={} manifest=verified version={} epoch={} manifest_sha256={}",
@@ -189,27 +273,36 @@ fn stage1() -> ! {
         }
     }
 
-    // Try slots in the A/B order until one verifies end to end.
-    let (slot, manifest, manifest_bytes, backing) = loop {
+    loop {
         let list: Vec<(String, ReleaseManifest)> = verified.iter().map(|(n, m, _)| (n.clone(), m.clone())).collect();
-        let choice = match choose(&state, &list) {
-            Ok(c) => c,
-            Err(_) => refuse("no slot passed verification with tries remaining"),
+        let Ok(choice) = choose(&state, &list) else {
+            log(&format!("no slot on {dev} passed verification with tries remaining"));
+            let _ = umount(MEDIA);
+            return None;
         };
-        // The try is spent durably BEFORE the slot is used: a crash from here on falls back next boot.
-        state = choice.next;
-        if let Err(e) = write_state(MEDIA, &state) {
-            refuse(&format!("cannot record the boot attempt: {e}"));
+        // The try is spent durably BEFORE the slot is used: a crash from here on falls back next boot. A proven
+        // slot spends nothing, so a read-only medium can still boot it.
+        if choice.next != state {
+            if let Err(e) = persist(&choice.next, &mut writable) {
+                log(&format!("slot={} skipped: cannot record the boot attempt on {dev}: {e}", choice.slot));
+                verified.retain(|(n, _, _)| *n != choice.slot);
+                continue;
+            }
+            state = choice.next;
         }
         let (_, m, mb) = verified.iter().find(|(n, _, _)| *n == choice.slot).cloned().expect("chosen slot is verified");
         log(&format!("selected slot={} epoch={}", choice.slot, m.epoch));
 
         let image_path = format!("{MEDIA}/jlr/slot-{}/base.sqfs", choice.slot);
-        let mem = match memfd_create("jlr-base", MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING) {
+        let mut sink = match memfd_create("jlr-base", MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING) {
             Ok(fd) => File::from(fd),
-            Err(e) => refuse(&format!("cannot allocate RAM for the base image: {e}")),
+            Err(e) => {
+                // Not evidence about the slot: nothing is retired, the slot is only skipped for this boot.
+                log(&format!("slot={} skipped: cannot allocate RAM for the base image: {e}", choice.slot));
+                verified.retain(|(n, _, _)| *n != choice.slot);
+                continue;
+            }
         };
-        let mut sink = mem;
         let result = File::open(&image_path)
             .map_err(|e| BootError::Io(format!("{image_path}: {e}")))
             .and_then(|mut src| verify_image(&m, &mut src, &mut sink));
@@ -231,16 +324,74 @@ fn stage1() -> ! {
                 ) {
                     refuse(&format!("cannot seal the RAM image: {e}"));
                 }
-                break (choice.slot, m, mb, sink);
+                return Some(Booted {
+                    slot: choice.slot,
+                    manifest: m,
+                    manifest_bytes: mb,
+                    image: sink,
+                    dev: medium.dev.clone(),
+                    fstype,
+                });
             }
             Err(e) => {
                 log(&format!("slot={} REFUSED image: {e}", choice.slot));
-                state.mark_bad(&choice.slot);
-                let _ = write_state(MEDIA, &state);
+                // Only proof that the content is bad retires the slot for good; an I/O error or memory
+                // exhaustion must not, or one USB hiccup would strand a machine whose slots are fine.
+                if state.record_image_failure(&choice.slot, &e) {
+                    if let Err(w) = persist(&state, &mut writable) {
+                        log(&format!("could not record that slot {} is bad: {w}", choice.slot));
+                    }
+                } else {
+                    log(&format!(
+                        "slot={} is not retired: the failure is not proof that its content is bad",
+                        choice.slot
+                    ));
+                }
                 verified.retain(|(n, _, _)| *n != choice.slot);
                 // The memfd is dropped here, discarding the unverified bytes.
             }
         }
+    }
+}
+
+fn stage1() -> ! {
+    log("start assurance=prototype (no Secure Boot or TPM anchor: the initramfs itself is not authenticated)");
+    mount_pseudo();
+
+    let anchors = match fs::read(ANCHORS)
+        .map_err(|e| e.to_string())
+        .and_then(|b| TrustAnchors::from_cbor(&b).map_err(|e| e.to_string()))
+    {
+        Ok(a) if !a.is_empty() => a,
+        Ok(_) => refuse("no trust anchors in the initramfs"),
+        Err(e) => refuse(&format!("cannot load trust anchors: {e}")),
+    };
+    log(&format!("anchors loaded keys={}", anchors.len()));
+
+    let pin = media_pin();
+    if let Some(p) = &pin {
+        log(&format!("boot media is pinned to id={p}"));
+    } else {
+        log("boot media is not pinned: any attached disk with a /jlr tree is considered (highest rollback floor wins)");
+    }
+    let media = discover(pin.as_deref());
+    if media.is_empty() {
+        refuse("no boot media with a /jlr directory was found");
+    }
+    // The rollback floor is per medium, so the highest one seen anywhere applies to every medium: a stale or
+    // foreign disk cannot lower it.
+    let floor = media.iter().map(|m| m.state.floor).max().unwrap_or(0);
+    log(&format!("media={} rollback floor={floor}", media.len()));
+
+    let mut booted = None;
+    for medium in &media {
+        if let Some(b) = try_medium(medium, floor, &anchors) {
+            booted = Some(b);
+            break;
+        }
+    }
+    let Some(Booted { slot, manifest, manifest_bytes, image: backing, dev, fstype }) = booted else {
+        refuse("no slot passed verification with tries remaining")
     };
 
     let loopdev = match loop_attach(&backing) {
@@ -270,7 +421,7 @@ fn stage1() -> ! {
         );
     }
     let _ = fs::create_dir_all(format!("{NEWROOT}/run/jlr"));
-    let env = format!("slot={slot}\nmedia_dev={dev}\nmedia_fs={fstype}\nfloor={}\n", state.floor);
+    let env = format!("slot={slot}\nmedia_dev={dev}\nmedia_fs={fstype}\nfloor={floor}\n");
     let _ = fs::write(format!("{NEWROOT}{HANDOFF}"), env);
     let _ = fs::write(format!("{NEWROOT}/run/jlr/manifest.cose"), &manifest_bytes);
     let _ = fs::write(format!("{NEWROOT}/run/jlr/anchors.cbor"), fs::read(ANCHORS).unwrap_or_default());
@@ -359,11 +510,21 @@ fn stage2() -> ! {
             None::<&str>,
         ) {
             Ok(()) => {
-                let mut state = read_state(MEDIA2);
-                state.mark_successful(&slot, &m);
-                match write_state(MEDIA2, &state) {
-                    Ok(()) => log2(&format!("slot {slot} marked successful; rollback floor is now {}", state.floor)),
-                    Err(e) => log2(&format!("could not record success: {e}")),
+                match media::read_state(Path::new(MEDIA2)) {
+                    Ok(r) => {
+                        let mut state = r.into_state();
+                        // The floor stage 1 applied (the highest on any attached medium) must not be lost
+                        // because this medium's own copy was lower.
+                        state.floor = state.floor.max(env_value("floor").and_then(|v| v.parse().ok()).unwrap_or(0));
+                        state.mark_successful(&slot, &m);
+                        match media::write_state(Path::new(MEDIA2), &state) {
+                            Ok(()) => {
+                                log2(&format!("slot {slot} marked successful; rollback floor is now {}", state.floor))
+                            }
+                            Err(e) => log2(&format!("could not record success: {e}")),
+                        }
+                    }
+                    Err(e) => log2(&format!("could not record success: boot state cannot be read: {e}")),
                 }
                 let _ = umount(MEDIA2);
             }

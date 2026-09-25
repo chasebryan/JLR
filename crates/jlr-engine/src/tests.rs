@@ -586,8 +586,9 @@ fn exec_verdict_measures_the_descriptor_not_the_path() {
     let original = jlr_crypto::Digest::of(&elf());
     let record_digest = e.explain(&exe).unwrap().record.digest;
     assert_ne!(record_digest, original, "the file on disk now differs");
-    assert_eq!(e.state_of(&v.id), Some(S::Observed));
-    assert_ne!(v.id, id_of(&e, &exe), "the decision must not be about the swapped file");
+    let vid = v.id.expect("the file was measurable");
+    assert_eq!(e.state_of(&vid), Some(S::Observed));
+    assert_ne!(vid, id_of(&e, &exe), "the decision must not be about the swapped file");
 }
 
 #[test]
@@ -669,4 +670,405 @@ fn unchanged_files_are_rehashed_once_their_evidence_is_older_than_the_policy_all
     // ...and the re-measurement resets the clock.
     let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
     assert_eq!((r.examined, r.unchanged), (0, 1));
+}
+
+// ---- adversarial-review follow-ups -------------------------------------------------------------------------
+
+#[test]
+fn a_file_that_cannot_be_measured_is_a_denial_not_an_internal_error() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    // A sparse file costs nothing to create and is larger than the measurement limit. The user who executes a
+    // file controls its size, so "too large" must not be a way to slip past the gate.
+    let big = lab.file("opt/padded", &elf());
+    fs::OpenOptions::new().write(true).open(&big).unwrap().set_len(600 << 20).unwrap();
+    let before = e.status().by_state.clone();
+    let v = e.decide_exec(fs::File::open(&big).unwrap(), &big).expect("an unmeasurable file yields a verdict");
+    assert!(!v.allowed, "unmeasurable means not allowed");
+    assert!(v.id.is_none() && v.unmeasurable.is_some());
+    assert_eq!((v.decision.state, v.decision.cell), (S::Quarantined, CellClass::Cell0));
+    assert_eq!(v.decision.network, NetworkMode::None);
+    assert!(v.max_age_secs <= 10, "a denial that may be transient must not be cached for long");
+    assert_eq!(e.status().by_state, before, "nothing is recorded as an artifact for a file that was never measured");
+
+    // A directory and a FIFO are decisions too, not errors.
+    let dir = lab.sys.join("opt");
+    let v = e.decide_exec(fs::File::open(&dir).unwrap(), &dir).unwrap();
+    assert!(!v.allowed && v.unmeasurable.is_some());
+}
+
+#[test]
+fn a_repeat_exec_decision_for_an_unchanged_file_writes_nothing() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let exe = lab.file("opt/tool", &elf());
+    let first = e.decide_exec(fs::File::open(&exe).unwrap(), &exe).unwrap();
+    let events_after_first = e.status().ledger_events;
+    let index_after_first = fs::read(lab.paths().index()).unwrap();
+
+    lab.clock.fetch_add(30, Ordering::SeqCst);
+    for _ in 0..5 {
+        let v = e.decide_exec(fs::File::open(&exe).unwrap(), &exe).unwrap();
+        assert_eq!(v.id, first.id);
+        assert_eq!(v.decision.state, first.decision.state);
+    }
+    assert_eq!(e.status().ledger_events, events_after_first, "an uncached exec must not grow the ledger");
+    assert_eq!(
+        fs::read(lab.paths().index()).unwrap(),
+        index_after_first,
+        "nor rewrite the index: every exec by any user would otherwise cost a full-file write"
+    );
+}
+
+#[test]
+fn an_expired_approval_is_noticed_by_an_incremental_scan() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Strict);
+    let mut e = lab.open();
+    let exe = lab.file("opt/tool", &elf());
+    let mut opts = Lab::scan_opts();
+    opts.full = false;
+    e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    let id = id_of(&e, &exe);
+    e.approve(&id.to_string(), CellClass::Cell1, NetworkMode::None, vec![], 3600, "alice").unwrap();
+    assert_eq!(e.state_of(&id), Some(S::Admitted));
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!((r.examined, r.unchanged), (0, 1), "inside the approval window nothing needs re-deciding");
+
+    // Metadata is unchanged, so only the row's own validity window can reveal that the approval ran out.
+    lab.clock.fetch_add(7200, Ordering::SeqCst);
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!(r.examined, 1, "an incremental scan must re-decide once the approval has expired");
+    assert_ne!(e.state_of(&id), Some(S::Admitted), "an expired approval grants nothing");
+}
+
+#[test]
+fn a_new_policy_epoch_re_decides_files_an_incremental_scan_would_skip() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let exe = lab.file("opt/tool", &elf());
+    let mut opts = Lab::scan_opts();
+    opts.full = false;
+    e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    let id = id_of(&e, &exe);
+    assert_eq!(e.state_of(&id), Some(S::Observed));
+    e.set_policy(jlr_policy::Policy::strict(2)).unwrap();
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!(r.examined, 1, "rows recorded under an older policy epoch are not reused");
+    assert_eq!(e.state_of(&id), Some(S::Quarantined));
+}
+
+#[test]
+fn losing_the_object_store_still_degrades_a_trusted_file_that_changes() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let bytes = elf();
+    let tool = lab.file("usr/bin/tool", &bytes);
+    lab.package("tool", &[(&tool, &bytes)]);
+    let mut e = lab.open();
+    e.enroll_baseline(std::slice::from_ref(&lab.sys), &enroll("host", "operator", false), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &tool);
+    assert_eq!(e.state_of(&id), Some(S::Admitted));
+
+    // The object store is an unauthenticated cache. Whoever can delete from it must not be able to turn
+    // "changed after it was trusted" into silence.
+    fs::remove_dir_all(lab.paths().objects().join("epn")).unwrap();
+    let mut evil = elf();
+    evil[100] = 0x99;
+    fs::write(&tool, &evil).unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    assert_eq!(e.state_of(&id), Some(S::Degraded), "the previously admitted identity must still be degraded");
+    assert_eq!(e.status().posture, Posture::Degraded);
+}
+
+#[test]
+fn revocation_targets_are_validated_and_put_in_the_form_the_matcher_compares() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let exe = lab.file("opt/tool", &elf());
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    let hex = e.explain(&exe).unwrap().record.digest.hex();
+    let epoch = e.status().revocations_epoch;
+
+    // Malformed targets are refused outright and consume nothing.
+    for bad in ["", "zz", &hex[..63], &format!("{hex}0"), "EPN-1-EXE-short", "epn", "sha256:"] {
+        for kind in [RevocationKind::Digest, RevocationKind::Epn] {
+            assert!(
+                matches!(e.revoke(kind, bad, "x"), Err(EngineError::Invalid(_))),
+                "{kind:?} {bad:?} must be refused"
+            );
+        }
+    }
+    assert!(e.revoke(RevocationKind::Signer, "bad\nsigner", "x").is_err());
+    assert_eq!(e.status().revocations_epoch, epoch, "refused revocations must not be signed or counted");
+
+    // Every natural spelling of the same digest works and is stored once, in the canonical form.
+    let upper = hex.to_uppercase();
+    assert_eq!(e.revoke(RevocationKind::Digest, &format!("SHA256:{upper}"), "stolen").unwrap(), 1);
+    assert_eq!(e.state_of(&id), Some(S::Revoked));
+    let stored: Vec<_> = e.revocations().entries.iter().map(|x| x.target.clone()).collect();
+    assert_eq!(stored, vec![format!("sha256:{hex}")]);
+
+    // EPN spelling: lower-case class and upper-case hex.
+    let mut other = elf();
+    other[90] = 7;
+    let exe2 = lab.file("opt/tool2", &other);
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id2 = id_of(&e, &exe2);
+    let sloppy = id2.to_string().to_lowercase();
+    assert_eq!(e.revoke(RevocationKind::Epn, &sloppy, "stolen").unwrap(), 1);
+    assert_eq!(e.state_of(&id2), Some(S::Revoked));
+}
+
+#[test]
+fn the_policy_epoch_floor_ignores_prose_an_author_controls() {
+    // The floor is read back from event details the engine wrote; text before the fixed fields must never count.
+    let digest = "a".repeat(64);
+    assert_eq!(crate::engine::parse_epoch(&format!("policy=x epoch=2 digest={digest}")), Some(2));
+    assert_eq!(crate::engine::parse_epoch(&format!("policy=site epoch=900000 epoch=2 digest={digest}")), Some(2));
+    assert_eq!(crate::engine::parse_epoch(&format!("policy=x epoch=0 epoch=7 digest={digest}")), Some(7));
+    assert_eq!(crate::engine::parse_epoch("revocations epoch=4 added Digest sha256:00: reason epoch=99"), Some(4));
+    assert_eq!(crate::engine::parse_epoch("epoch=5 without the fixed shape"), None);
+    assert_eq!(crate::engine::parse_epoch(""), None);
+
+    // And a policy cannot smuggle such a name in any more.
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let mut hostile = jlr_policy::Policy::strict(2);
+    hostile.name = "site-policy epoch=900000".into();
+    assert!(matches!(e.set_policy(hostile), Err(EngineError::Invalid(_))));
+    assert_eq!(e.policy().epoch, 1);
+    e.set_policy(jlr_policy::Policy::strict(2)).unwrap();
+}
+
+#[test]
+fn attacker_chosen_names_cannot_inject_control_characters_into_the_ledger() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let evil = "opt/x\n\u{1b}[2J\u{202e}forged: ALLOWED";
+    let exe = lab.file(evil, &elf());
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let v = e.decide_exec(fs::File::open(&exe).unwrap(), &exe).unwrap();
+    e.record_exec(v.id.as_ref(), &exe.to_string_lossy(), "denied", &v.decision).unwrap();
+    let bad = |c: char| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let evs = events(&lab);
+    assert!(evs.iter().any(|x| x.detail.contains("forged")), "the event must still be recorded and identifiable");
+    for ev in &evs {
+        assert!(!ev.detail.chars().any(bad), "unsanitised detail in the ledger: {:?}", ev.detail);
+    }
+}
+
+#[test]
+fn run_detached_gives_the_ledger_back_while_the_workload_runs() {
+    let lab = Lab::new();
+    if !helper_available(&lab) {
+        return;
+    }
+    lab.init(PolicyKind::Workstation);
+    let sh = fs::canonicalize("/bin/sh").unwrap();
+    let prog = lab.file("opt/sh", &fs::read(&sh).unwrap());
+    // The workload cannot write to the host, so it signals by being alive: it sleeps, and we probe the lock.
+    let (paths, cfg, prog2) = (lab.paths(), lab.cfg(), prog.clone());
+    let worker = std::thread::spawn(move || {
+        Engine::run_detached(
+            paths,
+            cfg,
+            &prog2,
+            &["-c".into(), "sleep 3".into()],
+            &["PATH=/usr/bin:/bin".into()],
+            &[],
+            true,
+        )
+    });
+    // Wait until the start has been logged (before the program runs), then require the lock to be free while the program sleeps.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut acquired = false;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if events(&lab).iter().any(|x| x.detail.contains("starting")) && !worker.is_finished() {
+            acquired = Engine::open_wait(lab.paths(), lab.cfg(), std::time::Duration::from_millis(500)).is_ok();
+            break;
+        }
+        if worker.is_finished() {
+            break;
+        }
+    }
+    let result = worker.join().unwrap();
+    match result {
+        Err(EngineError::Cell(jlr_cell::CellError::Refused(_))) => return, // kernel cannot host cells here
+        Err(e) => panic!("{e}"),
+        Ok(_) => {}
+    }
+    assert!(acquired, "the exclusive ledger lock must not be held for the lifetime of the workload");
+    assert!(events(&lab).iter().any(|x| x.detail.contains("exited with code 0")), "the end is recorded afterwards");
+}
+
+#[test]
+fn a_withdrawn_approval_cannot_be_put_back_from_a_copy() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Strict);
+    let exe = lab.file("opt/tool", &elf());
+    let (id, old_copy);
+    {
+        let mut e = lab.open();
+        e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+        id = id_of(&e, &exe);
+        e.approve(&id.to_string(), CellClass::Cell2, NetworkMode::FullUserNetwork, vec![], 720 * 3600, "alice")
+            .unwrap();
+        assert_eq!(e.state_of(&id), Some(S::Admitted));
+        // The operator keeps a copy of the broad grant, then narrows it (a shorter, smaller approval).
+        let f = lab.paths().approvals().join(format!("{}.cose", id.digest.hex()));
+        old_copy = fs::read(&f).unwrap();
+        lab.clock.fetch_add(1, Ordering::SeqCst);
+        e.approve(&id.to_string(), CellClass::Cell0, NetworkMode::None, vec![], 1, "alice").unwrap();
+    }
+    let f = lab.paths().approvals().join(format!("{}.cose", id.digest.hex()));
+    let narrowed = fs::read(&f).unwrap();
+    assert_ne!(old_copy, narrowed);
+
+    // Someone puts the old, still-unexpired, correctly signed grant back over the file.
+    fs::write(&f, &old_copy).unwrap();
+    let e = lab.open();
+    let d = e.explain(&exe).unwrap().decision;
+    assert_ne!(
+        (d.cell, d.network),
+        (CellClass::Cell2, NetworkMode::FullUserNetwork),
+        "a superseded approval came back to life: {d:?}"
+    );
+    let noted = |lab: &Lab| {
+        events(lab)
+            .iter()
+            .filter(|x| x.kind == EventKind::Degraded && x.detail.contains("not the approval the ledger records"))
+            .count()
+    };
+    assert_eq!(noted(&lab), 1, "the ignored file must be reported");
+    drop(e);
+    // ...and reported once, not once per start.
+    drop(lab.open());
+    drop(lab.open());
+    assert_eq!(noted(&lab), 1, "the same problem must not be logged again on every open");
+
+    // A copy stored under another name, sorting after the real file, cannot shadow the current approval.
+    fs::write(&f, &narrowed).unwrap();
+    fs::write(lab.paths().approvals().join("zzz-copy.cose"), &old_copy).unwrap();
+    let e = lab.open();
+    let d = e.explain(&exe).unwrap().decision;
+    assert_ne!((d.cell, d.network), (CellClass::Cell2, NetworkMode::FullUserNetwork), "{d:?}");
+}
+
+#[test]
+fn a_superseded_baseline_cannot_be_restored_from_a_copy() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let (a, b) = (elf(), {
+        let mut o = elf();
+        o[90] = 9;
+        o
+    });
+    let tool_a = lab.file("usr/bin/a", &a);
+    let tool_b = lab.file("usr/bin/b", &b);
+    lab.package("both", &[(&tool_a, &a), (&tool_b, &b)]);
+    let old_copy;
+    {
+        let mut e = lab.open();
+        let (_, n) = e
+            .enroll_baseline(std::slice::from_ref(&lab.sys), &enroll("host", "operator", false), &Lab::scan_opts())
+            .unwrap();
+        assert_eq!(n, 2);
+        old_copy = fs::read(lab.paths().baselines().join("host.cose")).unwrap();
+    }
+    // The operator drops b (removes it, re-enrols the baseline under the same name), then someone restores the copy.
+    fs::remove_file(&tool_b).unwrap();
+    lab.clock.fetch_add(5, Ordering::SeqCst);
+    {
+        let mut e = lab.open();
+        let (_, n) = e
+            .enroll_baseline(std::slice::from_ref(&lab.sys), &enroll("host", "operator", false), &Lab::scan_opts())
+            .unwrap();
+        assert_eq!(n, 1, "only a remains");
+    }
+    let current = fs::read(lab.paths().baselines().join("host.cose")).unwrap();
+    assert_ne!(current, old_copy);
+    fs::write(lab.paths().baselines().join("host.cose"), &old_copy).unwrap();
+    let e = lab.open();
+    assert_eq!(e.status().baselines.iter().map(|(_, n)| *n).sum::<usize>(), 0, "the restored baseline must not count");
+    assert!(
+        events(&lab)
+            .iter()
+            .any(|x| x.kind == EventKind::Degraded && x.detail.contains("not the baseline the ledger records"))
+    );
+}
+
+#[test]
+fn losing_the_path_index_does_not_hide_that_a_trusted_file_was_replaced() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let bytes = elf();
+    let tool = lab.file("usr/bin/tool", &bytes);
+    lab.package("tool", &[(&tool, &bytes)]);
+    let id;
+    {
+        let mut e = lab.open();
+        e.enroll_baseline(std::slice::from_ref(&lab.sys), &enroll("host", "operator", false), &Lab::scan_opts())
+            .unwrap();
+        id = id_of(&e, &tool);
+        assert_eq!(e.state_of(&id), Some(S::Admitted));
+    }
+    // The index is an unauthenticated cache: whoever can delete it must not thereby erase what was trusted where.
+    fs::remove_file(lab.paths().index()).unwrap();
+    let mut evil = elf();
+    evil[100] = 0x77;
+    fs::write(&tool, &evil).unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut e = lab.open();
+    assert!(
+        events(&lab).iter().any(|x| x.kind == EventKind::Degraded && x.detail.contains("path index was missing")),
+        "the loss must be recorded"
+    );
+    let r = e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    assert_eq!(r.degraded.len(), 1, "the replaced file must still be noticed: {r:?}");
+    assert_eq!(e.state_of(&id), Some(S::Degraded));
+    assert_eq!(e.status().posture, Posture::Degraded);
+    drop(e);
+
+    // A damaged index is a loss too, and it is reported once, not on every start afterwards.
+    fs::write(lab.paths().index(), b"\xff\xfe not cbor").unwrap();
+    drop(lab.open());
+    drop(lab.open());
+    let n = events(&lab).iter().filter(|x| x.detail.contains("path index was missing")).count();
+    assert_eq!(n, 2, "one event for each of the two losses, none for the reopen");
+}
+
+#[test]
+fn a_fresh_installation_without_an_index_is_not_a_loss() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    drop(lab.open());
+    assert!(!events(&lab).iter().any(|x| x.detail.contains("path index was missing")));
+}
+
+#[test]
+fn a_truncated_object_is_rewritten_the_next_time_the_artifact_is_seen() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let exe = lab.file("opt/tool", &elf());
+    let mut e = lab.open();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    let hex = id.digest.hex();
+    let obj = lab.paths().objects().join("epn").join(&hex[..2]).join(format!("{}.cbor", &hex[2..]));
+    let good = fs::read(&obj).unwrap();
+    fs::write(&obj, &good[..good.len() / 2]).unwrap(); // what a crash before the data reached the disk leaves
+    assert!(e.explain(&exe).is_ok());
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    assert_eq!(fs::read(&obj).unwrap(), good, "an object with the wrong length must be written again");
 }

@@ -3,7 +3,7 @@
 use crate::{classify, is_governed};
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// Traversal options.
@@ -59,7 +59,14 @@ pub fn walk(root: &Path, opts: &WalkOptions) -> std::io::Result<Vec<PathBuf>> {
             } else if ft.is_file() {
                 if opts.governed_only {
                     let mut head = [0u8; crate::HEAD_LEN];
-                    let n = fs::File::open(&path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+                    // lstat said "regular file", but the entry may have been swapped since: never follow a
+                    // symlink and never block on a FIFO or device.
+                    let n = fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                        .open(&path)
+                        .and_then(|mut f| f.read(&mut head))
+                        .unwrap_or(0);
                     if !is_governed(classify(&head[..n], &path, meta.mode())) {
                         continue;
                     }

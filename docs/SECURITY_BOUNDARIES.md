@@ -23,6 +23,14 @@ A release MAY claim a security property only when a reproducible test or procedu
 | A cell launch whose mandatory controls are missing runs nothing, and every launch reports what was enforced | Cell tests; `jlr doctor` |
 | The trust decision is deterministic, revocation always wins, and nothing is promoted without matching evidence | Property tests, mutation-checked |
 | Unknown or tampered executables are denied by the kernel when enforcement is on, and only then | QEMU exec-gate test |
+| An executable the gate cannot measure (oversized, changing, not a regular file) is denied when enforcing, never waved through, and a repeat exec of an unchanged file writes nothing | Engine tests; QEMU `enforce unmeasurable: BLOCKED` |
+| A file system mounted after the daemon started is gated too | QEMU `late mount stranger: BLOCKED` |
+| An extra attached disk cannot lower the rollback floor, and a pinned initramfs never mounts another disk | QEMU two-disk and pinned-medium tests |
+| A transient read error or a damaged state file cannot retire a good slot or reset the floor | Boot unit tests; QEMU unreadable-state test |
+| A cell workload has no controlling terminal, inherits no descriptor beyond its own image, cannot type into the operator's terminal or read the host kernel log | Cell tests, mutation-checked |
+| A hostile file name, policy name or revocation text cannot forge ledger or terminal lines or move the policy epoch floor | Model, policy and engine tests |
+| A superseded or withdrawn approval or baseline cannot be put back from a copy: only the file whose digest the ledger records as the latest override counts | Engine tests, mutation-checked |
+| Losing the path index cannot hide that a trusted file was replaced | Engine test, mutation-checked |
 | Wire formats are deterministic, strictly decoded, and reproduced by an independent implementation | Pinned vectors and `tools/check_vectors.py` |
 | The boot image and initramfs are bit-for-bit reproducible from identical inputs | `boot/build.sh` builds twice and compares |
 
@@ -44,45 +52,63 @@ Every item below is a boundary a reader must know about. None is hidden elsewher
    supervisor deployment (verified base with IPE or fs-verity), not a smarter daemon.
 3. **If the daemon dies, the gate opens.** The kernel releases held events when the fanotify descriptor closes. The ledger
    records when the daemon last ran and when it stopped.
-4. **Internal gate errors fail open** unless `--fail-closed`.
+4. **Internal gate errors fail open** unless `--fail-closed`. A file the gate cannot measure is *not* an internal error: it
+   is denied when enforcing, because the user who runs a file controls its size and how it changes.
+5. **The gate cannot see every file system.** One mounted in another mount namespace (for example a tmpfs an unprivileged
+   user mounts inside their own user namespace) is not marked, so executables there are not gated. Where that matters,
+   restrict unprivileged user namespaces (`kernel.unprivileged_userns_clone=0`, or the AppArmor restriction on recent
+   Ubuntu). A file system mounted in the host's namespace is marked when the kernel reports the mount-table change;
+   an exec in the few milliseconds before that is not gated.
 
 **Boot**
 
-5. **The initramfs is not authenticated by firmware.** A boot-media attacker who can replace it can replace the trust anchors.
+6. **The initramfs is not authenticated by firmware.** A boot-media attacker who can replace it can replace the trust anchors.
    Fix: signed unified kernel image (designed).
-6. **The rollback floor is on the boot media.** The same attacker can lower it. Fix: TPM NV counter (designed).
-7. **The boot state file is unauthenticated** for the same reason.
-8. **Media discovery mounts the first partition that has a `/jlr` directory.** A second attached disk carrying a `/jlr` tree
-   signed by an untrusted key is still refused (its manifest will not verify), and one signed by a trusted key is, by
-   definition, trusted; but a *denial of service* by an attached disk that shadows the real one is possible.
+7. **The rollback floor is on the boot media.** The same attacker can lower it. Fix: TPM NV counter (designed).
+8. **The boot state file is unauthenticated** for the same reason.
+9. **Which disk supplies the rollback floor.** Every attached disk with a `/jlr` tree is examined, and the highest floor on
+   any of them applies to all of them, so a stale or foreign disk cannot lower it. That holds only for media that are
+   attached: with the real medium absent nothing records what the floor should have been, and an older, validly signed
+   release on another disk will boot. An initramfs pinned to one medium (`jlr.media=` or `/etc/jlr/media-id`) never
+   mounts any other disk and refuses when the pinned one is missing. Unpinned, an attached disk can still deny service (a
+   state file with a very high floor, or a damaged one) because the boot stops rather than guess a floor. The fix that
+   removes the dependence on media is the TPM counter (designed).
+10. **Write-protected media boot only a proven slot.** An unproven update needs its "try spent" record written first, so
+    on a medium that cannot be written it is skipped and the proven slot boots. Success cannot be recorded there either.
 
 **Evidence and provenance**
 
-9. **dpkg's manifests are unauthenticated.** Package-managed software is therefore admitted by an operator-signed baseline, not
+11. **dpkg's manifests are unauthenticated.** Package-managed software is therefore admitted by an operator-signed baseline, not
    by evidence; the adapter records `SOURCE_KNOWN` and never `PACKAGE_SIGNATURE`.
-10. **Checkpoint counters are software counters.** They detect nothing against an attacker who rewrites both the ledger and its
+12. **Checkpoint counters are software counters.** They detect nothing against an attacker who rewrites both the ledger and its
     checkpoints. A checkpoint held off the machine does.
-11. **`PROVEN` is scoped.** It never means free of malware.
-12. **Path facts and metadata are hints.** Incremental scans reuse a measurement while size, mtime, ctime, inode and device are
+13. **`PROVEN` is scoped.** It never means free of malware.
+14. **Path facts and metadata are hints.** Incremental scans reuse a measurement while size, mtime, ctime, inode and device are
     unchanged and the evidence is younger than the policy's limit; an attacker with root can move the clock or edit the inode.
     Evidence is re-collected on the age limit and by the daemon's rescan.
 
 **Confinement**
 
-13. **Cells share the host kernel.** A kernel bug reachable through the allowed syscalls defeats them. A VM is the stronger
+15. **Cells share the host kernel.** A kernel bug reachable through the allowed syscalls defeats them. A VM is the stronger
     boundary (designed).
-14. **The seccomp filter is a deny list.**
-15. **`NET_CONNECT` host names are not enforced**; Landlock matches ports.
-16. **cgroup limits need a delegated cgroup**; without one, memory and process ceilings are unavailable and reported so.
-17. **A `FULL_USER_NETWORK` cell shares the host network namespace.**
-18. **No display, audio or input is forwarded**, so graphical programs cannot yet run in cells.
-19. **Companion-mode cells created by an unprivileged user depend on user namespaces**, which some distributions restrict.
+16. **The seccomp filter is a deny list.** It also refuses `syslog` and the terminal-injection `ioctl` requests.
+17. **`NET_CONNECT` host names are not enforced**; Landlock matches ports.
+18. **cgroup limits need a delegated cgroup**; without one, memory and process ceilings are unavailable and reported so.
+19. **A `FULL_USER_NETWORK` cell shares the host network namespace.**
+20. **No display, audio or input is forwarded**, so graphical programs cannot yet run in cells.
+21. **Companion-mode cells created by an unprivileged user depend on user namespaces**, which some distributions restrict.
+22. **A cell started from a terminal keeps that terminal as standard input** (in a session with no controlling terminal). It
+    can read what is typed and write to it.
+23. **The object store and the path index are unauthenticated caches.** Their loss is detected and repaired from the ledger
+    where that is possible (a lost index is rebuilt from recorded discoveries; a truncated record is rewritten), but an
+    attacker who can write the state directory can still make JLR forget cache-only facts such as evidence details. What
+    the ledger records, signed and checkpointed, is not affected.
 
 **Cryptography and process**
 
-20. Signatures are Ed25519 only; post-quantum hybrids are planned, not present.
-21. **No external audit; no coverage-guided fuzzing** of the untrusted parsers (property and malformed-input tests only).
-22. Compiled binaries are not yet compared bit-for-bit across build machines; the boot artifacts are.
+24. Signatures are Ed25519 only; post-quantum hybrids are planned, not present.
+25. **No external audit; no coverage-guided fuzzing** of the untrusted parsers (property and malformed-input tests only).
+26. Compiled binaries are not yet compared bit-for-bit across build machines; the boot artifacts are.
 
 ## 3. The self-integrity boundary
 
