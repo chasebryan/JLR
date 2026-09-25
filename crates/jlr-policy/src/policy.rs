@@ -148,12 +148,8 @@ impl Policy {
                     t.name
                 ));
             }
-            if matches!(
-                t.network,
-                NetworkMode::FullUserNetwork | NetworkMode::PrivilegedNetwork | NetworkMode::MediatedProxy
-            ) && !grants_run
-            {
-                return bad(format!("tier {}: {} artifacts may not have network access", t.name, t.state));
+            if !grants_run && t.network != NetworkMode::None {
+                return bad(format!("tier {}: {} artifacts may not have any network access", t.name, t.state));
             }
             if t.network == NetworkMode::PrivilegedNetwork && !t.needs_user {
                 return bad(format!("tier {}: PRIVILEGED_NETWORK needs a human decision", t.name));

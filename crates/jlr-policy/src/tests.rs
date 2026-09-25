@@ -118,6 +118,16 @@ fn validation_rejects_unsafe_policies() {
     cases.push(("observed with network", p));
 
     let mut p = base.clone();
+    let last = p.tiers.len() - 1;
+    p.tiers[last].network = N::LoopbackOnly;
+    cases.push(("observed with loopback", p));
+
+    let mut p = base.clone();
+    let last = p.tiers.len() - 1;
+    p.tiers[last].network = N::DestinationAllowlist;
+    cases.push(("observed with destination allow-list", p));
+
+    let mut p = base.clone();
     p.tiers[1].cell = CellClass::CellR;
     cases.push(("CELL-R in tier", p));
 

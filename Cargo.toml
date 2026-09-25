@@ -32,6 +32,7 @@ jlr-policy = { path = "crates/jlr-policy" }
 jlr-measure = { path = "crates/jlr-measure" }
 jlr-cell = { path = "crates/jlr-cell" }
 jlr-engine = { path = "crates/jlr-engine" }
+jlr-boot = { path = "crates/jlr-boot" }
 
 # Cryptography (pure Rust in the trusted computing base)
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize", "fast"] }

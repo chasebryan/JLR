@@ -40,6 +40,9 @@ record! {
         6 => ino: u64,
         /// Device.
         7 => dev: u64,
+        /// When the bytes were last actually hashed, in seconds since the Unix epoch.
+        /// Metadata alone is never trusted forever: see the policy's `evidence_max_age_secs`.
+        8 => measured_at: u64,
     }
 }
 

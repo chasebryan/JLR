@@ -1,0 +1,139 @@
+{
+  "boot_state": {
+    "after_install_b": "a201000282a4016161020e030004f5a4016162020f030304f4"
+  },
+  "cbor": [
+    {
+      "diagnostic": "0",
+      "hex": "00",
+      "name": "uint 0"
+    },
+    {
+      "diagnostic": "1000",
+      "hex": "1903e8",
+      "name": "uint 1000"
+    },
+    {
+      "diagnostic": "18446744073709551615",
+      "hex": "1bffffffffffffffff",
+      "name": "uint max"
+    },
+    {
+      "diagnostic": "-1",
+      "hex": "20",
+      "name": "negative -1"
+    },
+    {
+      "diagnostic": "\"IETF\"",
+      "hex": "6449455446",
+      "name": "text IETF"
+    },
+    {
+      "diagnostic": "h'01020304'",
+      "hex": "4401020304",
+      "name": "bytes"
+    },
+    {
+      "diagnostic": "[1, 2, 3]",
+      "hex": "83010203",
+      "name": "array"
+    },
+    {
+      "diagnostic": "{10: 1, 100: 2, -1: 3, \"z\": 4, \"aa\": 5}",
+      "hex": "a50a011864022003617a0462616105",
+      "name": "map keys sorted by encoding, inserted out of order"
+    },
+    {
+      "diagnostic": "18(1)",
+      "hex": "d201",
+      "name": "tag 18 wrapped uint"
+    },
+    {
+      "diagnostic": "[true, false, null]",
+      "hex": "83f5f4f6",
+      "name": "bool and null"
+    }
+  ],
+  "decision": {
+    "record_cbor": "a70105020203040482781c46535f524541443a2f686f6d652f757365722f446f63756d656e7473694445565f415544494f058103060108822f5820823412d1eacb67956220e532959f0104603057c88704863ca38e7cd188fda812"
+  },
+  "envelope": {
+    "cose_sign1": "d2845849a3013204582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e1078206170706c69636174696f6e2f766e642e6a6c722e65706e2b63626f723b763d31a05883a90101020503626c730465392e342d33051a00021be006822f58205cab3404396142792c5716dbc6ef7986204aedeacb93f889b9ecca0dc2a40138070509a3016464706b670269636f72657574696c73036b2f7573722f62696e2f6c730a81822f582016c8c6eb85e05438f5d6c60ff9869072a3a3b1618aa1481ac7a0cb049f06f51d58404ef084e93336cfd2fd6d52d7247a1338a73772d4fb173443d181d7168826ffa05a8061ddd0d0ce5084533bea37618bc401e6bb3f4f4a0ea3b6051e82dee4c102",
+    "envelope_digest": "sha256:4bbcea3776184b2ce7adfd01527b58f1e0db14c0334ee698493191101e413184",
+    "external_aad": "JLR/1/epn/node-vector",
+    "record_digest": "sha256:fcfe7bf29dd18ab924621caf2130ea049330793ee647d508abca6eb864cbf0a6",
+    "record_type": "epn",
+    "scope": "node-vector",
+    "signer": "device_seed"
+  },
+  "epn": {
+    "fields": {
+      "class": "EXE",
+      "digest": "sha256:5cab3404396142792c5716dbc6ef7986204aedeacb93f889b9ecca0dc2a40138",
+      "name": "ls",
+      "provenance": "SOURCE_KNOWN",
+      "size": 138208,
+      "source": {
+        "channel": "dpkg",
+        "origin": "coreutils",
+        "path": "/usr/bin/ls"
+      },
+      "version": "9.4-3"
+    },
+    "id": "EPN-1-EXE-fcfe7bf29dd18ab924621caf2130ea049330793ee647d508abca6eb864cbf0a6",
+    "record_cbor": "a90101020503626c730465392e342d33051a00021be006822f58205cab3404396142792c5716dbc6ef7986204aedeacb93f889b9ecca0dc2a40138070509a3016464706b670269636f72657574696c73036b2f7573722f62696e2f6c730a81822f582016c8c6eb85e05438f5d6c60ff9869072a3a3b1618aa1481ac7a0cb049f06f51d",
+    "record_digest": "sha256:fcfe7bf29dd18ab924621caf2130ea049330793ee647d508abca6eb864cbf0a6"
+  },
+  "event": {
+    "digest": "sha256:05e455102307cadb517db4c47cf5182495be6bcd4c0fe1457151be19e4741049",
+    "record_cbor": "ae0101025007070707070707070707070707070707031a6b49d20004182a056a6a6c722d656e67696e6506784a45504e2d312d4558452d666366653762663239646431386162393234363231636166323133306561303439333330373933656536343764353038616263613665623836346362663061360705080309040a822f5820823412d1eacb67956220e532959f0104603057c88704863ca38e7cd188fda8120b81822f5820ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e0c030d66766563746f720e822f58200000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "format": "jlr-protocol-vectors",
+  "keys": {
+    "device_kid": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+    "device_public": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "device_seed": "0101010101010101010101010101010101010101010101010101010101010101",
+    "release_public": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "release_seed": "0202020202020202020202020202020202020202020202020202020202020202"
+  },
+  "merkle": {
+    "consistency_3_to_5": [
+      "sha256:fca89f57c9f8c8eb4047a7ff9d333acf9e0f3384b20b255bceab0f216dcca267",
+      "sha256:f76836325aec5699d8d71f8e42e9d47c5c29b08059ba296384f7ca40ad3a40ae",
+      "sha256:60a53eed0de87a90c8e59427c59c46253c33a76a09502a51801300927b7e6bdc",
+      "sha256:ea9fc1a1b6e191b460d0d6306e3e870c173f39330f13cda1b70cfc72bdc398ba"
+    ],
+    "inclusion_index_2_size_5": [
+      "sha256:f76836325aec5699d8d71f8e42e9d47c5c29b08059ba296384f7ca40ad3a40ae",
+      "sha256:60a53eed0de87a90c8e59427c59c46253c33a76a09502a51801300927b7e6bdc",
+      "sha256:ea9fc1a1b6e191b460d0d6306e3e870c173f39330f13cda1b70cfc72bdc398ba"
+    ],
+    "leaf_hashes": [
+      "sha256:305df59f9590c3c9ac63d2b2743c388e3792449078cebf7fb3dbe6471643b2b7",
+      "sha256:3145c409f259b7c53e32036090ff76751025a2498ba9823ef718cac50b4e616f",
+      "sha256:fca89f57c9f8c8eb4047a7ff9d333acf9e0f3384b20b255bceab0f216dcca267",
+      "sha256:f76836325aec5699d8d71f8e42e9d47c5c29b08059ba296384f7ca40ad3a40ae",
+      "sha256:ea9fc1a1b6e191b460d0d6306e3e870c173f39330f13cda1b70cfc72bdc398ba"
+    ],
+    "leaves": [
+      "leaf-0",
+      "leaf-1",
+      "leaf-2",
+      "leaf-3",
+      "leaf-4"
+    ],
+    "root_3": "sha256:cf763a041c81ceef1578a6083f75c61bef2e0014f2a3e683a97fcfca5be7f19a",
+    "root_5": "sha256:00d21829a5503145348abcf712513eacf2a274211ad83e970202bb5b6d80b286"
+  },
+  "note": "Regenerate only deliberately: JLR_UPDATE_VECTORS=1 cargo test -p jlr --test vectors. A changed vector is a protocol change.",
+  "policy": {
+    "workstation_epoch_1_cbor_len": 244,
+    "workstation_epoch_1_digest": "sha256:a0c7bf6b417d771d441e584c3f1fe2a9c0525611f16a171ee5b53675492f61f0"
+  },
+  "release": {
+    "manifest_cbor": "a9010102686a6c722d626173650365302e312e30040305822f5820db442dda89353fc70dabf6443ca0cdc58879c349e776b7193fc475b9b0befaa80611070208822f5820a0c7bf6b417d771d441e584c3f1fe2a9c0525611f16a171ee5b53675492f61f00981a201636a6c7202822f5820d17d13782a08f8a393cd8b1d8181e136f82f559c9b6c78b6b35496f62040c4da",
+    "signed_manifest": "d2845856a301320458206a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f0382710782d6170706c69636174696f6e2f766e642e6a6c722e72656c656173652d6d616e69666573742b63626f723b763d31a05891a9010102686a6c722d626173650365302e312e30040305822f5820db442dda89353fc70dabf6443ca0cdc58879c349e776b7193fc475b9b0befaa80611070208822f5820a0c7bf6b417d771d441e584c3f1fe2a9c0525611f16a171ee5b53675492f61f00981a201636a6c7202822f5820d17d13782a08f8a393cd8b1d8181e136f82f559c9b6c78b6b35496f62040c4da584053f324ce744417d06e05d97fd9559f095234270c3e2cc1c4fcdd23652abb5300379d75f786dd36e28ddc15070a21ba246ab717531772c0b417014333be8fdb0b",
+    "signer": "release_seed"
+  },
+  "version": 1
+}

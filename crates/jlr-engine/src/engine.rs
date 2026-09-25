@@ -201,6 +201,8 @@ pub struct ExecVerdict {
     pub allowed: bool,
     /// Whether the active policy enforces (denies) rather than only audits.
     pub enforce: bool,
+    /// Seconds after which this verdict must be re-derived (the policy's evidence age limit).
+    pub max_age_secs: u64,
 }
 
 struct Processed {
@@ -239,7 +241,7 @@ fn now_ns(secs: i64, nsec: i64) -> u64 {
     (secs.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(nsec.max(0) as u64)
 }
 
-fn row_of(path: &str, epn: &EpnId, m: &std::fs::Metadata) -> IndexRow {
+fn row_of(path: &str, epn: &EpnId, m: &std::fs::Metadata, measured_at: u64) -> IndexRow {
     IndexRow {
         path: path.to_owned(),
         epn: epn.to_string(),
@@ -248,6 +250,7 @@ fn row_of(path: &str, epn: &EpnId, m: &std::fs::Metadata) -> IndexRow {
         ctime_ns: now_ns(m.ctime(), m.ctime_nsec()),
         ino: m.ino(),
         dev: m.dev(),
+        measured_at,
     }
 }
 
@@ -650,7 +653,7 @@ impl Engine {
         let path = obs.path.to_string_lossy().into_owned();
         let meta = obs.file.metadata()?;
         Ok(Seen {
-            row: row_of(&path, &obs.record.id(), &meta),
+            row: row_of(&path, &obs.record.id(), &meta, self.now()),
             path,
             record: obs.record.clone(),
             evidence: obs.evidence.clone(),
@@ -700,6 +703,7 @@ impl Engine {
                     && row.ctime_ns == now_ns(meta.ctime(), meta.ctime_nsec())
                     && row.ino == meta.ino()
                     && row.dev == meta.dev()
+                    && self.now().saturating_sub(row.measured_at) < self.policy.evidence_max_age_secs
                     && EpnId::parse(&row.epn).is_some_and(|id| self.states.contains_key(&id))
                 {
                     report.unchanged += 1;
@@ -753,6 +757,7 @@ impl Engine {
             allowed: p.decision.state.permits_normal_execution(),
             decision: p.decision,
             enforce: self.policy.enforce_exec,
+            max_age_secs: self.policy.evidence_max_age_secs,
         })
     }
 

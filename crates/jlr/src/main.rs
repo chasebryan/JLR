@@ -1,5 +1,7 @@
 //! The `jlr` command-line tool.
 
+#![forbid(unsafe_code)]
+
 mod policy_source;
 
 use clap::{Args, Parser, Subcommand};

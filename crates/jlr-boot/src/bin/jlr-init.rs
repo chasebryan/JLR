@@ -12,6 +12,8 @@
 //! Every decision is printed as a `JLR-BOOT:` or `JLR-STAGE2:` line so the
 //! result can be checked from the serial console.
 
+#![forbid(unsafe_code)]
+
 use jlr_boot::sys::{loop_attach, poweroff, restart};
 use jlr_boot::{BootError, BootState, ReleaseManifest, SlotState, choose, verify_image, verify_manifest};
 use jlr_cbor::Cbor;

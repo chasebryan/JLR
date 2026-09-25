@@ -3,6 +3,8 @@
 //! Signing keys never belong on the machines that boot the result. Run this
 //! tool on a separate, preferably offline, build machine.
 
+#![forbid(unsafe_code)]
+
 use jlr_boot::{BootState, Component, ReleaseManifest, verify_image, verify_manifest};
 use jlr_cbor::Cbor;
 use jlr_crypto::{Digest, PublicKey, Role, SigningKeypair, TrustAnchors};

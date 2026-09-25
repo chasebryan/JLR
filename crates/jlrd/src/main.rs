@@ -26,6 +26,8 @@
 //! already runs as root can stop the daemon. Both need the supervisor
 //! deployment (verified boot plus IPE or fs-verity) to close.
 
+#![forbid(unsafe_code)]
+
 use jlr_engine::{Config, Engine, EngineError, Paths, ScanOptions, list_artifacts};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::fanotify::{EventFFlags, Fanotify, FanotifyResponse, InitFlags, MarkFlags, MaskFlags, Response};
@@ -140,6 +142,8 @@ struct CacheEntry {
     stamp: (u64, i64, i64),
     generation: u64,
     allow: bool,
+    /// A verdict is never reused past the policy's evidence age limit.
+    expires: Instant,
 }
 
 #[derive(Default)]
@@ -274,6 +278,7 @@ fn run() -> Result<(), String> {
                 if let Some(c) = cache.get(&key)
                     && c.stamp == stamp
                     && c.generation == g
+                    && Instant::now() < c.expires
                 {
                     respond(c.allow);
                     continue;
@@ -300,7 +305,8 @@ fn run() -> Result<(), String> {
                             say(&format!("{verdict} {}", t.path));
                         }
                         // Only real verdicts are cached, so an error is retried on the next attempt.
-                        cache.insert(key, CacheEntry { stamp, generation: g, allow });
+                        let expires = Instant::now() + Duration::from_secs(v.max_age_secs.min(3600));
+                        cache.insert(key, CacheEntry { stamp, generation: g, allow, expires });
                         allow
                     }
                     Err(msg) => {

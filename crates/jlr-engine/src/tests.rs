@@ -642,3 +642,31 @@ fn open_wait_waits_for_the_lock_then_gives_up() {
     drop(held);
     assert!(Engine::open_wait(lab.paths(), lab.cfg(), std::time::Duration::from_millis(200)).is_ok());
 }
+
+#[test]
+fn unchanged_files_are_rehashed_once_their_evidence_is_older_than_the_policy_allows() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation); // evidence_max_age_secs = 7 days
+    lab.file("opt/prog", &elf());
+    let mut e = lab.open();
+    let mut opts = Lab::scan_opts();
+    opts.full = false;
+    e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!((r.examined, r.unchanged), (0, 1), "fresh evidence is reused");
+
+    lab.clock.fetch_add(6 * 86_400, Ordering::SeqCst);
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!((r.examined, r.unchanged), (0, 1), "still inside the limit");
+
+    lab.clock.fetch_add(2 * 86_400, Ordering::SeqCst);
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!(
+        (r.examined, r.unchanged),
+        (1, 0),
+        "stale evidence must be re-collected even though the metadata is unchanged"
+    );
+    // ...and the re-measurement resets the clock.
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!((r.examined, r.unchanged), (0, 1));
+}
