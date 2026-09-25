@@ -1,0 +1,19 @@
+[package]
+name = "jlr-policy"
+description = "JLR trust engine: policy records, validation, revocations, approvals and the deterministic decision function"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+jlr-cbor.workspace = true
+jlr-crypto.workspace = true
+jlr-model.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

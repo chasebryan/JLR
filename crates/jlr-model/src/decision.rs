@@ -40,6 +40,11 @@ coded_enum! {
         Missing = 14 => "MISSING",
         /// Observed behavior that policy forbids.
         ForbiddenBehavior = 15 => "FORBIDDEN_BEHAVIOR",
+        /// The installed bytes match the package manager's own file manifest.
+        /// That manifest is unauthenticated, so this is weaker than a package signature.
+        PackageManifestMatch = 16 => "PACKAGE_MANIFEST_MATCH",
+        /// The artifact is a member of a signed baseline.
+        BaselineMember = 17 => "BASELINE_MEMBER",
     }
 }
 
@@ -78,6 +83,14 @@ coded_enum! {
         SignatureVerified = 15 => "SIGNATURE_VERIFIED",
         /// Observation window has not completed.
         ObservationPending = 16 => "OBSERVATION_PENDING",
+        /// A local rebuild reproduced the bytes.
+        ReproducedBuild = 17 => "REPRODUCED_BUILD",
+        /// Verified against an upstream checksum only.
+        ChecksumVerified = 18 => "CHECKSUM_VERIFIED",
+        /// Reduced to a smaller cell than the tier grants.
+        CellCapped = 19 => "CELL_CAPPED",
+        /// The artifact was previously revoked.
+        PreviouslyRevoked = 20 => "PREVIOUSLY_REVOKED",
     }
 }
 

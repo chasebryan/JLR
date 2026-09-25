@@ -1,0 +1,30 @@
+[package]
+name = "jlr-cell"
+description = "JLR jail fabric: builds and enforces execution cells from trust decisions, and reports what was actually enforced"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "jlr-cell-init"
+path = "src/bin/jlr-cell-init.rs"
+
+[dependencies]
+jlr-cbor.workspace = true
+jlr-crypto.workspace = true
+jlr-model.workspace = true
+libc.workspace = true
+sha2.workspace = true
+nix = { workspace = true }
+landlock.workspace = true
+seccompiler.workspace = true
+caps = "0.5.6"
+
+[dev-dependencies]
+tempfile.workspace = true
+jlr-measure = { path = "../jlr-measure" }
+
+[lints]
+workspace = true

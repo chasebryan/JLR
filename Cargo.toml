@@ -5,6 +5,9 @@ members = [
     "crates/jlr-crypto",
     "crates/jlr-model",
     "crates/jlr-ledger",
+    "crates/jlr-policy",
+    "crates/jlr-measure",
+    "crates/jlr-cell",
 ]
 
 [workspace.package]
