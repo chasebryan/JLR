@@ -10,6 +10,7 @@ members = [
     "crates/jlr-cell",
     "crates/jlr-engine",
     "crates/jlr",
+    "crates/jlr-boot",
 ]
 
 [workspace.package]

@@ -1,0 +1,32 @@
+[package]
+name = "jlr-boot"
+description = "JLR boot chain: signed release manifests, A/B slot state with rollback floor, and the initramfs init"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "jlr-init"
+path = "src/bin/jlr-init.rs"
+
+[[bin]]
+name = "jlr-release"
+path = "src/bin/jlr-release.rs"
+
+[dependencies]
+jlr-cbor.workspace = true
+jlr-crypto.workspace = true
+jlr-model.workspace = true
+libc.workspace = true
+nix = { workspace = true }
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+jlr-model.workspace = true
+
+[lints]
+workspace = true

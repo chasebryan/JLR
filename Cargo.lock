@@ -378,6 +378,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jlr-boot"
+version = "0.1.0"
+dependencies = [
+ "jlr-cbor",
+ "jlr-crypto",
+ "jlr-model",
+ "libc",
+ "nix",
+ "proptest",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "jlr-cbor"
 version = "0.1.0"
 dependencies = [

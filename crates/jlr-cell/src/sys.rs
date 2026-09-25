@@ -96,7 +96,7 @@ pub fn loopback_up() -> io::Result<()> {
         req.ifr_name[i] = *b as libc::c_char;
     }
     // SAFETY: `req` is a valid ifreq for SIOCGIFFLAGS; the kernel writes its flags field.
-    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) } < 0 {
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: after a successful SIOCGIFFLAGS the flags member of the union is initialised.
@@ -104,7 +104,7 @@ pub fn loopback_up() -> io::Result<()> {
         req.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
     }
     // SAFETY: `req` is a valid ifreq for SIOCSIFFLAGS.
-    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &req) } < 0 {
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

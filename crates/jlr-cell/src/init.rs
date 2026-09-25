@@ -276,7 +276,8 @@ fn bind_flags(src: &str) -> MsFlags {
         if s.contains(FsFlags::ST_NODIRATIME) {
             f |= MsFlags::MS_NODIRATIME;
         }
-        if s.contains(FsFlags::ST_RELATIME) {
+        // ST_RELATIME is 0x1000 on Linux but is not exported for every libc target.
+        if s.bits() & 0x1000 != 0 {
             f |= MsFlags::MS_RELATIME;
         }
     }
@@ -430,11 +431,31 @@ fn build_root(spec: &CellSpec) -> Result<Layout, String> {
     Ok(layout)
 }
 
-fn drop_capabilities() -> Result<(), String> {
+/// Unprivileged identity used for workloads when the launcher itself is root.
+const NOBODY: u32 = 65534;
+
+/// Drops every capability. When `switch_to_nobody` is set (real root, no user
+/// namespace), the workload is also moved to an unprivileged uid, so it
+/// cannot use root's file permissions on any path it can reach.
+///
+/// Order matters: the bounding set can only be edited while `CAP_SETPCAP` is
+/// still held, and changing uid from 0 clears the effective set.
+fn drop_capabilities(switch_to_nobody: bool) -> Result<(), String> {
     use caps::{CapSet, Capability};
     for cap in caps::all() {
         // A capability that does not exist on this kernel cannot be dropped; that is fine.
         let _ = caps::drop(None, CapSet::Bounding, cap);
+    }
+    if switch_to_nobody {
+        use nix::unistd::{Gid, Uid, setgroups, setresgid, setresuid};
+        setgroups(&[]).map_err(|e| format!("setgroups: {e}"))?;
+        setresgid(Gid::from_raw(NOBODY), Gid::from_raw(NOBODY), Gid::from_raw(NOBODY))
+            .map_err(|e| format!("setresgid: {e}"))?;
+        setresuid(Uid::from_raw(NOBODY), Uid::from_raw(NOBODY), Uid::from_raw(NOBODY))
+            .map_err(|e| format!("setresuid: {e}"))?;
+        // Changing uid makes the process non-dumpable, which would hide /proc/self from it
+        // (and from `exec` of a script through /proc/self/fd).
+        let _ = nix::sys::prctl::set_dumpable(true);
     }
     for set in [CapSet::Effective, CapSet::Permitted, CapSet::Inheritable, CapSet::Ambient] {
         caps::clear(None, set).map_err(|e| format!("clear {set:?}: {e}"))?;
@@ -569,7 +590,7 @@ fn stage2(spec: CellSpec, ns_note: &str, cgroup_name: &str) -> i32 {
         }
     }
 
-    match drop_capabilities() {
+    match drop_capabilities(!used_userns) {
         Ok(()) => b.ok(Control::CapDrop),
         Err(e) => b.fail(Control::CapDrop, e),
     }
