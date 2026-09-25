@@ -10,7 +10,7 @@ use jlr_cbor::{Cbor, Value};
 use jlr_cell::{CellSpec, EnforcementReport, SealedExe, Stdio3, launch};
 use jlr_crypto::{Digest, Envelope, SigningKeypair, TrustAnchors, random_bytes};
 use jlr_ledger::{EventDraft, Ledger};
-use jlr_measure::{DpkgDb, Observation, ObserveOptions, Trust, WalkOptions, observe, walk};
+use jlr_measure::{DpkgDb, Observation, ObserveOptions, Trust, WalkOptions, observe, observe_open, walk};
 use jlr_model::{
     AdmissionState, Assurance, Basis, Capability, CellClass, Decision, EpnId, EpnRecord, EventKind, EvidenceItem,
     EvidenceKind, NetworkMode, Posture, record_type,
@@ -64,6 +64,23 @@ impl Default for Config {
             dpkg_root: None,
         }
     }
+}
+
+/// Options for [`Engine::enroll_baseline`].
+#[derive(Clone, Debug)]
+pub struct EnrollOptions {
+    /// Baseline name: alphanumeric, `-` or `_`.
+    pub name: String,
+    /// Cell members may run in.
+    pub cell: CellClass,
+    /// Network policy for that cell.
+    pub network: NetworkMode,
+    /// Validity in seconds.
+    pub ttl_secs: u64,
+    /// Operator identity for the audit trail.
+    pub granted_by: String,
+    /// Also enrol files no package manager vouches for.
+    pub include_unmanaged: bool,
 }
 
 /// Options for [`Engine::scan`].
@@ -149,6 +166,8 @@ pub struct Status {
     pub policy_epoch: u64,
     /// Active policy digest.
     pub policy_digest: Digest,
+    /// Whether the exec gate enforces (denies) or only audits.
+    pub enforce_exec: bool,
     /// Revocation list epoch.
     pub revocations_epoch: u64,
     /// Number of revocation entries.
@@ -169,6 +188,19 @@ pub struct Status {
     pub torn_tail_bytes: u64,
     /// Trusted keys.
     pub anchors: usize,
+}
+
+/// The engine's verdict on one attempted `exec`.
+#[derive(Debug)]
+pub struct ExecVerdict {
+    /// Identity of what is being executed.
+    pub id: EpnId,
+    /// The trust decision.
+    pub decision: Decision,
+    /// Whether the decision permits running outside an observation cell.
+    pub allowed: bool,
+    /// Whether the active policy enforces (denies) rather than only audits.
+    pub enforce: bool,
 }
 
 struct Processed {
@@ -261,6 +293,22 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
+    /// Like [`Engine::open`], but waits up to `timeout` for the ledger lock.
+    ///
+    /// Long-lived programs (the daemon) never hold the engine for long, so a
+    /// short wait lets the command line and the daemon share one state directory.
+    pub fn open_wait(paths: Paths, cfg: Config, timeout: std::time::Duration) -> Result<Engine, EngineError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match Engine::open(paths.clone(), cfg.clone()) {
+                Err(EngineError::Ledger(jlr_ledger::LedgerError::Locked)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Opens an initialised state directory, verifying everything it loads.
     ///
     /// Any signed object that fails verification aborts the open. The engine
@@ -441,6 +489,7 @@ impl Engine {
         self.states.get(id).copied()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log(
         &mut self,
         kind: EventKind,
@@ -617,6 +666,22 @@ impl Engine {
         &mut self,
         roots: &[PathBuf],
         opts: &ScanOptions,
+        collect: Option<&mut Vec<Seen>>,
+    ) -> Result<(ScanReport, ()), EngineError> {
+        let files = list_artifacts(roots, opts)?;
+        self.scan_files_inner(&files, opts, collect)
+    }
+
+    /// Measures and admits the given files. Use with [`list_artifacts`] to scan in bounded slices
+    /// so that no single call holds the ledger for long.
+    pub fn scan_files(&mut self, files: &[PathBuf], opts: &ScanOptions) -> Result<ScanReport, EngineError> {
+        self.scan_files_inner(files, opts, None).map(|(r, _)| r)
+    }
+
+    fn scan_files_inner(
+        &mut self,
+        files: &[PathBuf],
+        opts: &ScanOptions,
         mut collect: Option<&mut Vec<Seen>>,
     ) -> Result<(ScanReport, ()), EngineError> {
         let mut report = ScanReport::default();
@@ -624,44 +689,40 @@ impl Engine {
         let observe_opts = ObserveOptions { max_size: opts.max_size, ..self.observe_opts() };
         self.ledger.set_sync(false);
         let result = (|| -> Result<(), EngineError> {
-            for root in roots {
-                let mut wo = WalkOptions { one_file_system: opts.one_file_system, ..WalkOptions::default() };
-                wo.exclude.extend(opts.exclude.iter().cloned());
-                for path in walk(root, &wo)? {
-                    let pstr = path.to_string_lossy().into_owned();
-                    let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
-                    if !opts.full
-                        && collect.is_none()
-                        && let Some(row) = self.index.get(&pstr)
-                        && row.size == meta.len()
-                        && row.mtime_ns == now_ns(meta.mtime(), meta.mtime_nsec())
-                        && row.ctime_ns == now_ns(meta.ctime(), meta.ctime_nsec())
-                        && row.ino == meta.ino()
-                        && row.dev == meta.dev()
-                        && EpnId::parse(&row.epn).is_some_and(|id| self.states.contains_key(&id))
-                    {
-                        report.unchanged += 1;
-                        continue;
-                    }
-                    match observe(&path, dpkg.as_mut(), &observe_opts) {
-                        Ok(obs) => {
-                            report.examined += 1;
-                            let seen = self.seen_from(&obs)?;
-                            drop(obs);
-                            if let Some(c) = collect.as_deref_mut() {
-                                c.push(seen);
-                            } else {
-                                let p = self.process(&seen, &[])?;
-                                report.transitions += p.transitions;
-                                report.new_artifacts += usize::from(p.is_new);
-                                *report.by_state.entry(p.decision.state).or_default() += 1;
-                                if p.degraded_prior || p.decision.state == AdmissionState::Degraded {
-                                    report.degraded.push(path.clone());
-                                }
+            for path in files {
+                let pstr = path.to_string_lossy().into_owned();
+                let Ok(meta) = std::fs::symlink_metadata(path) else { continue };
+                if !opts.full
+                    && collect.is_none()
+                    && let Some(row) = self.index.get(&pstr)
+                    && row.size == meta.len()
+                    && row.mtime_ns == now_ns(meta.mtime(), meta.mtime_nsec())
+                    && row.ctime_ns == now_ns(meta.ctime(), meta.ctime_nsec())
+                    && row.ino == meta.ino()
+                    && row.dev == meta.dev()
+                    && EpnId::parse(&row.epn).is_some_and(|id| self.states.contains_key(&id))
+                {
+                    report.unchanged += 1;
+                    continue;
+                }
+                match observe(path, dpkg.as_mut(), &observe_opts) {
+                    Ok(obs) => {
+                        report.examined += 1;
+                        let seen = self.seen_from(&obs)?;
+                        drop(obs);
+                        if let Some(c) = collect.as_deref_mut() {
+                            c.push(seen);
+                        } else {
+                            let p = self.process(&seen, &[])?;
+                            report.transitions += p.transitions;
+                            report.new_artifacts += usize::from(p.is_new);
+                            *report.by_state.entry(p.decision.state).or_default() += 1;
+                            if p.degraded_prior || p.decision.state == AdmissionState::Degraded {
+                                report.degraded.push(path.clone());
                             }
                         }
-                        Err(e) => report.errors.push((path, e.to_string())),
                     }
+                    Err(e) => report.errors.push((path.clone(), e.to_string())),
                 }
             }
             Ok(())
@@ -671,6 +732,48 @@ impl Engine {
         self.save_index()?;
         result?;
         Ok((report, ()))
+    }
+
+    /// Decides whether an `exec` of the open file `file` may proceed.
+    ///
+    /// The bytes are measured through the descriptor the kernel delivered, so a
+    /// path swapped afterwards changes nothing. Discoveries and transitions are
+    /// recorded exactly as for a scan.
+    pub fn decide_exec(&mut self, file: std::fs::File, path: &Path) -> Result<ExecVerdict, EngineError> {
+        let mut dpkg = self.load_dpkg();
+        let obs = observe_open(file, path, dpkg.as_mut(), &self.observe_opts())?;
+        let id = obs.record.id();
+        let seen = self.seen_from(&obs)?;
+        drop(obs);
+        let p = self.process(&seen, &[])?;
+        self.save_index()?;
+        self.flush()?;
+        Ok(ExecVerdict {
+            id,
+            allowed: p.decision.state.permits_normal_execution(),
+            decision: p.decision,
+            enforce: self.policy.enforce_exec,
+        })
+    }
+
+    /// Records the outcome of an exec decision in the ledger.
+    pub fn record_exec(
+        &mut self,
+        id: &EpnId,
+        path: &str,
+        verdict: &str,
+        decision: &Decision,
+    ) -> Result<(), EngineError> {
+        let reasons: Vec<String> = decision.reasons.iter().map(ToString::to_string).collect();
+        let detail = format!("exec gate: {verdict} {path}: state {} [{}]", decision.state, reasons.join(","));
+        self.log(EventKind::Enforcement, Some(id), None, None, vec![], Basis::Policy, &detail)?;
+        self.flush()
+    }
+
+    /// Records a degraded condition of a component such as the exec gate.
+    pub fn record_degraded(&mut self, detail: &str) -> Result<(), EngineError> {
+        self.log(EventKind::Degraded, None, None, None, vec![], Basis::None, detail)?;
+        self.flush()
     }
 
     fn save_index(&self) -> Result<(), EngineError> {
@@ -688,13 +791,11 @@ impl Engine {
     pub fn enroll_baseline(
         &mut self,
         roots: &[PathBuf],
-        name: &str,
-        cell: CellClass,
-        network: NetworkMode,
-        ttl_secs: u64,
-        granted_by: &str,
+        enroll: &EnrollOptions,
         opts: &ScanOptions,
     ) -> Result<(ScanReport, usize), EngineError> {
+        let EnrollOptions { name, cell, network, ttl_secs, granted_by, include_unmanaged } = enroll.clone();
+        let (name, granted_by) = (name.as_str(), granted_by.as_str());
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
             return Err(EngineError::Invalid("baseline name must be alphanumeric, '-' or '_'".into()));
         }
@@ -706,10 +807,12 @@ impl Engine {
             .iter()
             .filter(|s| {
                 let has = |k| s.evidence.iter().any(|e| e.kind == k);
-                has(EvidenceKind::ManagedInstaller)
-                    && has(EvidenceKind::PackageManifestMatch)
+                let vouched = include_unmanaged
+                    || (has(EvidenceKind::ManagedInstaller) && has(EvidenceKind::PackageManifestMatch));
+                vouched
                     && !has(EvidenceKind::ContentDigestMismatch)
                     && !has(EvidenceKind::SignatureInvalid)
+                    && !has(EvidenceKind::ForbiddenBehavior)
             })
             .map(|s| s.record.id().digest)
             .collect();
@@ -1015,6 +1118,7 @@ impl Engine {
             policy_name: self.policy.name.clone(),
             policy_epoch: self.policy.epoch,
             policy_digest: self.policy.digest(),
+            enforce_exec: self.policy.enforce_exec,
             revocations_epoch: self.revocations.epoch,
             revocations: self.revocations.entries.len(),
             by_state,
@@ -1032,6 +1136,17 @@ impl Engine {
     pub fn short_node(&self) -> String {
         hex(&Digest::of(self.node.node_id.as_bytes()).0[..4])
     }
+}
+
+/// Lists governed files below `roots` in a deterministic order, without touching engine state.
+pub fn list_artifacts(roots: &[PathBuf], opts: &ScanOptions) -> Result<Vec<PathBuf>, EngineError> {
+    let mut all = Vec::new();
+    for root in roots {
+        let mut wo = WalkOptions { one_file_system: opts.one_file_system, ..WalkOptions::default() };
+        wo.exclude.extend(opts.exclude.iter().cloned());
+        all.extend(walk(root, &wo)?);
+    }
+    Ok(all)
 }
 
 fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {

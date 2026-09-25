@@ -35,6 +35,8 @@ pub struct PolicySource {
     pub writable_path_max_cell: String,
     pub max_manual_cell: String,
     pub evidence_max_age_secs: u64,
+    #[serde(default)]
+    pub enforce_exec: bool,
     #[serde(rename = "tier")]
     pub tiers: Vec<TierSource>,
 }
@@ -74,6 +76,7 @@ impl PolicySource {
             writable_path_max_cell: parse("cell", &self.writable_path_max_cell, CellClass::parse)?,
             max_manual_cell: parse("cell", &self.max_manual_cell, CellClass::parse)?,
             evidence_max_age_secs: self.evidence_max_age_secs,
+            enforce_exec: self.enforce_exec,
         };
         p.validate().map_err(|e| e.to_string())?;
         Ok(p)
@@ -89,6 +92,7 @@ impl PolicySource {
             writable_path_max_cell: p.writable_path_max_cell.to_string(),
             max_manual_cell: p.max_manual_cell.to_string(),
             evidence_max_age_secs: p.evidence_max_age_secs,
+            enforce_exec: p.enforce_exec,
             tiers: p
                 .tiers
                 .iter()

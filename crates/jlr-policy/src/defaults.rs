@@ -121,6 +121,7 @@ impl Policy {
             writable_path_max_cell: CellClass::Cell1,
             max_manual_cell: CellClass::Cell2,
             evidence_max_age_secs: 7 * 24 * 3600,
+            enforce_exec: false,
         }
     }
 
@@ -149,6 +150,7 @@ impl Policy {
             writable_path_max_cell: CellClass::Cell0,
             max_manual_cell: CellClass::Cell1,
             evidence_max_age_secs: 24 * 3600,
+            enforce_exec: false,
         }
     }
 }

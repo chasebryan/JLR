@@ -23,7 +23,7 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "build.sh: missing tool: $1" 
 need cargo; need mksquashfs; need python3; need gzip; need file
 
 echo "==> building static binaries ($TARGET)"
-(cd "$ROOT" && cargo build --release --target "$TARGET" -p jlr-boot -p jlr -p jlr-cell --locked 2>&1 | tail -1)
+(cd "$ROOT" && cargo build --release --target "$TARGET" -p jlr-boot -p jlr -p jlr-cell -p jlrd --locked 2>&1 | tail -1)
 
 mkdir -p "$OUT"
 rm -rf "$OUT/rootfs" "$OUT/initramfs"
@@ -51,15 +51,17 @@ echo "==> base root filesystem"
 R="$OUT/rootfs"
 mkdir -p "$R"/{bin,sbin,usr/bin,usr/lib/jlr,etc,dev,proc,sys,run,tmp,mnt,var,lib,lib64}
 cp "$OUT/busybox" "$R/bin/busybox"
-for a in sh ash ls cat echo cp mv rm mkdir mount umount sleep true false id uname env grep sed tr wc head tail dmesg poweroff reboot ps kill test '[' date touch chmod ln readlink find printf df free; do
+for a in sh ash ls cat echo cp mv rm mkdir mount umount sleep true false id uname env grep sed tr wc head tail dmesg poweroff reboot ps kill test '[' date touch chmod ln readlink find printf df free sort cut wait; do
   ln -sf busybox "$R/bin/$a"
 done
 cp "$BIN/jlr-init" "$R/usr/lib/jlr/jlr-init"
 ln -sf ../usr/lib/jlr/jlr-init "$R/sbin/init"
 cp "$BIN/jlr" "$R/usr/bin/jlr"
 cp "$BIN/jlr-cell-init" "$R/usr/bin/jlr-cell-init"
+cp "$BIN/jlrd" "$R/usr/bin/jlrd"
 cp "$BIN/jlr-release" "$R/usr/bin/jlr-release"
 cp "$ROOT/boot/guest-test.sh" "$R/usr/lib/jlr/guest-test.sh"
+cp "$ROOT/boot/guest-gate.sh" "$R/usr/lib/jlr/guest-gate.sh"
 printf 'NAME="JLR base"\nID=jlr\nVERSION_ID=%s\n' "${JLR_VERSION:-0.1.0}" > "$R/etc/os-release"
 printf 'root:x:0:0:root:/tmp:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n' > "$R/etc/passwd"
 printf 'root:x:0:\nnogroup:x:65534:\n' > "$R/etc/group"

@@ -469,3 +469,46 @@ fn governance_works_inside_the_verified_ram_base_under_a_real_kernel() {
     }
     assert!(!b.has("FAILED"), "{}", b.dump());
 }
+
+#[test]
+fn the_exec_gate_audits_then_enforces_and_notices_tampering_under_a_real_kernel() {
+    let Some(env) = env() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let disk = build_disk(&env, dir.path(), &[good_slot(&env, "a", 1)], None);
+    let b = boot(&env, Some(&disk), "jlr.exec=/usr/lib/jlr/guest-gate.sh");
+    assert!(!b.timed_out, "{}", b.dump());
+    let in_order = [
+        "GUEST: init ok",
+        "GUEST: baseline initial-host:",
+        "GUEST: gate: exec gate active on",
+        "GUEST: mode: exec gate audit",
+        // Audit: nothing is blocked, but the stranger is recorded.
+        "GUEST: audit known: ran",
+        "GUEST: audit stranger: ran",
+        "GUEST: log: 1 audit line(s) for the stranger",
+        "GUEST: enforce on",
+        // Enforce: the enrolled binary keeps running, unknown ones are denied by the kernel.
+        "GUEST: enforce known: ran",
+        "GUEST: enforce stranger: BLOCKED",
+        "GUEST: enforce stranger2: BLOCKED",
+        "GUEST: enforce system tool: ran",
+        // Tampering with an enrolled binary revokes its standing.
+        "GUEST: tampered known: BLOCKED",
+        // A blocked program can still run, confined.
+        "GUEST: jlr run: confined-ok",
+        "GUEST: jlr run: OBSERVED in CELL-0",
+        // When the daemon stops the kernel releases the gate.
+        "GUEST: after stop stranger: ran",
+        "GUEST: ledger ok",
+        "GUEST: done",
+    ];
+    let mut last = 0usize;
+    for step in in_order {
+        let pos = b.lines.iter().skip(last).position(|l| l.contains(step)).map(|p| p + last);
+        match pos {
+            Some(p) => last = p + 1,
+            None => panic!("missing (or out of order) {step:?} in:\n{}", b.dump()),
+        }
+    }
+    assert!(b.has("Operation not permitted"), "a denied exec must fail with EPERM:\n{}", b.dump());
+}

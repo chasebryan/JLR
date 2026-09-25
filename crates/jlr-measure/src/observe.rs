@@ -48,7 +48,32 @@ fn item(kind: EvidenceKind, source: &str, at: u64, detail: &str) -> EvidenceItem
 /// unauthenticated. Stronger provenance arrives only through signed baselines,
 /// pinned vendor signatures or verified package signatures.
 pub fn observe(path: &Path, dpkg: Option<&mut DpkgDb>, opts: &ObserveOptions) -> Result<Observation, MeasureError> {
-    let (mut file, m) = open_measured(path, opts.max_size)?;
+    let (file, m) = open_measured(path, opts.max_size)?;
+    observe_measured(file, m, path, dpkg, opts)
+}
+
+/// Like [`observe`], for a descriptor the caller already holds, such as the file
+/// descriptor a fanotify permission event delivers for an `exec`.
+///
+/// `path` is only a label for classification and package lookup; the bytes are
+/// measured through `file`, so a path swapped afterwards changes nothing.
+pub fn observe_open(
+    mut file: File,
+    path: &Path,
+    dpkg: Option<&mut DpkgDb>,
+    opts: &ObserveOptions,
+) -> Result<Observation, MeasureError> {
+    let m = crate::measure_file(&mut file, opts.max_size)?;
+    observe_measured(file, m, path, dpkg, opts)
+}
+
+fn observe_measured(
+    mut file: File,
+    m: crate::Measured,
+    path: &Path,
+    dpkg: Option<&mut DpkgDb>,
+    opts: &ObserveOptions,
+) -> Result<Observation, MeasureError> {
     let class = classify(&m.head, path, m.mode);
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let real_str = real.to_string_lossy().into_owned();

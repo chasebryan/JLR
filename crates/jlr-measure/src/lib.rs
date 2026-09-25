@@ -17,7 +17,7 @@ mod walk;
 pub use classify::{classify, is_governed};
 pub use dpkg::{DpkgDb, DpkgOwnership};
 pub use facts::{PathFacts, Trust, path_facts};
-pub use observe::{Observation, ObserveOptions, observe};
+pub use observe::{Observation, ObserveOptions, observe, observe_open};
 pub use walk::{WalkOptions, walk};
 
 use jlr_crypto::Digest;

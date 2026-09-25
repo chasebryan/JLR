@@ -17,7 +17,9 @@ mod paths;
 mod setup;
 mod store;
 
-pub use engine::{Config, Engine, Explanation, RunResult, ScanOptions, ScanReport, Status};
+pub use engine::{
+    Config, Engine, EnrollOptions, ExecVerdict, Explanation, RunResult, ScanOptions, ScanReport, Status, list_artifacts,
+};
 pub use error::EngineError;
 pub use paths::Paths;
 pub use setup::{InitReport, PolicyKind, init};

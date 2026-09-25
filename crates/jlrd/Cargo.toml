@@ -1,0 +1,21 @@
+[package]
+name = "jlrd"
+description = "The JLR daemon: fanotify exec gate, state watcher and continuous rescan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "jlrd"
+path = "src/main.rs"
+
+[dependencies]
+jlr-engine.workspace = true
+jlr-model.workspace = true
+nix = { workspace = true }
+signal-hook = "0.4"
+
+[lints]
+workspace = true

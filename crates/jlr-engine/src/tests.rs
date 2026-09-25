@@ -95,6 +95,17 @@ impl Lab {
     }
 }
 
+fn enroll(name: &str, by: &str, include_unmanaged: bool) -> EnrollOptions {
+    EnrollOptions {
+        name: name.into(),
+        cell: CellClass::Cell2,
+        network: NetworkMode::FullUserNetwork,
+        ttl_secs: 3600,
+        granted_by: by.into(),
+        include_unmanaged,
+    }
+}
+
 fn md5_hex(data: &[u8]) -> String {
     // Independent tiny MD5 via the system tool would need a process; use the crate through jlr-measure's own behaviour instead.
     use std::io::Write;
@@ -148,7 +159,7 @@ fn unmanaged_software_is_observed_not_admitted() {
     lab.init(PolicyKind::Workstation);
     let mut e = lab.open();
     let exe = lab.file("opt/dropper", &elf());
-    let r = e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    let r = e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(r.new_artifacts, 1);
     let id = id_of(&e, &exe);
     assert_eq!(e.state_of(&id), Some(S::Observed));
@@ -156,7 +167,7 @@ fn unmanaged_software_is_observed_not_admitted() {
     assert_eq!((d.cell, d.network), (CellClass::Cell0, NetworkMode::None));
     // A second scan changes nothing and adds no events.
     let before = e.status().ledger_events;
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(e.status().ledger_events, before, "an idempotent scan must not grow the ledger");
 }
 
@@ -166,7 +177,7 @@ fn strict_policy_quarantines_unmanaged_software() {
     lab.init(PolicyKind::Strict);
     let mut e = lab.open();
     let exe = lab.file("opt/dropper", &elf());
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(e.state_of(&id_of(&e, &exe)), Some(S::Quarantined));
 }
 
@@ -180,15 +191,7 @@ fn baseline_admits_managed_software_and_tampering_degrades_it() {
     lab.package("tool", &[(&tool, &bytes)]);
     let mut e = lab.open();
     let (report, members) = e
-        .enroll_baseline(
-            &[lab.sys.clone()],
-            "initial-host",
-            CellClass::Cell2,
-            NetworkMode::FullUserNetwork,
-            3600,
-            "operator",
-            &Lab::scan_opts(),
-        )
+        .enroll_baseline(std::slice::from_ref(&lab.sys), &enroll("initial-host", "operator", false), &Lab::scan_opts())
         .unwrap();
     assert_eq!(members, 1, "only package-managed, manifest-matching files become members");
     assert_eq!(report.new_artifacts, 2);
@@ -210,7 +213,7 @@ fn baseline_admits_managed_software_and_tampering_degrades_it() {
     // Tamper with the admitted binary.
     fs::write(&tool, b"#!/bin/sh\necho pwned\n").unwrap();
     fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-    let r = e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    let r = e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(r.degraded.len(), 1, "{r:?}");
     assert_eq!(e.state_of(&tool_id), Some(S::Degraded), "the previously admitted identity must be degraded");
     let new_id = id_of(&e, &tool);
@@ -228,8 +231,8 @@ fn incremental_scan_skips_unchanged_files_but_notices_edits_even_with_preserved_
     let exe = lab.file("opt/prog", &elf());
     let mut opts = Lab::scan_opts();
     opts.full = false;
-    e.scan(&[lab.sys.clone()], &opts).unwrap();
-    let r = e.scan(&[lab.sys.clone()], &opts).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
     assert_eq!((r.examined, r.unchanged), (0, 1));
 
     // Edit in place and restore the old mtime; ctime cannot be restored by the writer.
@@ -238,7 +241,7 @@ fn incremental_scan_skips_unchanged_files_but_notices_edits_even_with_preserved_
     changed[100] = 7;
     fs::write(&exe, &changed).unwrap();
     fs::File::options().write(true).open(&exe).unwrap().set_modified(old).unwrap();
-    let r = e.scan(&[lab.sys.clone()], &opts).unwrap();
+    let r = e.scan(std::slice::from_ref(&lab.sys), &opts).unwrap();
     assert_eq!(r.examined, 1, "ctime must expose an edit that preserved mtime");
 }
 
@@ -248,7 +251,7 @@ fn revocation_wins_and_cannot_be_approved_away() {
     lab.init(PolicyKind::Workstation);
     let mut e = lab.open();
     let exe = lab.file("opt/bad", &elf());
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     let ex = e.explain(&exe).unwrap();
     let id = ex.record.id();
     assert_eq!(e.state_of(&id), Some(S::Observed));
@@ -262,7 +265,7 @@ fn revocation_wins_and_cannot_be_approved_away() {
     // A later approval and a later scan both leave it revoked.
     let d = e.approve(&id.to_string(), CellClass::Cell1, NetworkMode::None, vec![], 3600, "operator").unwrap();
     assert_eq!(d.state, S::Revoked);
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(e.state_of(&id), Some(S::Revoked));
 
     // Execution is denied outright.
@@ -278,7 +281,7 @@ fn approval_promotes_step_by_step_with_a_manual_basis() {
     lab.init(PolicyKind::Strict);
     let mut e = lab.open();
     let exe = lab.file("opt/tool", &elf());
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     let id = id_of(&e, &exe);
     assert_eq!(e.state_of(&id), Some(S::Quarantined));
 
@@ -312,7 +315,7 @@ fn approval_promotes_step_by_step_with_a_manual_basis() {
     drop(e);
     lab.clock.fetch_add(7200, Ordering::SeqCst);
     let mut e2 = lab.open();
-    e2.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e2.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_ne!(e2.state_of(&id), Some(S::Admitted), "an expired approval grants nothing");
 }
 
@@ -324,7 +327,7 @@ fn state_is_rebuilt_from_the_ledger_not_from_caches() {
     let id;
     {
         let mut e = lab.open();
-        e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+        e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
         id = id_of(&e, &exe);
         assert_eq!(e.state_of(&id), Some(S::Observed));
     }
@@ -407,7 +410,7 @@ fn unverifiable_approvals_grant_nothing_and_are_logged() {
     let id;
     {
         let mut e = lab.open();
-        e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+        e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
         id = id_of(&e, &exe);
         e.approve(&id.to_string(), CellClass::Cell1, NetworkMode::None, vec![], 3600, "alice").unwrap();
     }
@@ -430,10 +433,10 @@ fn checkpoints_detect_rollback_of_the_whole_state_directory() {
     lab.init(PolicyKind::Workstation);
     lab.file("opt/a", &elf());
     let mut e = lab.open();
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     let cp = e.checkpoint().unwrap();
     lab.file("opt/b", &elf());
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     let full = e.verify_ledger(Some(&cp)).unwrap();
     assert!(full.external_checkpoint_matched);
     drop(e);
@@ -524,7 +527,7 @@ fn set_policy_requires_a_higher_epoch_and_takes_effect() {
     lab.init(PolicyKind::Workstation);
     let exe = lab.file("opt/tool", &elf());
     let mut e = lab.open();
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     let id = id_of(&e, &exe);
     assert_eq!(e.state_of(&id), Some(S::Observed));
 
@@ -539,7 +542,7 @@ fn set_policy_requires_a_higher_epoch_and_takes_effect() {
 
     e.set_policy(jlr_policy::Policy::strict(2)).unwrap();
     assert_eq!((e.policy().name.as_str(), e.policy().epoch), ("strict", 2));
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(e.state_of(&id), Some(S::Quarantined), "the stricter policy re-evaluates known artifacts");
     drop(e);
     assert_eq!(lab.open().policy().epoch, 2, "the new policy survives a restart");
@@ -552,13 +555,90 @@ fn the_same_file_has_the_same_identity_at_different_times() {
     lab.init(PolicyKind::Workstation);
     let exe = lab.file("opt/prog", &elf());
     let mut e = lab.open();
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     let first = id_of(&e, &exe);
     lab.clock.fetch_add(86_400, Ordering::SeqCst);
     let second = id_of(&e, &exe);
     assert_eq!(first, second, "identity must not depend on when the file is observed");
     assert_eq!(e.state_of(&second), Some(S::Observed), "and the recorded state must be found again");
     let before = e.status().ledger_events;
-    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
     assert_eq!(e.status().ledger_events, before, "rescanning later must not look like a new artifact");
+}
+
+#[test]
+fn exec_verdict_measures_the_descriptor_not_the_path() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let exe = lab.file("opt/tool", &elf());
+    let file = fs::File::open(&exe).unwrap();
+    // Swap the path after the descriptor was opened, as an attacker racing the gate would.
+    let mut evil = elf();
+    evil[100] = 0xee;
+    fs::remove_file(&exe).unwrap();
+    fs::write(&exe, &evil).unwrap();
+    let v = e.decide_exec(file, &exe).unwrap();
+    assert_eq!(v.decision.state, S::Observed);
+    assert!(!v.allowed, "an unknown binary may not run outside an observation cell");
+    assert!(!v.enforce, "the built-in policies audit until enforcement is switched on");
+    // The identity is that of the ORIGINAL bytes, which is what would have executed.
+    let original = jlr_crypto::Digest::of(&elf());
+    let record_digest = e.explain(&exe).unwrap().record.digest;
+    assert_ne!(record_digest, original, "the file on disk now differs");
+    assert_eq!(e.state_of(&v.id), Some(S::Observed));
+    assert_ne!(v.id, id_of(&e, &exe), "the decision must not be about the swapped file");
+}
+
+#[test]
+fn include_unmanaged_enrols_everything_that_is_not_known_bad() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let a = lab.file("usr/bin/a", &elf());
+    let mut other = elf();
+    other[90] = 1;
+    let b = lab.file("opt/b", &other);
+    let (_, members) = e
+        .enroll_baseline(std::slice::from_ref(&lab.sys), &enroll("base-image", "installer", true), &Lab::scan_opts())
+        .unwrap();
+    assert_eq!(members, 2, "no package database vouches for these, but the installer chose to");
+    assert_eq!(e.state_of(&id_of(&e, &a)), Some(S::Admitted));
+    assert_eq!(e.state_of(&id_of(&e, &b)), Some(S::Admitted));
+    // Enrolled state is recorded as a manual override.
+    assert!(events(&lab).iter().any(|x| x.kind == EventKind::Override && x.detail.contains("base-image")));
+}
+
+#[test]
+fn scanning_in_bounded_slices_gives_the_same_result_as_one_scan() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    for i in 0..7u8 {
+        let mut b = elf();
+        b[80] = i;
+        lab.file(&format!("opt/p{i}"), &b);
+    }
+    let opts = Lab::scan_opts();
+    let files = list_artifacts(std::slice::from_ref(&lab.sys), &opts).unwrap();
+    assert_eq!(files.len(), 7);
+    let mut e = lab.open();
+    let mut examined = 0;
+    for chunk in files.chunks(3) {
+        examined += e.scan_files(chunk, &opts).unwrap().examined;
+    }
+    assert_eq!(examined, 7);
+    assert_eq!(e.status().by_state.get(&S::Observed), Some(&7));
+}
+
+#[test]
+fn open_wait_waits_for_the_lock_then_gives_up() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let held = lab.open();
+    let t = std::time::Instant::now();
+    let r = Engine::open_wait(lab.paths(), lab.cfg(), std::time::Duration::from_millis(200));
+    assert!(matches!(r, Err(EngineError::Ledger(jlr_ledger::LedgerError::Locked))));
+    assert!(t.elapsed() >= std::time::Duration::from_millis(190), "it must actually wait");
+    drop(held);
+    assert!(Engine::open_wait(lab.paths(), lab.cfg(), std::time::Duration::from_millis(200)).is_ok());
 }

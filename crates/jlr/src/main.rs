@@ -4,7 +4,7 @@ mod policy_source;
 
 use clap::{Args, Parser, Subcommand};
 use jlr_cell::{CellSpec, Control, SealedExe, Stdio3, launch};
-use jlr_engine::{Config, Engine, EngineError, Paths, PolicyKind, ScanOptions, init};
+use jlr_engine::{Config, Engine, EngineError, EnrollOptions, Paths, PolicyKind, ScanOptions, init};
 use jlr_model::{AdmissionState, Capability, CellClass, Decision, NetworkMode};
 use jlr_policy::RevocationKind;
 use policy_source::PolicySource;
@@ -94,6 +94,10 @@ enum BaselineCmd {
         by: String,
         #[arg(long)]
         exclude: Vec<PathBuf>,
+        /// Also enrol files no package manager vouches for: "trust what is on disk now".
+        /// Meant for installers whose base image is itself the verified trust root.
+        #[arg(long)]
+        include_unmanaged: bool,
     },
 }
 
@@ -134,6 +138,11 @@ enum PolicyCmd {
     Show,
     /// Compile, validate, sign and install a policy from a TOML file.
     Set { file: PathBuf },
+    /// Turn the exec gate's enforcement on or off by installing a new signed policy epoch.
+    Enforce {
+        #[arg(value_parser = ["on", "off"])]
+        mode: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -166,7 +175,8 @@ fn caps_of(v: &[String]) -> Result<Vec<Capability>, String> {
 
 fn open(cli: &Cli) -> Result<Engine, EngineError> {
     let paths = cli.state.clone().map_or_else(Paths::default_location, Paths::new);
-    Engine::open(paths, Config::default())
+    // The daemon holds the ledger only briefly, so wait for it instead of failing.
+    Engine::open_wait(paths, Config::default(), std::time::Duration::from_secs(20))
 }
 
 fn describe(d: &Decision) -> String {
@@ -205,6 +215,14 @@ fn run(cli: Cli) -> Result<u8, String> {
             println!("assurance   {}   (what this report can honestly claim)", s.assurance);
             println!("posture     {}   scope: {}", s.posture, s.scope);
             println!("policy      {} epoch {}  {}", s.policy_name, s.policy_epoch, s.policy_digest);
+            println!(
+                "exec gate   {}",
+                if s.enforce_exec {
+                    "enforce (unknown software may not run natively)"
+                } else {
+                    "audit (records what it would deny; nothing is blocked)"
+                }
+            );
             println!("revocations {} entries, epoch {}", s.revocations, s.revocations_epoch);
             println!("trust       {} keys", s.anchors);
             let states: Vec<String> = s.by_state.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -300,13 +318,22 @@ fn run(cli: Cli) -> Result<u8, String> {
                 Err(x) => Err(x.to_string()),
             }
         }
-        Cmd::Baseline { cmd: BaselineCmd::Enroll { paths, name, cell, network, ttl_days, by, exclude } } => {
+        Cmd::Baseline {
+            cmd: BaselineCmd::Enroll { paths, name, cell, network, ttl_days, by, exclude, include_unmanaged },
+        } => {
             let mut eng = open(&cli).map_err(e)?;
             let cell = parse_named("cell", cell, CellClass::parse)?;
             let network = parse_named("network mode", network, NetworkMode::parse)?;
             let opts = ScanOptions { exclude: exclude.clone(), full: true, ..ScanOptions::default() };
-            let (r, members) =
-                eng.enroll_baseline(paths, name, cell, network, ttl_days * 86400, by, &opts).map_err(e)?;
+            let enroll = EnrollOptions {
+                name: name.clone(),
+                cell,
+                network,
+                ttl_secs: ttl_days * 86400,
+                granted_by: by.clone(),
+                include_unmanaged: *include_unmanaged,
+            };
+            let (r, members) = eng.enroll_baseline(paths, &enroll, &opts).map_err(e)?;
             println!("baseline {name}: {members} members of {} artifacts examined", r.examined);
             let states: Vec<String> = r.by_state.iter().map(|(k, v)| format!("{k}={v}")).collect();
             println!("results  {}", states.join("  "));
@@ -352,6 +379,16 @@ fn run(cli: Cli) -> Result<u8, String> {
             let mut eng = open(&cli).map_err(e)?;
             let digest = eng.set_policy(policy).map_err(e)?;
             println!("policy installed: epoch {} {digest}", src.epoch);
+            Ok(0)
+        }
+        Cmd::Policy { cmd: PolicyCmd::Enforce { mode } } => {
+            let mut eng = open(&cli).map_err(e)?;
+            let mut p = eng.policy().clone();
+            p.enforce_exec = mode == "on";
+            p.epoch += 1;
+            let epoch = p.epoch;
+            let digest = eng.set_policy(p).map_err(e)?;
+            println!("exec gate enforcement {mode}: policy epoch {epoch} {digest}");
             Ok(0)
         }
         Cmd::Ledger { cmd } => {

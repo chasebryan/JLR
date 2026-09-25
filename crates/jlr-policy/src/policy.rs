@@ -52,6 +52,9 @@ record! {
         8 => max_manual_cell: CellClass,
         /// Seconds after which evidence is stale and must be re-collected.
         9 => evidence_max_age_secs: u64,
+        /// Whether the exec gate denies artifacts that may not run normally.
+        /// When false, the gate only records what it would have denied (audit mode).
+        10 => enforce_exec: bool,
     }
 }
 
