@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.98.1
+
+jobs:
+  check:
+    name: Format, lint, unit and integration tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c rustfmt,clippy -t x86_64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Allow unprivileged user namespaces (needed by the cell tests on Ubuntu 24.04)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Generated documentation is current
+        run: python3 tools/gen_records.py --check
+      - name: Every test cited in the documentation exists
+        run: python3 tools/check_doc_refs.py
+      - name: Protocol vectors verify with an independent implementation
+        run: |
+          sudo apt-get install -y --no-install-recommends python3-cryptography
+          python3 tools/check_vectors.py
+      - name: Tests (boot tests skip themselves here; see the boot job)
+        run: cargo test --workspace --locked
+
+  boot:
+    name: Reproducible boot artifacts and QEMU boot tests
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -t x86_64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Install boot test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 busybox-static squashfs-tools e2fsprogs python3 file
+          # A kernel with virtio, loop, ext4 and squashfs built in, made readable for QEMU.
+          sudo env INITRD=No apt-get install -y --no-install-recommends linux-image-generic
+          KERNEL="$(ls /boot/vmlinuz-*-generic | sort -V | tail -1)"
+          sudo cp "$KERNEL" "$RUNNER_TEMP/vmlinuz"
+          sudo chmod 0644 "$RUNNER_TEMP/vmlinuz"
+          echo "JLR_KERNEL=$RUNNER_TEMP/vmlinuz" >> "$GITHUB_ENV"
+      - name: Enable KVM when the runner offers it
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "no KVM: tests will use TCG and take longer"
+      - name: Build boot artifacts
+        run: ./boot/build.sh
+      - name: The build is reproducible
+        run: |
+          sha256sum out/boot/base.sqfs out/boot/initramfs.cpio.gz > "$RUNNER_TEMP/first.sha"
+          ./boot/build.sh > /dev/null
+          sha256sum -c "$RUNNER_TEMP/first.sha"
+      - name: QEMU boot tests
+        run: cargo test -p jlr-boot --test qemu --locked -- --test-threads=2
