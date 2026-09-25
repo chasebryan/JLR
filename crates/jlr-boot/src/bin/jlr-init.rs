@@ -14,12 +14,13 @@
 
 #![forbid(unsafe_code)]
 
+use jlr_boot::confirm::{LoadFailure, Reading, confirm};
 use jlr_boot::media::{self, HEAD_LEN, StateRead, filesystem_id, parse_pin};
 use jlr_boot::sys::{loop_attach, poweroff, restart};
 use jlr_boot::{BootError, BootState, ReleaseManifest, choose, verify_image, verify_manifest};
 use jlr_cbor::Cbor;
 use jlr_crypto::{Digest, TrustAnchors};
-use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+use nix::fcntl::{FcntlArg, PosixFadviseAdvice, SealFlag, fcntl, posix_fadvise};
 use nix::mount::{MsFlags, mount, umount};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::unistd::{chdir, chroot};
@@ -352,21 +353,19 @@ fn try_medium(medium: &Medium, floor: u64, anchors: &TrustAnchors) -> Option<Boo
     }
 }
 
-/// Why an image could not be loaded.
-enum LoadFailure {
-    /// Nothing proves the content is bad: an I/O error, no memory, or reads that disagreed with each other.
-    Transient(String),
-    /// Two reads returned the same wrong bytes: the content is bad, on every boot.
-    ProvenBad(BootError),
-}
-
-/// Reads the image at `path` into a fresh RAM file, hashing while it copies.
-fn read_image(path: &str, m: &ReleaseManifest) -> Result<File, LoadFailure> {
+/// Reads the image at `path` into a fresh RAM file, hashing while it copies. On the confirming read the file's cached
+/// pages are dropped first: a wrong byte returned by the medium is now sitting in the page cache, and reading it from
+/// there again would "confirm" a fluke.
+fn read_image(path: &str, m: &ReleaseManifest, reading: Reading) -> Result<File, LoadFailure> {
     let mut sink = match memfd_create("jlr-base", MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING) {
         Ok(fd) => File::from(fd),
         Err(e) => return Err(LoadFailure::Transient(format!("cannot allocate RAM for the base image: {e}"))),
     };
     let mut src = File::open(path).map_err(|e| LoadFailure::Transient(format!("{path}: {e}")))?;
+    if reading == Reading::Confirming {
+        // Best effort: the medium is mounted read-only, so its pages are clean and can be dropped.
+        let _ = posix_fadvise(&src, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED);
+    }
     match verify_image(m, &mut src, &mut sink) {
         Ok(_) => Ok(sink),
         Err(e) if e.proves_bad_content() => Err(LoadFailure::ProvenBad(e)),
@@ -374,36 +373,9 @@ fn read_image(path: &str, m: &ReleaseManifest) -> Result<File, LoadFailure> {
     }
 }
 
-/// Loads and verifies a slot's image. A mismatch is confirmed by reading once more: flaky media (a bad cable, a dying
-/// stick) can return wrong bytes without any error, and retiring a proven slot for that would strand the machine.
-/// Only the same wrong answer twice is proof; a second read that verifies is used, and one that answers differently
-/// is treated as unreliable media, not as a bad image.
+/// Loads and verifies a slot's image, confirming a mismatch by a second read (see [`confirm`]).
 fn load_image(path: &str, m: &ReleaseManifest) -> Result<File, LoadFailure> {
-    let first = match read_image(path, m) {
-        Err(LoadFailure::ProvenBad(e)) => e,
-        other => return other,
-    };
-    log(&format!("image mismatch ({first}); reading the image once more to confirm"));
-    match read_image(path, m) {
-        Ok(sink) => {
-            log("the second read verified: the first returned different bytes, so this medium is unreliable");
-            Ok(sink)
-        }
-        Err(LoadFailure::ProvenBad(second)) if same_mismatch(&first, &second) => Err(LoadFailure::ProvenBad(first)),
-        Err(LoadFailure::ProvenBad(second)) => Err(LoadFailure::Transient(format!(
-            "two reads of the image disagreed with each other ({first}; {second}): the medium is unreliable"
-        ))),
-        Err(other) => Err(other),
-    }
-}
-
-/// Whether two verification failures are the same wrong answer.
-fn same_mismatch(a: &BootError, b: &BootError) -> bool {
-    match (a, b) {
-        (BootError::ImageDigest { actual: x, .. }, BootError::ImageDigest { actual: y, .. }) => x == y,
-        (BootError::ImageSize { actual: x, .. }, BootError::ImageSize { actual: y, .. }) => x == y,
-        _ => false,
-    }
+    confirm(|reading| read_image(path, m, reading), &mut |line| log(line))
 }
 
 fn stage1() -> ! {

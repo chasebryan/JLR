@@ -18,7 +18,7 @@ jlr doctor
 | Finding | Meaning | What to do |
 |---|---|---|
 | `cgroup UNAVAILABLE (memory.max: Permission denied)` | The session has no delegated cgroup, so memory and process ceilings cannot be set | Run the daemon as a system service, or accept `Partial` enforcement. Reports say so. |
-| `mount-ns` or `user-ns` unavailable | Unprivileged user namespaces are blocked | Run jlr as root, or on Ubuntu 24.04 set `kernel.apparmor_restrict_unprivileged_userns=0`. **That setting re-enables the one way a local user can escape the exec gate** (mounting a file system in their own namespace, SECURITY_BOUNDARIES 5): prefer running as root where the gate matters |
+| `mount-ns` or `user-ns` unavailable | Unprivileged user namespaces are blocked | Run jlr as root, or on Ubuntu 24.04 set `kernel.apparmor_restrict_unprivileged_userns=0`. **That setting re-enables a way for a local user to escape the exec gate** (mounting a file system in their own namespace, SECURITY_BOUNDARIES 5): prefer running as root where the gate matters |
 | `landlock NOT present` | Kernel lacks Landlock | Cells run without the write-confinement layer; the mount namespace still applies |
 | `TPM 2.0 no device`, `Secure Boot disabled` | No hardware anchor | Ledger checkpoints are software counters only; say so in your own risk notes |
 
@@ -80,7 +80,7 @@ The exec gate has two modes, chosen by the signed policy:
 A file the gate cannot measure (padded past the size limit, changing while it is read, not a regular file) is treated as a
 decision, not a fault: it is denied when enforcing and logged as "would deny (unmeasurable)" when auditing. A file system
 mounted after `jlrd` started is marked as soon as the kernel reports it. A user who makes the gate do a great deal of
-unmeasured work is throttled (`--slow-budget-secs`, and unprivileged users together may use at most half the gate's time):
+unmeasured work is throttled (`--slow-budget-secs`, and unprivileged users together may use at most 30 seconds of it a minute):
 their unknown executions are answered at once by policy, without being measured, so one user cannot stall everyone's `exec`.
 That answer is a denial when enforcing and an allow, counted in a summary event, when auditing.
 

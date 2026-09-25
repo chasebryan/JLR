@@ -216,7 +216,12 @@ fn run(cli: Cli) -> Result<u8, String> {
             println!("node        {}", s.node_id);
             println!("assurance   {}   (what this report can honestly claim)", s.assurance);
             println!("posture     {}   scope: {}", s.posture, s.scope);
-            println!("policy      {} epoch {}  {}", s.policy_name, s.policy_epoch, s.policy_digest);
+            println!(
+                "policy      {} epoch {}  {}",
+                jlr_model::sanitize(&s.policy_name),
+                s.policy_epoch,
+                s.policy_digest
+            );
             println!(
                 "exec gate   {}",
                 if s.enforce_exec {

@@ -84,17 +84,30 @@ pub fn sanitize(s: &str) -> String {
 /// the fixed fields that follow it.
 pub fn sanitize_to(s: &str, limit: usize) -> String {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len().min(limit + 16));
+    const MARKER: &str = "\u{2026}[truncated]";
+    // Text that is already safe (no hostile character) and short enough, including this function's own output
+    // (which is at most `limit` bytes of safe text plus the marker), is returned as it is. That is what makes the
+    // function idempotent, whatever the limit falls in the middle of.
+    if s.len() <= limit + MARKER.len() && !s.chars().any(is_hostile) {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len().min(limit + MARKER.len()));
+    let mut escape = String::new();
+    let mut buf = [0u8; 4];
     for c in s.chars() {
-        if out.len() >= limit {
-            out.push_str("\u{2026}[truncated]");
+        escape.clear();
+        let piece: &str = if is_hostile(c) {
+            let _ = write!(escape, "\\u{{{:x}}}", c as u32);
+            &escape
+        } else {
+            c.encode_utf8(&mut buf)
+        };
+        // A character or an escape is written whole or not at all, so the limit never cuts one in half.
+        if out.len() + piece.len() > limit {
+            out.push_str(MARKER);
             break;
         }
-        if is_hostile(c) {
-            let _ = write!(out, "\\u{{{:x}}}", c as u32);
-        } else {
-            out.push(c);
-        }
+        out.push_str(piece);
     }
     out
 }

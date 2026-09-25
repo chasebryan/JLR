@@ -90,7 +90,22 @@ mod tests {
     }
 
     #[test]
-    fn users_are_independent_so_an_attacker_cannot_throttle_a_victim() {
+    fn a_few_accounts_can_use_up_the_shared_cap_and_throttle_everyone_else() {
+        // The price of the shared cap, stated as a test with the production numbers (10 s per user, 30 s together,
+        // 60 s window): three accounts that each spend their whole allowance make `exhausted` true for a fourth
+        // account that has spent nothing. Its *cached* and known-good files are unaffected (the daemon answers those
+        // before asking), but an unknown file it runs in that minute is answered by policy, unmeasured.
+        let t0 = Instant::now();
+        let mut b = Budgets::new(Duration::from_secs(10), Duration::from_secs(30), Duration::from_secs(60));
+        for uid in [2001, 2002, 2003] {
+            b.charge(uid, Duration::from_secs(10), t0);
+        }
+        assert!(b.exhausted(1000, t0), "a user who spent nothing is throttled once the shared cap is used up");
+        assert!(!b.exhausted(1000, t0 + Duration::from_secs(60)), "and served again in the next window");
+    }
+
+    #[test]
+    fn per_user_allowances_are_independent_while_the_shared_cap_has_room() {
         let t0 = Instant::now();
         let mut b = Budgets::new(Duration::from_secs(1), Duration::from_secs(1000), Duration::from_secs(60));
         b.charge(1000, Duration::from_secs(5), t0);

@@ -86,6 +86,7 @@ if [ -n "${JLR_MEDIA_ID:-}" ]; then
   case "$JLR_MEDIA_ID" in
     *[!0-9A-Fa-f-]*|"") echo "build.sh: JLR_MEDIA_ID must be an ext4 UUID or FAT volume serial (hex digits and hyphens)" >&2; exit 3 ;;
   esac
+  [ "${#JLR_MEDIA_ID}" -le 64 ] || { echo "build.sh: JLR_MEDIA_ID is longer than 64 characters" >&2; exit 3; }
   printf 'uuid=%s\n' "$JLR_MEDIA_ID" > "$I/etc/jlr/media-id"
 fi
 find "$I" -exec touch -h -d @"$SOURCE_DATE_EPOCH" {} +

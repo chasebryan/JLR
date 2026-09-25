@@ -99,6 +99,28 @@ pub fn read_state(media: &Path) -> Result<StateRead, BootError> {
     }
 }
 
+/// If a previous cut-short rename left a complete `.new` and no state file, makes that `.new` the state file. A `.new`
+/// that does not parse (a first write torn before anything replaced anything) is removed. Returns whether a state was
+/// promoted. Nothing happens when a state file exists.
+pub fn promote_recovered(media: &Path) -> io::Result<bool> {
+    let dir = media.join("jlr");
+    let path = dir.join(STATE_FILE);
+    let tmp = dir.join(format!("{STATE_FILE}.new"));
+    if path.exists() || !tmp.exists() {
+        return Ok(false);
+    }
+    match fs::read(&tmp).map(|b| BootState::from_cbor(&b).is_ok()) {
+        Ok(true) => {
+            fs::rename(&tmp, &path)?;
+            Ok(true)
+        }
+        _ => {
+            let _ = fs::remove_file(&tmp);
+            Ok(false)
+        }
+    }
+}
+
 /// Writes the boot state durably: the new file is synced before it replaces the old one, and the directory is
 /// synced afterwards.
 ///
@@ -110,14 +132,7 @@ pub fn write_state(media: &Path, state: &BootState) -> io::Result<()> {
     let dir = media.join("jlr");
     let path = dir.join(STATE_FILE);
     let tmp = dir.join(format!("{STATE_FILE}.new"));
-    if !path.exists() && tmp.exists() {
-        match fs::read(&tmp).map(|b| BootState::from_cbor(&b).is_ok()) {
-            Ok(true) => fs::rename(&tmp, &path)?,
-            _ => {
-                let _ = fs::remove_file(&tmp);
-            }
-        }
-    }
+    promote_recovered(media)?;
     let result = (|| {
         let mut f = File::create(&tmp)?;
         f.write_all(&state.to_cbor())?;

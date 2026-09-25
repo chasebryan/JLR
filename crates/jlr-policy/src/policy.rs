@@ -107,7 +107,10 @@ impl Policy {
     }
 
     fn validate_with(&self, strict_names: bool) -> Result<(), PolicyError> {
+        // Before the alphabet rule a policy name was 1 to 128 bytes and a tier name only had to be non-empty; an
+        // installed policy is held to exactly that, so nothing that loaded before stops loading.
         let name_ok = |n: &str| if strict_names { plain_name(n) } else { !n.is_empty() && n.len() <= 128 };
+        let tier_name_ok = |n: &str| if strict_names { plain_name(n) } else { !n.is_empty() };
         if self.schema != Self::SCHEMA {
             return bad(format!("unsupported schema {}", self.schema));
         }
@@ -132,7 +135,7 @@ impl Policy {
         }
         let mut seen = std::collections::BTreeSet::new();
         for t in &self.tiers {
-            if !name_ok(&t.name) || !seen.insert(t.name.as_str()) {
+            if !tier_name_ok(&t.name) || !seen.insert(t.name.as_str()) {
                 return bad(format!(
                     "tier names must be unique, 1 to 128 characters from A-Z a-z 0-9 . _ -: {:?}",
                     jlr_model::sanitize(&t.name)

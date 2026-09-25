@@ -115,7 +115,7 @@ A file the gate cannot measure (over the size limit, changing while it is read, 
 **decision**, not an internal error: it is denied when enforcing and recorded as "would deny" when auditing, whatever
 `--fail-closed` says, because the user who runs a file controls those conditions. `--slow-budget-secs` (default 10)
 bounds how much work each non-root user may cost per minute (opening the engine and deciding, **not** time spent waiting for
-the ledger lock), and all non-root users together may use half a minute of it; beyond that their unknown executions are
+the ledger lock), and all non-root users together may use 30 seconds of it a minute; beyond that their unknown executions are
 answered at once by policy without being measured (denied when enforcing, allowed and counted when auditing), so one user,
 or one person with many uids, cannot stall everyone's `exec`. A file the daemon already allowed and that has not changed
 is still allowed. Each throttled user leaves a summary event. `--lock-wait-ms` (default 3000) bounds how long the gate
@@ -147,7 +147,8 @@ Key files are created exclusively with mode 0600 and refused on load if group- o
 ## Console protocol
 
 Boot writes machine-checkable lines to the console. `JLR-BOOT:` lines come from stage 1 (`anchors loaded`,
-`media found`, `slot=… manifest=verified`, `selected slot=…`, `image verified …`, `base mounted read-only from RAM`,
+`media found`, `slot=… manifest=verified`, `trying slot=…`, `image verified …`, `selected slot=…` (after the try was
+spent), `base mounted read-only from RAM`,
 `boot media released`, `switching root`, or `REFUSED reason=…` followed by `state=RECOVERY-RESTRICTED`). Also
 `boot media is pinned to id=…` or `boot media is not pinned`, `media=N rollback floor=F`, `ignoring /dev/…: not the pinned
 boot medium`, and `slot=… skipped: …` when a slot cannot be used on this boot without being retired.

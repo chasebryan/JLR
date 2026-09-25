@@ -335,7 +335,7 @@ mod media_tests {
     }
 
     #[test]
-    fn a_failed_write_leaves_no_partial_file_and_a_recovered_copy_is_never_truncated() {
+    fn a_failed_write_leaves_no_partial_file_and_a_later_write_supersedes_a_recovered_copy() {
         // A rename that cannot happen (a directory is in the way) fails after the new file was written.
         let d = media_dir();
         fs::create_dir(d.path().join("jlr/bootstate.cbor")).unwrap();
@@ -343,8 +343,9 @@ mod media_tests {
         assert!(!d.path().join("jlr/bootstate.cbor.new").exists(), "a failed write must not leave its partial file");
         fs::remove_dir(d.path().join("jlr/bootstate.cbor")).unwrap();
 
-        // A complete `.new` with no state file is the only copy of the floor. Writing a later state promotes it
-        // first instead of truncating it, and ends with the newer state in place.
+        // A complete `.new` with no state file is the only copy of the floor. A later write ends with the newer state
+        // in place and no `.new` left over (that the older copy is promoted first, rather than truncated by the new
+        // write, is what `promote_recovered` is tested for below).
         fs::write(d.path().join("jlr/bootstate.cbor.new"), proven_at(12).to_cbor()).unwrap();
         write_state(d.path(), &proven_at(20)).unwrap();
         assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(proven_at(20)));
@@ -407,5 +408,110 @@ mod media_tests {
         assert_eq!(filesystem_id(&[0u8; 2048]), None);
         assert_eq!(filesystem_id(&[0u8; 100]), None);
         assert_eq!(filesystem_id(&[]), None);
+    }
+}
+
+mod confirm_tests {
+    use crate::BootError;
+    use crate::confirm::{LoadFailure, Reading, confirm, same_mismatch};
+    use jlr_crypto::Digest;
+
+    fn wrong(byte: &[u8]) -> LoadFailure {
+        LoadFailure::ProvenBad(BootError::ImageDigest { expected: Digest::of(b"good"), actual: Digest::of(byte) })
+    }
+
+    fn run(reads: Vec<Result<&'static str, LoadFailure>>) -> (Result<&'static str, LoadFailure>, Vec<Reading>) {
+        let mut reads = reads.into_iter();
+        let mut seen = Vec::new();
+        let r = confirm(
+            |reading| {
+                seen.push(reading);
+                reads.next().expect("more reads than expected")
+            },
+            &mut |_| {},
+        );
+        (r, seen)
+    }
+
+    #[test]
+    fn a_read_that_verifies_is_used_without_a_second_read() {
+        let (r, seen) = run(vec![Ok("image")]);
+        assert_eq!(r.unwrap(), "image");
+        assert_eq!(seen, vec![Reading::First]);
+    }
+
+    #[test]
+    fn a_transient_failure_ends_the_attempt_and_is_not_confirmed() {
+        let (r, seen) = run(vec![Err(LoadFailure::Transient("read error".into()))]);
+        assert!(matches!(r, Err(LoadFailure::Transient(_))));
+        assert_eq!(seen, vec![Reading::First], "a medium that errors is not read again to confirm anything");
+    }
+
+    #[test]
+    fn a_fluke_is_cleared_when_the_confirming_read_verifies() {
+        let (r, seen) = run(vec![Err(wrong(b"flaky")), Ok("image")]);
+        assert_eq!(r.unwrap(), "image", "the slot must boot, not be retired");
+        assert_eq!(seen, vec![Reading::First, Reading::Confirming]);
+    }
+
+    #[test]
+    fn the_same_wrong_answer_twice_is_proof() {
+        let (r, _) = run(vec![Err(wrong(b"bad image")), Err(wrong(b"bad image"))]);
+        assert!(matches!(r, Err(LoadFailure::ProvenBad(BootError::ImageDigest { .. }))), "{r:?}");
+    }
+
+    #[test]
+    fn reads_that_disagree_prove_nothing() {
+        let (r, _) = run(vec![Err(wrong(b"one")), Err(wrong(b"two"))]);
+        assert!(matches!(r, Err(LoadFailure::Transient(_))), "unreliable media is not a bad image: {r:?}");
+        // A confirming read that errors is no better.
+        let (r, _) = run(vec![Err(wrong(b"one")), Err(LoadFailure::Transient("io".into()))]);
+        assert!(matches!(r, Err(LoadFailure::Transient(_))));
+    }
+
+    #[test]
+    fn size_and_digest_mismatches_are_never_the_same_answer() {
+        let d = BootError::ImageDigest { expected: Digest::of(b"a"), actual: Digest::of(b"b") };
+        let s = BootError::ImageSize { expected: 4, actual: 2 };
+        assert!(!same_mismatch(&d, &s));
+        assert!(same_mismatch(&s, &BootError::ImageSize { expected: 4, actual: 2 }));
+        assert!(!same_mismatch(&s, &BootError::ImageSize { expected: 4, actual: 3 }));
+        assert!(!same_mismatch(&BootError::NoBootableSlot, &BootError::NoBootableSlot));
+    }
+}
+
+mod recovery_tests {
+    use crate::media::{StateRead, promote_recovered, read_state};
+    use crate::{BootState, SlotState};
+    use jlr_cbor::Cbor;
+    use std::fs;
+
+    fn state_at(floor: u64) -> BootState {
+        BootState { floor, slots: vec![SlotState { name: "a".into(), priority: 15, tries: 0, successful: true }] }
+    }
+
+    #[test]
+    fn a_complete_replacement_beside_no_state_file_becomes_the_state_file() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("jlr")).unwrap();
+        fs::write(d.path().join("jlr/bootstate.cbor.new"), state_at(12).to_cbor()).unwrap();
+        assert!(promote_recovered(d.path()).unwrap());
+        assert!(!d.path().join("jlr/bootstate.cbor.new").exists(), "the copy is moved, not left beside the real one");
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(state_at(12)));
+        // With a state file present nothing is touched, whatever the replacement holds.
+        fs::write(d.path().join("jlr/bootstate.cbor.new"), state_at(99).to_cbor()).unwrap();
+        assert!(!promote_recovered(d.path()).unwrap());
+        assert_eq!(read_state(d.path()).unwrap(), StateRead::Loaded(state_at(12)));
+        assert!(d.path().join("jlr/bootstate.cbor.new").exists());
+    }
+
+    #[test]
+    fn a_torn_replacement_is_removed_and_promotes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("jlr")).unwrap();
+        fs::write(d.path().join("jlr/bootstate.cbor.new"), b"\x01").unwrap();
+        assert!(!promote_recovered(d.path()).unwrap());
+        assert!(!d.path().join("jlr/bootstate.cbor.new").exists());
+        assert!(!d.path().join("jlr/bootstate.cbor").exists());
     }
 }

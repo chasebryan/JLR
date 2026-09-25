@@ -277,6 +277,30 @@ fn env_err(seq: u64, what: &str, e: EnvelopeError) -> LedgerError {
     LedgerError::Corrupt { seq, reason: format!("{what}: {e}") }
 }
 
+// Runs between the two reads of `replay` in tests, so a writer can be made to act at exactly that moment.
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_READS: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_between_reads_hook(hook: Option<Box<dyn FnMut()>>) {
+    BETWEEN_READS.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn between_reads() {
+    BETWEEN_READS.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn between_reads() {}
+
 /// Replays a ledger directory.
 ///
 /// With `full`, every event signature is verified. Otherwise events covered by
@@ -290,6 +314,7 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors, full: bool) -> Result<
     // to it, so any checkpoint seen here is covered by the events read next, even with a writer running (`jlr
     // ledger verify` takes no lock). The other order reports a checkpoint appended in between as a truncated ledger.
     let cp_data = read_all(&dir.join(CHECKPOINTS))?;
+    between_reads();
     let events_data = read_all(&dir.join(EVENTS))?;
     let (frames, valid_len, torn) = split_frames(&events_data)?;
 

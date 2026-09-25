@@ -112,19 +112,24 @@ descriptors 0 to 2 and its own sealed image, no kernel log and no terminal-injec
 applied is reported and makes the status `Partial`. *Adopted; amends ADR-021 and ADR-022.*
 
 **ADR-039 - The lock is held to decide, not to run.** `jlr run` measures, decides and records the start under the ledger
+lock, releases it for the life of the workload, and takes it again to record the end. A long-lived confined program
+therefore cannot stall the exec gate, revocations or a policy change. If the end cannot be recorded, the program's result is
+still returned with a note. *Adopted; refines ADR-028.*
 
 **ADR-040 - Sanitising is idempotent.** Text passes through several layers (an operator's reason, the event that records it,
 the command that prints it), and escaping backslashes doubled them at each layer and made a legitimate identifier such as
-`CN=Doe\, John` "unprintable". Control, separator and invisible characters are escaped and a backslash is left alone;
-applying the function again changes nothing. Attacker-influenced fields are bounded on their own before a message is
-composed, so truncation never removes the decision that follows a long path. *Adopted; refines ADR-039's neighbours.*
+`CN=Doe\, John` "unprintable". Control, separator and invisible characters are escaped and a backslash is left alone; text
+that is already safe and short enough is returned as it is, which makes applying the function again change nothing, even
+when a limit falls inside an escape. Every attacker-influenced part (a path, a file name) of a composed event is bounded on
+its own before the message is assembled, so truncation cannot remove the state, reasons or step that follow it. *Adopted.*
 
 **ADR-041 - The gate's budget is charged for work and capped overall.** A user is charged for opening the engine and
-deciding, not for waiting on a lock they did not hold; all unprivileged users together share half the gate's time, so many
-uids (subordinate ids, user namespaces) cannot multiply the allowance; a file already allowed and unchanged is not made to
-pay for its user's other executions; throttling is recorded. *Adopted; refines ADR-027.*
-lock, releases it for the life of the workload, and takes it again to record the end. A long-lived confined program
-therefore cannot stall the exec gate, revocations or a policy change. *Adopted; refines ADR-028.*
+deciding, not for waiting on a lock they did not hold; all unprivileged users together may spend at most 30 seconds of that
+work a minute, so many uids (subordinate ids, user namespaces) cannot multiply the allowance; a file already allowed,
+unchanged and inside its real validity is not made to pay for its user's other executions; throttling is recorded as a
+bounded number of events written with one flush, never one per user or file. The price: a few accounts can use the shared
+cap up and cause other users' *unknown* executions to be answered by policy for the rest of the minute (cached and known-good
+files are unaffected). *Adopted; refines ADR-027.*
 
 ## How the two design sets were reconciled
 

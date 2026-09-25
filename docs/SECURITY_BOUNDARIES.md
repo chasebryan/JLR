@@ -63,12 +63,16 @@ Every item below is a boundary a reader must know about. None is hidden elsewher
    namespace is marked by a watcher thread as soon as the kernel reports the change, and marking is repeated for every
    change (a device number is reused by the next file system mounted, so remembering numbers would leave a replacement
    ungated). An `exec` between the mount and the mark is not gated; the window is scheduling latency, not bounded by
-   any measurement.
+   any measurement. A file system that root cannot examine, such as a user's FUSE mount without `allow_other`, cannot be
+   marked by path either, so **executables on it are not gated**; the daemon says so once per mount point. A mount point
+   whose name is not valid UTF-8 is handled, and an unreadable mount table keeps the existing marks and is retried.
 5a. **The gate's throttle is per user and overall, and it is not a guarantee.** A user who exhausts the per-user slow-path
-   allowance, or all unprivileged users together (they may spend at most half of the gate's time), have unknown
+   allowance, or all unprivileged users together (they may spend at most 30 seconds of work a minute), have unknown
    executions answered by policy without measurement: denied when enforcing, allowed and counted when auditing. Each
-   throttled user leaves a summary event. A file the daemon already allowed and that has not changed is still allowed. Root
-   is not throttled, and the gate is one thread.
+   throttled user is counted in a summary event. A file the daemon already allowed, that has not changed and is still inside
+   its real validity (evidence age, approval or baseline expiry) is still allowed. **A few accounts can use up the shared
+   cap and cause other users' unknown executions to be answered by policy for the rest of the minute** (denied when
+   enforcing); cached and known-good files are unaffected. Root is not throttled, and the gate is one thread.
 5b. **Measurement is a stamp check, not a lock.** A file is measured by hashing the bytes and comparing its size, both times
    and inode before and after. `ctime` cannot be set by the owner, but its resolution is the kernel's: before Linux 6.13, and
    on file systems without fine-grained timestamps (NFS, FUSE, FAT), it is a tick of milliseconds to seconds, and an edit
@@ -101,8 +105,10 @@ Every item below is a boundary a reader must know about. None is hidden elsewher
    state file. The pin removes other people's disks from consideration; it does not make the medium trustworthy.
 10. **Read-only mounts can still write.** Media are mounted read-only and remounted read-write only to write state, but an
     ext4 file system that was not unmounted cleanly has its journal replayed by a read-only mount when the device is
-    writable, so an unpinned boot can change a disk it then does not use. What is guaranteed is that no *state* is written
-    to a medium that is not the one booted. A medium that cannot be written at all mounts read-only or is skipped.
+    writable, so an unpinned boot can change a disk it then does not use. What is guaranteed is narrower: the boot writes
+    no *state* to a medium unless it is recording a try or the success of a slot it is booting, or retiring a slot that
+    proved bad on that medium (which then may not be the one that boots). A medium that cannot be written at all mounts
+    read-only or is skipped.
 10a. **Write-protected media boot only a proven slot.** An unproven update needs its "try spent" record written, so on a
     medium that cannot be written it is skipped and the proven slot boots. Success cannot be recorded there either.
 10b. **The image is read again before a mismatch condemns a slot.** A digest or size mismatch is confirmed by a second read;

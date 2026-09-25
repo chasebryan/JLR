@@ -140,7 +140,8 @@ The check is an *integrity* check on the length field, not a security control. I
 (a crash during append): its bytes are copied to `events.log.torn.N`, the file is truncated to the last whole frame, and
 the repair is logged. Torn bytes are never deleted. `checkpoints.log` follows the same rules (`checkpoints.log.torn.N`) and
 is repaired when the ledger is opened, so a later checkpoint is never appended behind garbage. A repaired
-checkpoint tail is recorded as a `DEGRADED` event and shown by `jlr status` and `jlr ledger verify`. An append that fails
+checkpoint tail is recorded as a `DEGRADED` event, and `jlr ledger verify` warns about one that is still present; `jlr
+status` shows the warning and a `DEGRADED` posture only in the process that repaired it, and the event is what remains. An append that fails
 part way removes what it wrote, so a full disk cannot leave a torn frame in the middle of the log, and the counter advances
 only after the frame is durable; if the removal itself fails, the ledger refuses every further write until it is reopened
 (which repairs a torn tail), because anything appended after leftover bytes would be mis-framed. Readers that take no lock

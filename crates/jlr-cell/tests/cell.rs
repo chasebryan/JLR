@@ -273,6 +273,9 @@ fn missing_mandatory_control_refuses_and_runs_nothing() {
         Err(CellError::Refused(r)) => {
             assert_eq!(r.status, Status::Refused);
             assert!(r.mandatory_missing.iter().any(|m| m == "net-ns"), "{r:?}");
+            // Every report carries the kernel's Landlock ABI, including a refusal that happens before Landlock is
+            // applied (this one is decided while the namespaces are being set up).
+            assert_eq!(r.landlock_abi, kernel_landlock_abi(), "{r:?}");
         }
         Err(CellError::Setup(_)) | Err(CellError::Io(_)) => {}
         Ok(_) => panic!("a cell with a missing mandatory control was started"),

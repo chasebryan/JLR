@@ -26,7 +26,7 @@ flowchart TB
     G2 --> E
     F -->|verified| S["spend a try durably<br/>(unproven slots only)"]
     S -->|cannot record| G2
-    F --> H["seal memfd; attach loop device;<br/>mount squashfs read-only"]
+    S --> H["seal memfd; attach loop device;<br/>mount squashfs read-only"]
     H --> I["release the boot media"]
     I --> J["switch root; exec /sbin/init"]
     J --> K["stage 2: health checks"]
@@ -40,7 +40,7 @@ flowchart TB
 |---|---|---|
 | Trust anchors present and non-empty | initramfs | `REFUSED` |
 | Manifest signature, release role, `epoch >= floor`, `min_epoch <= epoch` | stage 1, per slot | Slot not considered; logged |
-| Boot state readable | stage 1, per medium | `REFUSED`: any failure other than "the file does not exist" (which is a fresh medium) stops the boot, because guessing would reset the rollback floor |
+| Boot state readable | stage 1, per medium | `REFUSED`: any failure other than "the file does not exist" (which is a fresh medium) stops the boot, because guessing would reset the rollback floor. The one exception is a torn `bootstate.cbor.new` with **no** state file beside it, which is a first write cut short and reads as fresh (a `.new` is synced before it replaces anything, so anyone who could plant it could equally have deleted the state file) |
 | Image size equals the manifest, digest equals the manifest | stage 1, while copying into RAM | Read once more; the same wrong answer twice retires the slot for good, a second read that verifies is used, and reads that disagree skip the slot for this boot |
 | Image could be read and RAM allocated | stage 1 | Slot skipped for this boot, **not** retired and **no try spent**: an I/O error or memory exhaustion is not evidence that the slot is bad |
 | Boot attempt recorded | stage 1, after the image verified and before it is sealed, mounted or run | Slot skipped for this boot (a write-protected medium cannot record it); `REFUSED` only if no slot is left |

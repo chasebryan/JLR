@@ -153,7 +153,8 @@ Neither can lift a revocation or a prohibition. Neither survives a content chang
 evidence of the latest `OVERRIDE` event for its subject (the EPN, or `baseline:<name>`). A superseded or withdrawn file that
 is copied back still verifies on its signature, and is ignored and reported once. A copy stored under another name cannot
 shadow the current one for the same reason. Approving again with a shorter time or a smaller cell is how an approval is
-narrowed or withdrawn. The signed files are stored as `<subject>.<first 16 hex of their digest>.cose`, so writing a new one
+narrowed or withdrawn. The signed files are stored as `<artifact digest hex>.<first 16 hex of the file's digest>.cose` (approvals) and
+`<baseline name>.<first 16 hex of the file's digest>.cose` (baselines), so writing a new one
 never overwrites the one the ledger currently records; the ledger event that makes it current comes next, and older files
 are removed only after that. A crash or a full disk in between leaves the old authority in force and the new file ignored
 (and reported once) until the operator repeats the command.

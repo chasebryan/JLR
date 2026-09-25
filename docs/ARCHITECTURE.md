@@ -203,7 +203,7 @@ them are made durable, and never lets a cache decide anything the ledger has not
 | Policy or revocation epoch lower than one already recorded | Refused as rollback |
 | A baseline or approval fails verification | Ignored, granted nothing, logged as DEGRADED |
 | Ledger event or checkpoint fails verification | Open fails |
-| Ledger has an incomplete final record | Bytes quarantined, repair logged, posture DEGRADED |
+| Ledger has an incomplete final record (events or checkpoints) | Bytes quarantined, repair logged as a DEGRADED event, posture DEGRADED for the process that repaired it (the event stays in the ledger for everyone else) |
 | Mandatory jail control cannot be established | Launch refused; nothing runs |
 | Optional jail control missing (for example cgroup) | Launch proceeds, report says `Partial` and names the control |
 | Gate internal error | Allow and log, unless `--fail-closed` |

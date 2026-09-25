@@ -23,6 +23,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod confirm;
 mod manifest;
 pub mod media;
 mod state;

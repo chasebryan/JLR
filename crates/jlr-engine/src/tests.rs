@@ -1326,3 +1326,64 @@ fn a_signer_identifier_may_contain_a_backslash_but_not_a_control_character() {
         assert!(e.revoke(RevocationKind::Signer, bad, "x").is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn the_enforcement_toggle_keeps_working_for_a_policy_installed_under_an_older_name() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut old = jlr_policy::Policy::workstation(1);
+    old.name = "site policy: main".into();
+    let key = jlr_crypto::SigningKeypair::load(&lab.paths().policy_key()).unwrap();
+    fs::write(
+        lab.paths().policy(),
+        jlr_crypto::Envelope::sign(jlr_model::record_type::POLICY, "*", &old.to_cbor(), &key),
+    )
+    .unwrap();
+    let mut e = lab.open();
+    // `jlr policy enforce on` installs a copy of the current policy with the flag changed and a higher epoch.
+    let mut next = e.policy().clone();
+    next.epoch += 1;
+    next.enforce_exec = true;
+    e.set_policy(next).expect("turning enforcement on must not be refused over the name");
+    assert!(e.policy().enforce_exec);
+    // Any other new policy must follow the rule.
+    let mut renamed = e.policy().clone();
+    renamed.epoch += 1;
+    renamed.name = "another name".into();
+    assert!(matches!(e.set_policy(renamed), Err(EngineError::Invalid(_))));
+}
+
+#[test]
+fn a_hostile_path_cannot_push_the_reasons_and_step_out_of_a_transition_record() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    // A path of about 1,300 bytes: five components of 255 bytes.
+    let deep = (0..5).map(|i| format!("{}{}", i, "d".repeat(254))).collect::<Vec<_>>().join("/");
+    let exe = lab.file(&format!("opt/{deep}/tool"), &elf());
+    e.decide_exec(fs::File::open(&exe).unwrap(), &exe).unwrap();
+    let transition =
+        events(&lab).into_iter().find(|x| x.kind == EventKind::Transition).expect("the discovery is recorded");
+    assert!(
+        transition.detail.contains("] step "),
+        "the reasons and step must survive a long path: {}",
+        transition.detail
+    );
+    assert!(transition.detail.len() < 700, "{} bytes", transition.detail.len());
+}
+
+#[test]
+fn an_epn_revocation_that_names_something_else_does_not_count_lost_records_as_unchecked() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let exe = lab.file("opt/tool", &elf());
+    let mut e = lab.open();
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    let hex = id.digest.hex();
+    fs::remove_file(lab.paths().objects().join("epn").join(&hex[..2]).join(format!("{}.cbor", &hex[2..]))).unwrap();
+    let other = EpnId::parse(&format!("EPN-1-EXE-{}", jlr_crypto::Digest::of(b"something else").hex())).unwrap();
+    let r = e.revoke_report(RevocationKind::Epn, &other.to_string(), "x").unwrap();
+    assert_eq!((r.moved, r.unchecked), (0, 0), "an EPN revocation never needs the record: {r:?}");
+    assert_eq!(e.state_of(&id), Some(S::Observed));
+}

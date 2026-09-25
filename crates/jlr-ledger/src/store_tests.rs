@@ -495,7 +495,34 @@ fn a_write_that_cannot_be_rolled_back_is_reported_so_the_ledger_can_stop() {
 }
 
 #[test]
+fn a_checkpoint_written_between_the_two_reads_is_covered_by_the_events_read_afterwards() {
+    // Deterministic: the writer acts at exactly the moment between `replay`'s two reads. With events read first, the
+    // checkpoint it writes commits to more events than were read and verification reports a truncated ledger.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let dir = tempfile::tempdir().unwrap();
+    let mut l = Ledger::create(&path(&dir), NODE, key(), BOOT).unwrap();
+    l.append(EventDraft::new("test", EventKind::Discover, "before")).unwrap();
+    l.checkpoint().unwrap();
+    let writer = Rc::new(RefCell::new(l));
+    let fired = Rc::new(RefCell::new(0u32));
+    let (w, f) = (writer.clone(), fired.clone());
+    crate::store::set_between_reads_hook(Some(Box::new(move || {
+        *f.borrow_mut() += 1;
+        let mut l = w.borrow_mut();
+        l.append(EventDraft::new("test", EventKind::Discover, "during")).unwrap();
+        l.checkpoint().unwrap();
+    })));
+    let r = verify_dir(&path(&dir), NODE, &anchors(), None);
+    crate::store::set_between_reads_hook(None);
+    assert_eq!(*fired.borrow(), 1, "the hook must run between the reads");
+    let r = r.expect("a checkpoint written between the reads must not read as a truncated ledger");
+    assert!(r.events >= 2, "the events read afterwards include the new event: {r:?}");
+}
+
+#[test]
 fn a_reader_that_takes_no_lock_never_sees_a_checkpoint_the_events_do_not_cover() {
+    // A stress companion of the deterministic test above: it only fails occasionally with the old read order.
     // `jlr ledger verify` runs beside the daemon. A checkpoint written between reading the events and reading the
     // checkpoints used to be reported as a truncated ledger.
     let dir = tempfile::tempdir().unwrap();

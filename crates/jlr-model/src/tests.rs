@@ -310,6 +310,25 @@ fn sanitize_is_idempotent_so_layers_do_not_double_escape() {
 }
 
 #[test]
+fn sanitize_is_idempotent_when_the_limit_falls_inside_an_escape() {
+    // A hostile character right at the limit: the escape must be written whole or not at all, and the result must be
+    // a fixed point (an earlier version cut the escape in the middle on the second application).
+    for pad in 1000..1030 {
+        for tail in ["xyz", "", "\u{e0041}q", "\n", "\u{202e}\u{202e}\u{202e}"] {
+            let raw = format!("{}\u{e0041}{tail}", "a".repeat(pad));
+            let once = sanitize(&raw);
+            assert_eq!(sanitize(&once), once, "pad {pad}, tail {tail:?}");
+            assert!(!once.contains('\u{e0041}'));
+            assert!(once.len() <= 1024 + "\u{2026}[truncated]".len(), "{}", once.len());
+            // No escape is ever cut in half: every backslash-u is followed by a closing brace before the end.
+            for (k, _) in once.match_indices("\\u{") {
+                assert!(once[k..].contains('}'), "cut escape in {once:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn sanitize_to_bounds_each_field_so_the_fields_after_it_survive() {
     let hostile_path = "/x/".to_owned() + &"d".repeat(3000);
     let line = format!("exec gate: denied {}: state QUARANTINED [EVIDENCE_MISSING]", sanitize_to(&hostile_path, 200));

@@ -748,7 +748,7 @@ impl Engine {
             kind: EvidenceKind::ContentDigestMismatch,
             source: "measure".into(),
             at: self.now(),
-            detail: format!("content at {path} no longer matches {old}"),
+            detail: format!("content at {} no longer matches {old}", jlr_model::sanitize_to(path, 300)),
             digest: None,
         };
         let ev = self.store_evidence(std::slice::from_ref(&mismatch))?;
@@ -759,7 +759,7 @@ impl Engine {
             None,
             vec![ev],
             Basis::None,
-            &format!("content at {path} changed"),
+            &format!("content at {} changed", jlr_model::sanitize_to(path, 300)),
         )?;
         // Degrading an identity whose bytes changed does not need its record. If the object store was
         // truncated or edited, the identity is degraded anyway instead of silently staying trusted.
@@ -780,7 +780,12 @@ impl Engine {
                 policy: self.policy.digest(),
             },
         };
-        let n = self.apply_decision(old, &decision, ev, &format!("content changed at {path}"))?;
+        let n = self.apply_decision(
+            old,
+            &decision,
+            ev,
+            &format!("content changed at {}", jlr_model::sanitize_to(path, 300)),
+        )?;
         Ok((n, self.states.get(old) == Some(&AdmissionState::Degraded)))
     }
 
@@ -811,10 +816,21 @@ impl Engine {
                 None,
                 vec![ev],
                 Basis::None,
-                &format!("{} {} at {}", seen.record.class, seen.record.name, seen.path),
+                &format!(
+                    "{} {} at {}",
+                    seen.record.class,
+                    jlr_model::sanitize_to(&seen.record.name, 100),
+                    jlr_model::sanitize_to(&seen.path, 300)
+                ),
             )?;
         }
-        transitions += self.apply_decision(&id, &decision, ev, &format!("{} at {}", seen.record.name, seen.path))?;
+        // The name and path are the attacker's; each is bounded on its own so the fields that follow survive.
+        let named = format!(
+            "{} at {}",
+            jlr_model::sanitize_to(&seen.record.name, 100),
+            jlr_model::sanitize_to(&seen.path, 300)
+        );
+        transitions += self.apply_decision(&id, &decision, ev, &named)?;
         // A row may be reused only while the evidence and every authority it relied on are still valid.
         let now = self.now();
         let mut valid_until = now.saturating_add(self.policy.evidence_max_age_secs);
@@ -1008,6 +1024,23 @@ impl Engine {
         self.flush()
     }
 
+    /// Records several degraded conditions with one durable flush at the end, instead of one per record. A daemon
+    /// that has many things to say (a summary per user, per file) must not hold the ledger, and stall everything
+    /// that waits on it, for the sum of that many syncs.
+    pub fn record_degraded_many(&mut self, details: &[String]) -> Result<(), EngineError> {
+        self.ledger.set_sync(false);
+        let mut result = Ok(());
+        for d in details {
+            result = self.log(EventKind::Degraded, None, None, None, vec![], Basis::None, d);
+            if result.is_err() {
+                break;
+            }
+        }
+        self.ledger.set_sync(true);
+        result?;
+        self.flush()
+    }
+
     /// Records a degraded condition of a component such as the exec gate.
     pub fn record_degraded(&mut self, detail: &str) -> Result<(), EngineError> {
         self.log(EventKind::Degraded, None, None, None, vec![], Basis::None, detail)?;
@@ -1086,8 +1119,10 @@ impl Engine {
             Basis::ManualOverride,
             &format!("baseline {name} enrolled by {granted_by}: {count} members"),
         ) {
+            // The new file is left in place: it is harmless (not the one the ledger records, so it is ignored and
+            // reported once), while deleting it could remove the very file the ledger names, if this event was
+            // written after all (a failed rollback) or if the bytes, and so the name, equal the current file's.
             self.baselines = previous;
-            let _ = std::fs::remove_file(self.paths.baselines().join(&file));
             return Err(e);
         }
         remove_superseded(&self.paths.baselines(), &format!("{name}."), &file);
@@ -1147,7 +1182,7 @@ impl Engine {
         self.flush()?;
         self.save_index()?;
         let id = obs.record.id();
-        let shown = jlr_model::sanitize(&seen.path);
+        let shown = jlr_model::sanitize_to(&seen.path, 300);
         if !runnable(decision.state) {
             self.log(
                 EventKind::Enforcement,
@@ -1180,7 +1215,7 @@ impl Engine {
 
     /// Records how a prepared run went.
     fn record_run(&mut self, p: &PreparedRun, outcome: &Result<RunOutcome, String>) -> Result<(), EngineError> {
-        let shown = jlr_model::sanitize(&p.path);
+        let shown = jlr_model::sanitize_to(&p.path, 300);
         match outcome {
             Ok(o) => {
                 let rd = put_object(&self.paths, "report", &o.report.to_cbor())?;
@@ -1331,11 +1366,11 @@ impl Engine {
             Basis::ManualOverride,
             &format!("operator {granted_by} approved {} cell={cell} network={network}", record.name),
         ) {
+            // The new file is left in place; see `enroll_baseline`.
             match previous {
                 Some(p) => self.approvals.insert(id, p),
                 None => self.approvals.remove(&id),
             };
-            let _ = std::fs::remove_file(self.paths.approvals().join(&file));
             return Err(e);
         }
         remove_superseded(&self.paths.approvals(), &format!("{}.", id.digest.hex()), &file);
@@ -1424,7 +1459,9 @@ impl Engine {
                     };
                     let ev = self.store_evidence(&[])?;
                     n += self.apply_decision(&id, &d, ev, &format!("revoked: {reason}"))?;
-                } else {
+                } else if kind != RevocationKind::Epn {
+                    // An EPN revocation is decided by the identifier alone, so an artifact whose record is missing
+                    // is not "unchecked" for it: it simply is not the one named.
                     unchecked += 1;
                 }
                 continue;
@@ -1453,7 +1490,11 @@ impl Engine {
 
     /// Installs a new signed policy. The epoch must be strictly greater than the current one.
     pub fn set_policy(&mut self, new: Policy) -> Result<Digest, EngineError> {
-        new.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
+        // A policy that keeps the installed policy's name (the `enforce on|off` toggle does) may keep a name that
+        // predates the alphabet rule; any other new policy must follow it.
+        let keeps_installed_name = new.name == self.policy.name;
+        let valid = if keeps_installed_name { new.validate_loaded() } else { new.validate() };
+        valid.map_err(|e| EngineError::Invalid(e.to_string()))?;
         if new.epoch <= self.policy.epoch {
             return Err(EngineError::Rollback(format!(
                 "policy epoch {} must be greater than the current epoch {}",
