@@ -7,13 +7,13 @@ use crate::store::{
     IndexFile, IndexRow, NodeInfo, get_object, has_object, load_index, put_object, save_index, sync_fs, write_atomic,
 };
 use jlr_cbor::{Cbor, Value};
-use jlr_cell::{CellSpec, EnforcementReport, SealedExe, Stdio3, launch};
+use jlr_cell::{CellError, CellSpec, EnforcementReport, SealedExe, Stdio3, launch};
 use jlr_crypto::{Digest, Envelope, SigningKeypair, TrustAnchors, random_bytes};
 use jlr_ledger::{EventDraft, Ledger};
 use jlr_measure::{DpkgDb, Observation, ObserveOptions, Trust, WalkOptions, observe, observe_open, walk};
 use jlr_model::{
     AdmissionState, Assurance, Basis, Capability, CellClass, Decision, EpnId, EpnRecord, EventKind, EvidenceItem,
-    EvidenceKind, NetworkMode, Posture, record_type,
+    EvidenceKind, NetworkMode, Posture, ReasonCode, record_type,
 };
 use jlr_policy::{
     Approval, Baseline, Facts, Policy, RevocationEntry, RevocationKind, Revocations, VerifiedApproval,
@@ -134,6 +134,18 @@ pub struct RunResult {
     pub stdout: Vec<u8>,
     /// Captured standard error, when requested.
     pub stderr: Vec<u8>,
+    /// Set when the program ran but its end could not be recorded in the ledger (the ledger stayed locked, the
+    /// disk was full). The program's result is still returned; this says the record is incomplete.
+    pub record_error: Option<String>,
+}
+
+/// What adding a revocation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokeReport {
+    /// Known artifacts moved to `REVOKED`.
+    pub moved: usize,
+    /// Known artifacts that could not be checked against the new entry because their records are missing.
+    pub unchecked: usize,
 }
 
 /// A read-only explanation of what the engine thinks of one file.
@@ -193,8 +205,11 @@ pub struct Status {
 /// The engine's verdict on one attempted `exec`.
 #[derive(Debug)]
 pub struct ExecVerdict {
-    /// Identity of what is being executed.
-    pub id: EpnId,
+    /// Identity of what is being executed; `None` when the file could not be measured.
+    pub id: Option<EpnId>,
+    /// Why the file could not be measured, when that is the case. It is a decision, not an internal
+    /// error: the executing user controls the conditions (size, changing content).
+    pub unmeasurable: Option<String>,
     /// The trust decision.
     pub decision: Decision,
     /// Whether the decision permits running outside an observation cell.
@@ -241,16 +256,18 @@ fn now_ns(secs: i64, nsec: i64) -> u64 {
     (secs.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(nsec.max(0) as u64)
 }
 
-fn row_of(path: &str, epn: &EpnId, m: &std::fs::Metadata, measured_at: u64) -> IndexRow {
+fn row_of(path: &str, epn: &EpnId, st: &jlr_measure::Stamp, measured_at: u64) -> IndexRow {
     IndexRow {
         path: path.to_owned(),
         epn: epn.to_string(),
-        size: m.len(),
-        mtime_ns: now_ns(m.mtime(), m.mtime_nsec()),
-        ctime_ns: now_ns(m.ctime(), m.ctime_nsec()),
-        ino: m.ino(),
-        dev: m.dev(),
+        size: st.size,
+        mtime_ns: st.mtime_ns,
+        ctime_ns: st.ctime_ns,
+        ino: st.ino,
+        dev: st.dev,
         measured_at,
+        valid_until: 0,
+        policy_epoch: 0,
     }
 }
 
@@ -285,8 +302,16 @@ fn route(from: AdmissionState, to: AdmissionState) -> Option<Vec<AdmissionState>
     None
 }
 
-fn parse_epoch(detail: &str) -> Option<u64> {
-    detail.split("epoch=").nth(1)?.split_whitespace().next()?.parse().ok()
+pub(crate) fn parse_epoch(detail: &str) -> Option<u64> {
+    // The engine writes `policy=<name> epoch=<n> digest=<hex>` and `revocations epoch=<n> ...`. Parse from
+    // a fixed position (the last `epoch=` before the last `digest=`, or the fixed prefix), never from text a
+    // policy author or a revocation reason controls.
+    if let Some(rest) = detail.strip_prefix("revocations epoch=") {
+        return rest.split_whitespace().next()?.parse().ok();
+    }
+    let (head, _) = detail.rsplit_once(" digest=")?;
+    let (_, n) = head.rsplit_once(" epoch=")?;
+    n.parse().ok()
 }
 
 impl std::fmt::Debug for Engine {
@@ -301,13 +326,25 @@ impl Engine {
     /// Long-lived programs (the daemon) never hold the engine for long, so a
     /// short wait lets the command line and the daemon share one state directory.
     pub fn open_wait(paths: Paths, cfg: Config, timeout: std::time::Duration) -> Result<Engine, EngineError> {
+        Engine::open_wait_timed(paths, cfg, timeout).map(|(e, _)| e)
+    }
+
+    /// Like [`Engine::open_wait`], and also returns how long the attempt that succeeded took, which is the work of
+    /// opening (replaying the ledger) without the time spent waiting for someone else's lock. The daemon charges
+    /// users for the former and not the latter.
+    pub fn open_wait_timed(
+        paths: Paths,
+        cfg: Config,
+        timeout: std::time::Duration,
+    ) -> Result<(Engine, std::time::Duration), EngineError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            let started = std::time::Instant::now();
             match Engine::open(paths.clone(), cfg.clone()) {
                 Err(EngineError::Ledger(jlr_ledger::LedgerError::Locked)) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(15));
                 }
-                other => return other,
+                other => return other.map(|e| (e, started.elapsed())),
             }
         }
     }
@@ -335,7 +372,7 @@ impl Engine {
         .map_err(|e| EngineError::Verification(format!("policy: {e}")))?;
         let policy =
             Policy::from_cbor(&v.payload).map_err(|e| EngineError::Verification(format!("policy payload: {e}")))?;
-        policy.validate().map_err(|e| EngineError::Verification(e.to_string()))?;
+        policy.validate_loaded().map_err(|e| EngineError::Verification(e.to_string()))?;
 
         let rev_env = std::fs::read(paths.revocations())?;
         let v = Envelope::verify(
@@ -384,32 +421,67 @@ impl Engine {
             )));
         }
 
+        // The ledger, not the directory, says which approval and baseline are current: a file counts only if
+        // its envelope digest is the evidence of the latest OVERRIDE event for its subject. A superseded or
+        // withdrawn file that is copied back verifies again on its signature alone, so the signature is not
+        // enough, and a copy stored under another name cannot shadow the current one either.
+        let mut current: HashMap<&str, Digest> = HashMap::new();
+        for e in &events {
+            if e.kind == EventKind::Override
+                && let (Some(subject), Some(d)) = (&e.subject, e.evidence.first())
+            {
+                current.insert(subject.as_str(), *d);
+            }
+        }
         let mut baselines = Vec::new();
         let mut approvals = HashMap::new();
         let mut problems: Vec<String> = Vec::new();
         for entry in read_dir_sorted(&paths.baselines()) {
-            match std::fs::read(&entry)
-                .map_err(|e| e.to_string())
-                .and_then(|b| Baseline::verify(&b, &node.node_id, &anchors).map_err(|e| e.to_string()))
-            {
+            let read = std::fs::read(&entry).map_err(|e| e.to_string());
+            match read.and_then(|b| {
+                let v = Baseline::verify(&b, &node.node_id, &anchors).map_err(|e| e.to_string())?;
+                let subject = format!("baseline:{}", v.get().name);
+                if current.get(subject.as_str()) == Some(&Digest::of(&b)) {
+                    Ok(v)
+                } else {
+                    Err("it is not the baseline the ledger records as current".to_owned())
+                }
+            }) {
                 Ok(b) => baselines.push((b.get().name.clone(), b)),
                 Err(e) => problems.push(format!("baseline {}: {e}", entry.display())),
             }
         }
         for entry in read_dir_sorted(&paths.approvals()) {
-            match std::fs::read(&entry)
-                .map_err(|e| e.to_string())
-                .and_then(|b| Approval::verify(&b, &node.node_id, &anchors).map_err(|e| e.to_string()))
-            {
-                Ok(a) => {
-                    if let Some(id) = EpnId::parse(&a.get().epn) {
-                        approvals.insert(id, a);
-                    }
+            let read = std::fs::read(&entry).map_err(|e| e.to_string());
+            match read.and_then(|b| {
+                let v = Approval::verify(&b, &node.node_id, &anchors).map_err(|e| e.to_string())?;
+                let id = EpnId::parse(&v.get().epn).ok_or_else(|| "it names no valid EPN".to_owned())?;
+                if current.get(id.to_string().as_str()) == Some(&Digest::of(&b)) {
+                    Ok((id, v))
+                } else {
+                    Err("it is not the approval the ledger records as current".to_owned())
+                }
+            }) {
+                Ok((id, a)) => {
+                    approvals.insert(id, a);
                 }
                 Err(e) => problems.push(format!("approval {}: {e}", entry.display())),
             }
         }
 
+        if report.checkpoint_torn_bytes > 0 {
+            // The newest checkpoints, the anti-rollback anchors, may be gone. That is worth a signed trace.
+            let mut d = EventDraft::new(
+                "jlr-engine",
+                EventKind::Degraded,
+                &format!(
+                    "recovered an incomplete checkpoint record of {} bytes; the newest checkpoints may be missing; kept in a quarantine file",
+                    report.checkpoint_torn_bytes
+                ),
+            );
+            d.policy = policy.digest();
+            ledger.append(d)?;
+        }
         if report.torn_tail_bytes > 0 {
             let mut d = EventDraft::new(
                 "jlr-engine",
@@ -422,15 +494,72 @@ impl Engine {
             d.policy = policy.digest();
             ledger.append(d)?;
         }
+        let already: std::collections::HashSet<&str> =
+            events.iter().filter(|e| e.kind == EventKind::Degraded).map(|e| e.detail.as_str()).collect();
         for p in &problems {
-            // A signed object that does not verify grants nothing and is reported.
-            let mut d =
-                EventDraft::new("jlr-engine", EventKind::Degraded, &format!("ignored unverifiable object: {p}"));
+            // A signed object that does not verify, or is not current, grants nothing and is reported once, not
+            // on every start (the daemon opens the engine for every uncached decision).
+            let detail = jlr_model::sanitize(&format!("ignored unverifiable object: {p}"));
+            if already.contains(detail.as_str()) {
+                continue;
+            }
+            let mut d = EventDraft::new("jlr-engine", EventKind::Degraded, &detail);
             d.policy = policy.digest();
-            ledger.append(d)?;
+            // Best effort: a report about an ignored file must not make the engine unopenable when the ledger
+            // cannot grow (a full disk), because the daemon opens the engine for every decision and an open that
+            // fails is a decision that fails open. The file grants nothing whether or not the note is written.
+            let _ = ledger.append(d);
         }
 
-        let index = load_index(&paths).rows.into_iter().map(|r| (r.path.clone(), r)).collect();
+        let (file, lost) = load_index(&paths);
+        let mut index: std::collections::BTreeMap<String, IndexRow> =
+            file.rows.into_iter().map(|r| (r.path.clone(), r)).collect();
+        if lost && !states.is_empty() {
+            // Without the index nothing says which artifact used to be at a path, so a trusted file that was
+            // replaced would look like a brand-new file and the tampering would go unnoticed. Rebuild the
+            // memory from what is durable and checkable: the ledger's discoveries (in order, latest wins) and
+            // the content-addressed records, whose path is part of the record. The rows carry no file stamp,
+            // so the next scan re-measures every one of them.
+            let mut recovered = 0usize;
+            for e in &events {
+                if e.kind != EventKind::Discover {
+                    continue;
+                }
+                let Some(id) = e.subject.as_deref().and_then(EpnId::parse) else { continue };
+                if let Some(path) = get_object(&paths, "epn", &id.digest)
+                    .ok()
+                    .and_then(|b| EpnRecord::from_cbor(&b).ok())
+                    .and_then(|r| r.source.path)
+                {
+                    let row = IndexRow {
+                        path: path.clone(),
+                        epn: id.to_string(),
+                        size: 0,
+                        mtime_ns: 0,
+                        ctime_ns: 0,
+                        ino: 0,
+                        dev: 0,
+                        measured_at: 0,
+                        valid_until: 0,
+                        policy_epoch: 0,
+                    };
+                    if index.insert(path, row).is_none() {
+                        recovered += 1;
+                    }
+                }
+            }
+            let unrecovered = states.len().saturating_sub(index.len());
+            let mut d = EventDraft::new(
+                "jlr-engine",
+                EventKind::Degraded,
+                &format!(
+                    "the path index was missing or damaged; rebuilt {recovered} rows from the ledger and the object store, {unrecovered} known artifacts could not be placed. Run a full scan"
+                ),
+            );
+            d.policy = policy.digest();
+            let _ = ledger.append(d); // best effort, as above
+            let _ = save_index(&paths, &IndexFile { rows: index.values().cloned().collect() });
+        }
         Ok(Engine {
             paths,
             cfg,
@@ -444,7 +573,7 @@ impl Engine {
             states,
             index,
             checkpoints: report.checkpoints,
-            torn_tail_bytes: report.torn_tail_bytes,
+            torn_tail_bytes: report.torn_tail_bytes + report.checkpoint_torn_bytes,
         })
     }
 
@@ -487,6 +616,11 @@ impl Engine {
         &self.policy
     }
 
+    /// The active revocation list.
+    pub fn revocations(&self) -> &Revocations {
+        &self.revocations
+    }
+
     /// State of an artifact according to the ledger.
     pub fn state_of(&self, id: &EpnId) -> Option<AdmissionState> {
         self.states.get(id).copied()
@@ -503,10 +637,32 @@ impl Engine {
         basis: Basis,
         detail: &str,
     ) -> Result<(), EngineError> {
-        let mut d = EventDraft::new("jlr-engine", kind, detail);
-        d.subject = subject.map(ToString::to_string);
+        self.log_subject(kind, subject.map(ToString::to_string), old, new, evidence, basis, detail)
+    }
+
+    /// Like [`Engine::log`] for events whose subject is not an EPN (a baseline is `baseline:<name>`).
+    #[allow(clippy::too_many_arguments)]
+    fn log_subject(
+        &mut self,
+        kind: EventKind,
+        subject: Option<String>,
+        old: Option<AdmissionState>,
+        new: Option<AdmissionState>,
+        evidence: Vec<Digest>,
+        basis: Basis,
+        detail: &str,
+    ) -> Result<(), EngineError> {
+        // Paths, names and error strings can come from an attacker; no event may carry raw control characters.
+        let mut d = EventDraft::new("jlr-engine", kind, &jlr_model::sanitize(detail));
+        d.subject = subject;
         d.old_state = old;
         d.new_state = new;
+        // An event that names objects must not become durable before the objects it names. In a batch the
+        // caller flushes objects and then the ledger; outside a batch the event is synced as it is appended,
+        // so the objects are made durable first.
+        if !evidence.is_empty() && self.ledger.is_syncing() {
+            sync_fs(self.paths.root())?;
+        }
         d.evidence = evidence;
         d.basis = basis;
         d.policy = self.policy.digest();
@@ -573,12 +729,11 @@ impl Engine {
     }
 
     fn store_record(&mut self, record: &EpnRecord) -> Result<bool, EngineError> {
-        let id = record.id();
-        if has_object(&self.paths, "epn", &id.digest) {
-            return Ok(false);
-        }
+        let existed = has_object(&self.paths, "epn", &record.id().digest);
+        // `put_object` rewrites an object that exists with the wrong length (a truncated write), so a damaged
+        // record is repaired the next time its artifact is seen. Repairing is not discovering.
         put_object(&self.paths, "epn", &record.to_cbor())?;
-        Ok(true)
+        Ok(!existed)
     }
 
     fn load_record(&self, id: &EpnId) -> Option<EpnRecord> {
@@ -591,12 +746,12 @@ impl Engine {
         if matches!(old_state, AdmissionState::Revoked | AdmissionState::Degraded | AdmissionState::Quarantined) {
             return Ok((0, false));
         }
-        let Some(record) = self.load_record(old) else { return Ok((0, false)) };
+        let record = self.load_record(old);
         let mismatch = EvidenceItem {
             kind: EvidenceKind::ContentDigestMismatch,
             source: "measure".into(),
             at: self.now(),
-            detail: format!("content at {path} no longer matches {old}"),
+            detail: format!("content at {} no longer matches {old}", jlr_model::sanitize_to(path, 300)),
             digest: None,
         };
         let ev = self.store_evidence(std::slice::from_ref(&mismatch))?;
@@ -607,10 +762,33 @@ impl Engine {
             None,
             vec![ev],
             Basis::None,
-            &format!("content at {path} changed"),
+            &format!("content at {} changed", jlr_model::sanitize_to(path, 300)),
         )?;
-        let decision = self.evaluate_now(&record, std::slice::from_ref(&mismatch), &[]);
-        let n = self.apply_decision(old, &decision, ev, &format!("content changed at {path}"))?;
+        // Degrading an identity whose bytes changed does not need its record. If the object store was
+        // truncated or edited, the identity is degraded anyway instead of silently staying trusted.
+        let decision = match record {
+            Some(r) => self.evaluate_now(&r, std::slice::from_ref(&mismatch), &[]),
+            None => Decision {
+                state: if matches!(old_state, AdmissionState::Verified | AdmissionState::Admitted) {
+                    AdmissionState::Degraded
+                } else {
+                    AdmissionState::Quarantined
+                },
+                cell: CellClass::Cell0,
+                network: NetworkMode::None,
+                capabilities: vec![],
+                reasons: vec![ReasonCode::ContentChanged],
+                basis: Basis::None,
+                needs_user: None,
+                policy: self.policy.digest(),
+            },
+        };
+        let n = self.apply_decision(
+            old,
+            &decision,
+            ev,
+            &format!("content changed at {}", jlr_model::sanitize_to(path, 300)),
+        )?;
         Ok((n, self.states.get(old) == Some(&AdmissionState::Degraded)))
     }
 
@@ -626,8 +804,13 @@ impl Engine {
             degraded_prior = degraded;
         }
         let is_new = self.store_record(&seen.record)?;
-        let ev = self.store_evidence(&seen.evidence)?;
         let known = self.states.contains_key(&id);
+        let decision = self.evaluate_now(&seen.record, &seen.evidence, requested);
+        // Evidence is stored (as an object, named by its digest, and it carries the time it was collected) only
+        // when an event is going to cite it. Storing it on every repeat decision made an unchanged file leak one
+        // orphan object per decision.
+        let cited = is_new || !known || self.states.get(&id).copied() != Some(decision.state);
+        let ev = if cited { self.store_evidence(&seen.evidence)? } else { Digest::ZERO };
         if is_new || !known {
             self.log(
                 EventKind::Discover,
@@ -636,12 +819,31 @@ impl Engine {
                 None,
                 vec![ev],
                 Basis::None,
-                &format!("{} {} at {}", seen.record.class, seen.record.name, seen.path),
+                &format!(
+                    "{} {} at {}",
+                    seen.record.class,
+                    jlr_model::sanitize_to(&seen.record.name, 100),
+                    jlr_model::sanitize_to(&seen.path, 300)
+                ),
             )?;
         }
-        let decision = self.evaluate_now(&seen.record, &seen.evidence, requested);
-        transitions += self.apply_decision(&id, &decision, ev, &format!("{} at {}", seen.record.name, seen.path))?;
-        self.index.insert(seen.path.clone(), seen.row.clone());
+        // The name and path are the attacker's; each is bounded on its own so the fields that follow survive.
+        let named = format!(
+            "{} at {}",
+            jlr_model::sanitize_to(&seen.record.name, 100),
+            jlr_model::sanitize_to(&seen.path, 300)
+        );
+        transitions += self.apply_decision(&id, &decision, ev, &named)?;
+        // A row may be reused only while the evidence and every authority it relied on are still valid.
+        let now = self.now();
+        let mut valid_until = now.saturating_add(self.policy.evidence_max_age_secs);
+        if let Some(a) = self.approval_for(&id, now) {
+            valid_until = valid_until.min(a.get().expires_at);
+        }
+        let mut row = seen.row.clone();
+        row.valid_until = valid_until;
+        row.policy_epoch = self.policy.epoch;
+        self.index.insert(seen.path.clone(), row);
         Ok(Processed { decision, transitions, is_new: is_new || !known, degraded_prior })
     }
 
@@ -651,9 +853,10 @@ impl Engine {
 
     fn seen_from(&self, obs: &Observation) -> Result<Seen, EngineError> {
         let path = obs.path.to_string_lossy().into_owned();
-        let meta = obs.file.metadata()?;
+        // The stamp was taken BEFORE the file was hashed. Building the row from a later fstat
+        // would let a file modified after measurement be recorded as unchanged.
         Ok(Seen {
-            row: row_of(&path, &obs.record.id(), &meta, self.now()),
+            row: row_of(&path, &obs.record.id(), &obs.stamp, self.now()),
             path,
             record: obs.record.clone(),
             evidence: obs.evidence.clone(),
@@ -703,7 +906,8 @@ impl Engine {
                     && row.ctime_ns == now_ns(meta.ctime(), meta.ctime_nsec())
                     && row.ino == meta.ino()
                     && row.dev == meta.dev()
-                    && self.now().saturating_sub(row.measured_at) < self.policy.evidence_max_age_secs
+                    && self.now() < row.valid_until
+                    && row.policy_epoch == self.policy.epoch
                     && EpnId::parse(&row.epn).is_some_and(|id| self.states.contains_key(&id))
                 {
                     report.unchanged += 1;
@@ -740,38 +944,103 @@ impl Engine {
 
     /// Decides whether an `exec` of the open file `file` may proceed.
     ///
-    /// The bytes are measured through the descriptor the kernel delivered, so a
-    /// path swapped afterwards changes nothing. Discoveries and transitions are
-    /// recorded exactly as for a scan.
+    /// The bytes are measured through the descriptor the kernel delivered, so a path swapped afterwards
+    /// changes nothing. Discoveries and transitions are recorded exactly as for a scan.
+    ///
+    /// A file that cannot be measured (too large, changing under the read, not a regular file) is a
+    /// **decision**, not an internal error: the user executing it controls those conditions, so treating
+    /// them as "fail open" would let anyone run anything by padding or touching a file. The verdict is
+    /// "not allowed", and the caller applies the enforcement mode.
     pub fn decide_exec(&mut self, file: std::fs::File, path: &Path) -> Result<ExecVerdict, EngineError> {
         let mut dpkg = self.load_dpkg();
-        let obs = observe_open(file, path, dpkg.as_mut(), &self.observe_opts())?;
+        let obs = match observe_open(file, path, dpkg.as_mut(), &self.observe_opts()) {
+            Ok(o) => o,
+            Err(e) => return Ok(self.unmeasurable_verdict(&e)),
+        };
         let id = obs.record.id();
         let seen = self.seen_from(&obs)?;
         drop(obs);
-        let p = self.process(&seen, &[])?;
-        self.save_index()?;
-        self.flush()?;
+        let before = self.index.get(&seen.path).cloned();
+        // Objects first, then events: the ledger is synced once, after the objects it names.
+        self.ledger.set_sync(false);
+        let processed = self.process(&seen, &[]);
+        self.ledger.set_sync(true);
+        let p = processed?;
+        let after = self.index.get(&seen.path).cloned();
+        // A repeat decision that changed nothing costs no disk writes at all (no index rewrite, no syncfs).
+        if p.transitions > 0 || p.is_new || !rows_equivalent(before.as_ref(), after.as_ref()) {
+            // Ledger first, index second: an index row that says "this path now holds X" must never outlive
+            // the events recording what happened to whatever was there before.
+            self.flush()?;
+            self.save_index()?;
+        }
+        let valid_for = after.as_ref().map_or(0, |r| r.valid_until.saturating_sub(self.now()));
         Ok(ExecVerdict {
-            id,
+            id: Some(id),
+            unmeasurable: None,
             allowed: p.decision.state.permits_normal_execution(),
             decision: p.decision,
             enforce: self.policy.enforce_exec,
-            max_age_secs: self.policy.evidence_max_age_secs,
+            max_age_secs: valid_for.max(1),
         })
+    }
+
+    fn unmeasurable_verdict(&self, why: &jlr_measure::MeasureError) -> ExecVerdict {
+        let text = jlr_model::sanitize(&why.to_string());
+        ExecVerdict {
+            id: None,
+            unmeasurable: Some(text.clone()),
+            decision: Decision {
+                state: AdmissionState::Quarantined,
+                cell: CellClass::Cell0,
+                network: NetworkMode::None,
+                capabilities: vec![],
+                reasons: vec![ReasonCode::EvidenceMissing],
+                basis: Basis::None,
+                needs_user: Some(format!("the file could not be measured: {text}")),
+                policy: self.policy.digest(),
+            },
+            allowed: false,
+            enforce: self.policy.enforce_exec,
+            // Retry soon: the condition may be transient, and a stale "deny" must not stick.
+            max_age_secs: 5,
+        }
     }
 
     /// Records the outcome of an exec decision in the ledger.
     pub fn record_exec(
         &mut self,
-        id: &EpnId,
+        id: Option<&EpnId>,
         path: &str,
         verdict: &str,
         decision: &Decision,
     ) -> Result<(), EngineError> {
         let reasons: Vec<String> = decision.reasons.iter().map(ToString::to_string).collect();
-        let detail = format!("exec gate: {verdict} {path}: state {} [{}]", decision.state, reasons.join(","));
-        self.log(EventKind::Enforcement, Some(id), None, None, vec![], Basis::Policy, &detail)?;
+        // The path is the attacker's; bounding it on its own keeps the decision that follows it in the record.
+        let detail = format!(
+            "exec gate: {verdict} {}: state {} [{}]",
+            jlr_model::sanitize_to(path, 300),
+            decision.state,
+            reasons.join(",")
+        );
+        self.log(EventKind::Enforcement, id, None, None, vec![], Basis::Policy, &detail)?;
+        self.flush()
+    }
+
+    /// Records several degraded conditions with one durable flush at the end, instead of one per record. A daemon
+    /// that has many things to say (a summary per user, per file) must not hold the ledger, and stall everything
+    /// that waits on it, for the sum of that many syncs.
+    pub fn record_degraded_many(&mut self, details: &[String]) -> Result<(), EngineError> {
+        self.ledger.set_sync(false);
+        let mut result = Ok(());
+        for d in details {
+            result = self.log(EventKind::Degraded, None, None, None, vec![], Basis::None, d);
+            if result.is_err() {
+                break;
+            }
+        }
+        self.ledger.set_sync(true);
+        result?;
         self.flush()
     }
 
@@ -836,18 +1105,30 @@ impl Engine {
         let bytes = baseline.sign(&self.node.node_id, &key);
         let verified = Baseline::verify(&bytes, &self.node.node_id, &self.anchors)
             .map_err(|e| EngineError::Verification(e.to_string()))?;
-        write_atomic(&self.paths.baselines().join(format!("{name}.cose")), &bytes)?;
+        // The new file gets a name of its own (subject and a prefix of its digest), so writing it never overwrites
+        // the file the ledger currently records. The ledger event that makes it current comes next, and only then
+        // are older files removed: a crash or a full disk in between leaves the old authority intact.
+        let file = format!("{name}.{}.cose", &Digest::of(&bytes).hex()[..16]);
+        write_atomic(&self.paths.baselines().join(&file), &bytes)?;
+        let previous = self.baselines.clone();
         self.baselines.retain(|(n, _)| n != name);
         self.baselines.push((name.to_owned(), verified));
-        self.log(
+        if let Err(e) = self.log_subject(
             EventKind::Override,
-            None,
+            Some(format!("baseline:{name}")),
             None,
             None,
             vec![Digest::of(&bytes)],
             Basis::ManualOverride,
-            &format!("baseline {name} enrolled by {granted_by}: {count} members"),
-        )?;
+            &format!("baseline {name} enrolled by {}: {count} members", jlr_model::sanitize_to(granted_by, 100)),
+        ) {
+            // The new file is left in place: it is harmless (not the one the ledger records, so it is ignored and
+            // reported once), while deleting it could remove the very file the ledger names, if this event was
+            // written after all (a failed rollback) or if the bytes, and so the name, equal the current file's.
+            self.baselines = previous;
+            return Err(e);
+        }
+        remove_superseded(&self.paths.baselines(), &format!("{name}."), &file);
 
         self.ledger.set_sync(false);
         let mut fail = None;
@@ -885,24 +1166,26 @@ impl Engine {
         Ok(Explanation { prior: self.states.get(&id).copied(), record: obs.record, evidence: obs.evidence, decision })
     }
 
-    /// Runs a program in the cell its decision prescribes.
-    ///
-    /// The file is measured once, copied into a sealed memfd while being hashed
-    /// again, and that descriptor is what executes.
-    pub fn run(
+    /// Measures a program, decides, and prepares the sealed executable and cell for it. Everything that
+    /// touches the ledger happens here, so a caller can release the ledger before the program runs.
+    fn prepare_run(
         &mut self,
         path: &Path,
         args: &[String],
         env: &[String],
         requested: &[Capability],
-        capture: bool,
-    ) -> Result<RunResult, EngineError> {
+    ) -> Result<PreparedRun, EngineError> {
         let mut dpkg = self.load_dpkg();
         let mut obs = observe(path, dpkg.as_mut(), &self.observe_opts())?;
         let seen = self.seen_from(&obs)?;
-        let decision = self.process(&seen, requested)?.decision;
+        self.ledger.set_sync(false);
+        let processed = self.process(&seen, requested);
+        self.ledger.set_sync(true);
+        let decision = processed?.decision;
+        self.flush()?;
         self.save_index()?;
         let id = obs.record.id();
+        let shown = jlr_model::sanitize_to(&seen.path, 300);
         if !runnable(decision.state) {
             self.log(
                 EventKind::Enforcement,
@@ -911,7 +1194,7 @@ impl Engine {
                 None,
                 vec![],
                 Basis::None,
-                &format!("denied execution of {}: state {}", seen.path, decision.state),
+                &format!("denied execution of {shown}: state {}", decision.state),
             )?;
             self.flush()?;
             return Err(EngineError::NotRunnable(Box::new(decision)));
@@ -920,48 +1203,127 @@ impl Engine {
         argv.extend(args.iter().cloned());
         let spec = CellSpec::from_decision(&decision, argv, env.to_vec())?;
         let sealed = SealedExe::seal(&mut obs.file, &obs.record.digest, 512 << 20)?;
-        let io = if capture { Stdio3::captured() } else { Stdio3::inherit() };
-        let running = match launch(&self.cfg.helper, &sealed, &spec, io) {
-            Ok(r) => r,
-            Err(e) => {
-                let detail = format!("could not start {}: {e}", seen.path);
-                self.log(EventKind::Enforcement, Some(&id), None, None, vec![], Basis::None, &detail)?;
-                self.flush()?;
-                return Err(e.into());
-            }
-        };
-        let report = running.report().clone();
-        let rd = put_object(&self.paths, "report", &report.to_cbor())?;
-        self.log(
-            EventKind::Enforcement,
-            Some(&id),
-            None,
-            None,
-            vec![rd],
-            decision.basis,
-            &format!(
-                "started {} in {} network={} status={:?} active=[{}] unavailable=[{}]",
-                seen.path,
-                decision.cell,
-                decision.network,
-                report.status,
-                report.active.join(","),
-                report.unavailable.join("; ")
-            ),
-        )?;
-        let (outcome, stdout, stderr) =
-            if capture { running.wait_with_output()? } else { (running.wait()?, Vec::new(), Vec::new()) };
         self.log(
             EventKind::Enforcement,
             Some(&id),
             None,
             None,
             vec![],
-            Basis::None,
-            &format!("{} exited with code {}", seen.path, outcome.code),
+            decision.basis,
+            &format!("starting {shown} in {} network={}", decision.cell, decision.network),
         )?;
         self.flush()?;
-        Ok(RunResult { decision, report, exit_code: outcome.code, stdout, stderr })
+        Ok(PreparedRun { sealed, spec, decision, id, path: seen.path })
+    }
+
+    /// Records how a prepared run went.
+    fn record_run(&mut self, p: &PreparedRun, outcome: &Result<RunOutcome, String>) -> Result<(), EngineError> {
+        let shown = jlr_model::sanitize_to(&p.path, 300);
+        match outcome {
+            Ok(o) => {
+                let rd = put_object(&self.paths, "report", &o.report.to_cbor())?;
+                self.log(
+                    EventKind::Enforcement,
+                    Some(&p.id),
+                    None,
+                    None,
+                    vec![rd],
+                    p.decision.basis,
+                    &format!(
+                        "started {shown} in {} network={} status={:?} active=[{}] unavailable=[{}]",
+                        p.decision.cell,
+                        p.decision.network,
+                        o.report.status,
+                        o.report.active.join(","),
+                        o.report.unavailable.join("; ")
+                    ),
+                )?;
+                self.log(
+                    EventKind::Enforcement,
+                    Some(&p.id),
+                    None,
+                    None,
+                    vec![],
+                    Basis::None,
+                    &format!("{shown} exited with code {}", o.code),
+                )?;
+            }
+            Err(e) => {
+                self.log(
+                    EventKind::Enforcement,
+                    Some(&p.id),
+                    None,
+                    None,
+                    vec![],
+                    Basis::None,
+                    &format!("could not start {shown}: {e}"),
+                )?;
+            }
+        }
+        self.flush()
+    }
+
+    /// Runs a program in the cell its decision prescribes.
+    ///
+    /// The file is measured once, copied into a sealed memfd while being hashed again, and that descriptor
+    /// is what executes. **This holds the ledger lock until the program exits.** Interactive tools use
+    /// [`Engine::run_detached`], which releases it.
+    pub fn run(
+        &mut self,
+        path: &Path,
+        args: &[String],
+        env: &[String],
+        requested: &[Capability],
+        capture: bool,
+    ) -> Result<RunResult, EngineError> {
+        let prepared = self.prepare_run(path, args, env, requested)?;
+        let outcome = execute_prepared(&self.cfg.helper, &prepared, capture);
+        self.record_run(&prepared, &outcome.as_ref().map(|(o, _, _)| o.clone()).map_err(ToString::to_string))?;
+        let (o, stdout, stderr) = outcome?;
+        Ok(RunResult {
+            decision: prepared.decision,
+            report: o.report,
+            exit_code: o.code,
+            stdout,
+            stderr,
+            record_error: None,
+        })
+    }
+
+    /// Like [`Engine::run`], but the ledger is **released while the program runs**.
+    ///
+    /// The lock is taken to measure, decide and record the start, dropped for the lifetime of the workload,
+    /// and taken again to record the end. A confined browser running for hours therefore does not block the
+    /// exec gate, `jlr revoke`, or a policy change.
+    pub fn run_detached(
+        paths: Paths,
+        cfg: Config,
+        path: &Path,
+        args: &[String],
+        env: &[String],
+        requested: &[Capability],
+        capture: bool,
+    ) -> Result<RunResult, EngineError> {
+        let wait = std::time::Duration::from_secs(20);
+        let mut engine = Engine::open_wait(paths.clone(), cfg.clone(), wait)?;
+        let prepared = engine.prepare_run(path, args, env, requested)?;
+        drop(engine); // the lock is released here
+        let outcome = execute_prepared(&cfg.helper, &prepared, capture);
+        // The program has already run, with whatever effects it had. If its end cannot be recorded (the ledger
+        // stayed locked, the disk is full) the caller must still get its exit status and output, with a note
+        // that the record is incomplete, not an error that hides them.
+        let recorded = Engine::open_wait(paths, cfg, wait).and_then(|mut engine| {
+            engine.record_run(&prepared, &outcome.as_ref().map(|(o, _, _)| o.clone()).map_err(ToString::to_string))
+        });
+        let (o, stdout, stderr) = outcome?;
+        Ok(RunResult {
+            decision: prepared.decision,
+            report: o.report,
+            exit_code: o.code,
+            stdout,
+            stderr,
+            record_error: recorded.err().map(|e| e.to_string()),
+        })
     }
 
     /// Records an operator approval for a known artifact and applies it.
@@ -994,17 +1356,31 @@ impl Engine {
         let bytes = approval.sign(&self.node.node_id, &key);
         let verified = Approval::verify(&bytes, &self.node.node_id, &self.anchors)
             .map_err(|e| EngineError::Verification(e.to_string()))?;
-        write_atomic(&self.paths.approvals().join(format!("{}.cose", id.digest.hex())), &bytes)?;
-        self.approvals.insert(id, verified);
-        self.log(
+        // See `enroll_baseline`: a file of its own, then the ledger event, then removal of what it supersedes.
+        let file = format!("{}.{}.cose", id.digest.hex(), &Digest::of(&bytes).hex()[..16]);
+        write_atomic(&self.paths.approvals().join(&file), &bytes)?;
+        let previous = self.approvals.insert(id, verified);
+        if let Err(e) = self.log(
             EventKind::Override,
             Some(&id),
             None,
             None,
             vec![Digest::of(&bytes)],
             Basis::ManualOverride,
-            &format!("operator {granted_by} approved {} cell={cell} network={network}", record.name),
-        )?;
+            &format!(
+                "operator {} approved {} cell={cell} network={network}",
+                jlr_model::sanitize_to(granted_by, 100),
+                jlr_model::sanitize_to(&record.name, 100)
+            ),
+        ) {
+            // The new file is left in place; see `enroll_baseline`.
+            match previous {
+                Some(p) => self.approvals.insert(id, p),
+                None => self.approvals.remove(&id),
+            };
+            return Err(e);
+        }
+        remove_superseded(&self.paths.approvals(), &format!("{}.", id.digest.hex()), &file);
         // Re-evaluate with the evidence that is true now.
         let path = self.index.values().find(|r| r.epn == id.to_string()).map(|r| PathBuf::from(&r.path));
         let decision = match path {
@@ -1014,6 +1390,7 @@ impl Engine {
                 let seen = self.seen_from(&obs)?;
                 drop(obs);
                 let d = self.process(&seen, &[])?.decision;
+                self.flush()?;
                 self.save_index()?;
                 d
             }
@@ -1025,6 +1402,23 @@ impl Engine {
 
     /// Adds a revocation, signs the new list and applies it to known artifacts.
     pub fn revoke(&mut self, kind: RevocationKind, target: &str, reason: &str) -> Result<usize, EngineError> {
+        self.revoke_report(kind, target, reason).map(|r| r.moved)
+    }
+
+    /// Like [`Engine::revoke`], and also says how many known artifacts could not be checked because their records
+    /// are missing from the object store, so "nothing matched" is never reported when nothing could be checked.
+    pub fn revoke_report(
+        &mut self,
+        kind: RevocationKind,
+        target: &str,
+        reason: &str,
+    ) -> Result<RevokeReport, EngineError> {
+        // A revocation that names something no artifact can ever match would be signed, ledgered and reported as
+        // done while protecting nothing, so the target is validated and put in the one form the matcher compares.
+        let target = normalize_revocation_target(kind, target)?;
+        let target = target.as_str();
+        let reason = jlr_model::sanitize(reason);
+        let reason = reason.as_str();
         let key = SigningKeypair::load(&self.paths.policy_key())
             .map_err(|e| EngineError::Verification(format!("policy key: {e}")))?;
         let mut list = self.revocations.clone();
@@ -1054,21 +1448,58 @@ impl Engine {
         let ids: Vec<EpnId> =
             self.states.iter().filter(|(_, s)| **s != AdmissionState::Revoked).map(|(i, _)| *i).collect();
         let mut n = 0;
+        let mut unchecked = 0usize;
         for id in ids {
-            let Some(record) = self.load_record(&id) else { continue };
+            let Some(record) = self.load_record(&id) else {
+                // An EPN revocation names the identifier itself, which is known without the record, so the
+                // artifact is revoked even when the object store lost it. Other kinds need the record's fields.
+                if kind == RevocationKind::Epn && id.to_string() == target {
+                    let d = Decision {
+                        state: AdmissionState::Revoked,
+                        cell: CellClass::Cell0,
+                        network: NetworkMode::None,
+                        capabilities: vec![],
+                        reasons: vec![ReasonCode::Revoked],
+                        basis: Basis::Policy,
+                        needs_user: None,
+                        policy: self.policy.digest(),
+                    };
+                    let ev = self.store_evidence(&[])?;
+                    n += self.apply_decision(&id, &d, ev, &format!("revoked: {reason}"))?;
+                } else if kind != RevocationKind::Epn {
+                    // An EPN revocation is decided by the identifier alone, so an artifact whose record is missing
+                    // is not "unchecked" for it: it simply is not the one named.
+                    unchecked += 1;
+                }
+                continue;
+            };
             if self.revocations.hit(&record).is_some() {
                 let d = self.evaluate_now(&record, &[], &[]);
                 let ev = self.store_evidence(&[])?;
                 n += self.apply_decision(&id, &d, ev, &format!("revoked: {reason}"))?;
             }
         }
+        if unchecked > 0 {
+            // The object store is a cache an attacker may have damaged; say so instead of reporting a clean result.
+            self.log(
+                EventKind::Degraded,
+                None,
+                None,
+                None,
+                vec![],
+                Basis::None,
+                &format!("{unchecked} known artifacts could not be checked against the new revocation: their records are missing from the object store"),
+            )?;
+        }
         self.flush()?;
-        Ok(n)
+        Ok(RevokeReport { moved: n, unchecked })
     }
 
     /// Installs a new signed policy. The epoch must be strictly greater than the current one.
     pub fn set_policy(&mut self, new: Policy) -> Result<Digest, EngineError> {
-        new.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
+        // A policy may keep the names the installed policy already carries (the `enforce on|off` toggle does), even
+        // if they predate the alphabet rule; it may not introduce a new one.
+        new.validate_replacing(&self.policy).map_err(|e| EngineError::Invalid(e.to_string()))?;
         if new.epoch <= self.policy.epoch {
             return Err(EngineError::Rollback(format!(
                 "policy epoch {} must be greater than the current epoch {}",
@@ -1143,6 +1574,96 @@ impl Engine {
     }
 }
 
+/// A program that has been measured, decided and sealed, ready to launch without the engine.
+struct PreparedRun {
+    sealed: SealedExe,
+    spec: CellSpec,
+    decision: Decision,
+    id: EpnId,
+    path: String,
+}
+
+#[derive(Clone)]
+struct RunOutcome {
+    report: EnforcementReport,
+    code: i32,
+}
+
+/// Launches a prepared program and waits for it. Needs no engine and no ledger lock.
+#[allow(clippy::type_complexity)]
+fn execute_prepared(
+    helper: &Path,
+    p: &PreparedRun,
+    capture: bool,
+) -> Result<(RunOutcome, Vec<u8>, Vec<u8>), CellError> {
+    let io = if capture { Stdio3::captured() } else { Stdio3::inherit() };
+    let running = launch(helper, &p.sealed, &p.spec, io)?;
+    let report = running.report().clone();
+    let (outcome, stdout, stderr) =
+        if capture { running.wait_with_output()? } else { (running.wait()?, Vec::new(), Vec::new()) };
+    Ok((RunOutcome { report, code: outcome.code }, stdout, stderr))
+}
+
+/// Whether two index rows describe the same state. `measured_at` is ignored: it only moves the age
+/// clock and must not force a whole-index rewrite on every repeat decision.
+/// Whether re-deciding left the persisted row as good as it was, so nothing needs to be written.
+///
+/// Re-measuring moves `measured_at` and pushes `valid_until` out; neither is worth a disk write on every
+/// exec. A stale row on disk is safe because it only ever asks for re-measurement *sooner*. A window that
+/// got **shorter** (a tighter approval, an earlier expiry) is different: persisting a longer one than the
+/// truth would let a restart skip a file that should be re-decided, so that always forces a write.
+fn rows_equivalent(a: Option<&IndexRow>, b: Option<&IndexRow>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            y.valid_until >= x.valid_until
+                && IndexRow { measured_at: 0, valid_until: 0, ..x.clone() }
+                    == IndexRow { measured_at: 0, valid_until: 0, ..y.clone() }
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Validates a revocation target and returns it in the form the matcher compares.
+fn normalize_revocation_target(kind: RevocationKind, target: &str) -> Result<String, EngineError> {
+    let target = target.trim();
+    match kind {
+        RevocationKind::Digest => {
+            let hex = match target.get(..7) {
+                Some(p) if p.eq_ignore_ascii_case("sha256:") => &target[7..],
+                _ => target,
+            };
+            Digest::from_hex(hex).map(|d| d.to_string()).ok_or_else(|| {
+                EngineError::Invalid(format!(
+                    "not a SHA-256 digest (64 hex digits, optionally prefixed sha256:): {}",
+                    jlr_model::sanitize(target)
+                ))
+            })
+        }
+        // Upper-casing accepts `epn-1-exe-<hex>` and upper-case hex; `to_string` puts it in the one form compared.
+        RevocationKind::Epn => EpnId::parse(&target.to_ascii_uppercase())
+            .map(|id| id.to_string())
+            .ok_or_else(|| EngineError::Invalid(format!("not an EPN identifier: {}", jlr_model::sanitize(target)))),
+        RevocationKind::Signer => {
+            if target.is_empty() || target.len() > 256 || jlr_model::sanitize(target) != target {
+                return Err(EngineError::Invalid("a signer identifier must be 1 to 256 printable characters".into()));
+            }
+            Ok(target.to_owned())
+        }
+    }
+}
+
+/// Verifies the ledger of the installation at `paths` **without opening the engine**: no signing key is
+/// loaded, nothing is written, no lock is taken, and it works on read-only storage. This is what an
+/// operator or a recovery environment should use to check a ledger.
+pub fn verify_ledger_at(paths: &Paths, external: Option<&[u8]>) -> Result<jlr_ledger::VerifyReport, EngineError> {
+    let node = NodeInfo::from_cbor(&std::fs::read(paths.node()).map_err(|_| EngineError::NotInitialised)?)
+        .map_err(|e| EngineError::Verification(format!("node record: {e}")))?;
+    let anchors = TrustAnchors::from_cbor(&std::fs::read(paths.anchors())?)
+        .map_err(|e| EngineError::Verification(format!("trust anchors: {e}")))?;
+    Ok(jlr_ledger::verify_dir(&paths.ledger(), &node.node_id, &anchors, external)?)
+}
+
 /// Lists governed files below `roots` in a deterministic order, without touching engine state.
 pub fn list_artifacts(roots: &[PathBuf], opts: &ScanOptions) -> Result<Vec<PathBuf>, EngineError> {
     let mut all = Vec::new();
@@ -1152,6 +1673,19 @@ pub fn list_artifacts(roots: &[PathBuf], opts: &ScanOptions) -> Result<Vec<PathB
         all.extend(walk(root, &wo)?);
     }
     Ok(all)
+}
+
+/// Removes the signed files in `dir` whose names start with `prefix`, except `keep`. Best effort: a file that cannot
+/// be removed is harmless, because only the file the ledger names is honoured, and it is reported once when read.
+fn remove_superseded(dir: &Path, prefix: &str, keep: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) && name.ends_with(".cose") && name != keep {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {

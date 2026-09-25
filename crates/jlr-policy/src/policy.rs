@@ -69,6 +69,24 @@ impl fmt::Display for PolicyError {
 }
 impl std::error::Error for PolicyError {}
 
+/// Which names a policy may carry.
+enum NameRule<'a> {
+    /// A new policy: plain names only.
+    Strict,
+    /// An installed policy: what was accepted before the alphabet rule.
+    Loaded,
+    /// A replacement of an installed policy: plain names, or names the installed policy already carries.
+    Carry(&'a Policy),
+}
+
+/// Names reach the ledger and operator terminals. Keeping them to a plain alphabet means a name can never carry
+/// control characters, line breaks or text that reads like another field (for example `epoch=9`).
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 fn bad<T>(msg: impl Into<String>) -> Result<T, PolicyError> {
     Err(PolicyError(msg.into()))
 }
@@ -86,11 +104,45 @@ impl Policy {
     /// trust it should not. A policy that fails validation must be refused;
     /// the caller must not fall back to a permissive default (I-11).
     pub fn validate(&self) -> Result<(), PolicyError> {
+        self.validate_with(&NameRule::Strict)
+    }
+
+    /// Validation for a policy that replaces `installed` (the `enforce on|off` toggle installs a copy of the current
+    /// policy with one flag changed). Every rule of [`Policy::validate`] applies, except that a policy name or tier
+    /// name that **the installed policy already carries** is accepted even if it predates the alphabet rule, so an
+    /// installation with an older name can still change its own settings. No new non-conforming name can be
+    /// introduced this way.
+    pub fn validate_replacing(&self, installed: &Policy) -> Result<(), PolicyError> {
+        self.validate_with(&NameRule::Carry(installed))
+    }
+
+    /// Validation for a policy that was **already signed and installed**. Every rule of [`Policy::validate`]
+    /// applies except the alphabet of names: policies installed before names were restricted may use spaces and
+    /// punctuation, and refusing to open such an installation would leave the operator unable to replace the
+    /// policy. The name is only ever printed after escaping, so accepting it is safe. New policies still go
+    /// through [`Policy::validate`].
+    pub fn validate_loaded(&self) -> Result<(), PolicyError> {
+        self.validate_with(&NameRule::Loaded)
+    }
+
+    fn validate_with(&self, rule: &NameRule<'_>) -> Result<(), PolicyError> {
+        // Before the alphabet rule a policy name was 1 to 128 bytes and a tier name only had to be non-empty; an
+        // installed policy is held to exactly that, so nothing that loaded before stops loading.
+        let name_ok = |n: &str| match rule {
+            NameRule::Strict => plain_name(n),
+            NameRule::Loaded => !n.is_empty() && n.len() <= 128,
+            NameRule::Carry(old) => plain_name(n) || (n == old.name && !n.is_empty() && n.len() <= 128),
+        };
+        let tier_name_ok = |n: &str| match rule {
+            NameRule::Strict => plain_name(n),
+            NameRule::Loaded => !n.is_empty(),
+            NameRule::Carry(old) => plain_name(n) || (!n.is_empty() && old.tiers.iter().any(|t| t.name == n)),
+        };
         if self.schema != Self::SCHEMA {
             return bad(format!("unsupported schema {}", self.schema));
         }
-        if self.name.is_empty() || self.name.len() > 128 {
-            return bad("name must be 1 to 128 bytes");
+        if !name_ok(&self.name) {
+            return bad("name must be 1 to 128 characters from A-Z a-z 0-9 . _ -");
         }
         if self.epoch == 0 {
             return bad("epoch must be positive");
@@ -110,8 +162,11 @@ impl Policy {
         }
         let mut seen = std::collections::BTreeSet::new();
         for t in &self.tiers {
-            if t.name.is_empty() || !seen.insert(t.name.as_str()) {
-                return bad(format!("tier names must be unique and non-empty: {:?}", t.name));
+            if !tier_name_ok(&t.name) || !seen.insert(t.name.as_str()) {
+                return bad(format!(
+                    "tier names must be unique, 1 to 128 characters from A-Z a-z 0-9 . _ -: {:?}",
+                    jlr_model::sanitize(&t.name)
+                ));
             }
             let grants_run = t.state.permits_normal_execution();
             if grants_run && !t.max_provenance.satisfies(ProvenanceRank::VerifiedChecksum) {

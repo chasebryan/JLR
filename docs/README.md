@@ -33,6 +33,7 @@ This directory is the normative design record. Status of each statement is marke
 16. [DECISIONS.md](DECISIONS.md) - durable decisions and the reconciliation of the two earlier design sets
 17. [IMPLEMENTATION_ROADMAP.md](IMPLEMENTATION_ROADMAP.md) - status and what is next
 18. [GLOSSARY.md](GLOSSARY.md), [REFERENCES.md](REFERENCES.md)
+19. [REVIEW_2026-09.md](REVIEW_2026-09.md) - the adversarial review of the first implementation: every finding and what was done
 
 ## Normative language
 

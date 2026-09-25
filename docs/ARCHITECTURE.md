@@ -203,12 +203,13 @@ them are made durable, and never lets a cache decide anything the ledger has not
 | Policy or revocation epoch lower than one already recorded | Refused as rollback |
 | A baseline or approval fails verification | Ignored, granted nothing, logged as DEGRADED |
 | Ledger event or checkpoint fails verification | Open fails |
-| Ledger has an incomplete final record | Bytes quarantined, repair logged, posture DEGRADED |
+| Ledger has an incomplete final record (events or checkpoints) | Bytes quarantined, repair logged as a DEGRADED event, posture DEGRADED for the process that repaired it (the event stays in the ledger for everyone else) |
 | Mandatory jail control cannot be established | Launch refused; nothing runs |
 | Optional jail control missing (for example cgroup) | Launch proceeds, report says `Partial` and names the control |
 | Gate internal error | Allow and log, unless `--fail-closed` |
 | Boot: manifest, signature, signer role, floor, image digest or size fails | `RECOVERY-RESTRICTED`; nothing from the media runs |
-| Boot: a slot's image fails after its try was spent | Slot marked bad; next slot tried |
+| Boot: a slot's image is proven bad (same mismatch on two reads) | Slot marked bad; next slot tried |
+| Boot: a slot's image cannot be read (I/O error, no memory, reads that disagree) | Slot skipped for this boot, not retired, no try spent |
 
 Availability decisions are explicit and configurable; **missing evidence is never converted into positive trust**.
 

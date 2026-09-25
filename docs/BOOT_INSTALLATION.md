@@ -16,13 +16,17 @@ disk and registers a host. Each is specified below and none is claimed.
 ```mermaid
 flowchart TB
     A["kernel + initramfs<br/>(trust anchors baked in)"] --> B["stage 1 (jlr-init)"]
-    B --> C["find media with /jlr"]
+    B --> C["find every medium with /jlr<br/>(only the pinned one, if pinned);<br/>highest rollback floor applies to all"]
     C --> D["verify each slot's manifest:<br/>signature, release role, floor"]
-    D --> E["choose slot (A/B rules);<br/>spend a try durably"]
+    D --> E["choose slot (A/B rules)"]
     E --> F["read image into a memfd,<br/>hash while copying,<br/>size and digest must match"]
-    F -->|mismatch| G["mark slot bad, try next slot"]
+    F -->|"same mismatch on a second read"| G["retire slot, try next slot"]
+    F -->|"I/O error, no memory,<br/>reads that disagree"| G2["skip slot for this boot only"]
     G --> E
-    F --> H["seal memfd; attach loop device;<br/>mount squashfs read-only"]
+    G2 --> E
+    F -->|verified| S["spend a try durably<br/>(unproven slots only)"]
+    S -->|cannot record| G2
+    S --> H["seal memfd; attach loop device;<br/>mount squashfs read-only"]
     H --> I["release the boot media"]
     I --> J["switch root; exec /sbin/init"]
     J --> K["stage 2: health checks"]
@@ -36,8 +40,10 @@ flowchart TB
 |---|---|---|
 | Trust anchors present and non-empty | initramfs | `REFUSED` |
 | Manifest signature, release role, `epoch >= floor`, `min_epoch <= epoch` | stage 1, per slot | Slot not considered; logged |
-| Boot attempt recorded | stage 1, before the image is used | `REFUSED` (cannot record) |
-| Image size equals the manifest, digest equals the manifest | stage 1, while copying into RAM | Slot marked bad; next slot |
+| Boot state readable | stage 1, per medium | `REFUSED`: any failure other than "the file does not exist" (which is a fresh medium) stops the boot, because guessing would reset the rollback floor. The one exception is a torn `bootstate.cbor.new` with **no** state file beside it, which is a first write cut short and reads as fresh (a `.new` is synced before it replaces anything, so anyone who could plant it could equally have deleted the state file) |
+| Image size equals the manifest, digest equals the manifest | stage 1, while copying into RAM | Read once more; the same wrong answer twice retires the slot for good, a second read that verifies is used, and reads that disagree skip the slot for this boot |
+| Image could be read and RAM allocated | stage 1 | Slot skipped for this boot, **not** retired and **no try spent**: an I/O error or memory exhaustion is not evidence that the slot is bad |
+| Boot attempt recorded | stage 1, after the image verified and before it is sealed, mounted or run | Slot skipped for this boot (a write-protected medium cannot record it); `REFUSED` only if no slot is left |
 | Sealing, loop attach, mount | stage 1 | `REFUSED` |
 | Root is read-only; run is writable and memory-backed; manifest present; tools present | stage 2 | Slot stays unproven |
 
@@ -54,6 +60,27 @@ machine waits (or powers off or reboots, per `jlr.onfail`). The independent reco
 ```
 
 The boot media is ext4 (or vfat or iso9660, read-only) and needs no special handling: nothing on it is trusted until verified.
+Media are mounted read-only and remounted read-write only at the moment state must be written: to record a try or the success
+of a slot that is booting, or to retire a slot that proved bad on that medium (which then may not be the one that boots). No
+other *state* is written. (A read-only mount of an ext4 volume that was not cleanly unmounted still replays its journal
+when the device is writable, so "never modified" would be too strong.) A write-protected medium boots a proven slot; an unproven update needs its "try spent" record
+written first and is skipped there.
+
+**Which disk.** Every attached disk with a `/jlr` tree is examined and the highest rollback floor on any of them applies to
+all, so an extra disk cannot lower it. To go further, pin the initramfs to one medium by its file system identifier (the
+ext4 UUID or the FAT volume serial): `JLR_MEDIA_ID=<id> boot/build.sh` writes `/etc/jlr/media-id` into the initramfs, or
+`jlr.media=uuid=<id>` on the kernel command line does the same when no file is present. A pinned initramfs reads the first
+bytes of each other device to learn its identifier and **never mounts it** (the console lists `examining /dev/… for a /jlr
+tree` for each device it does mount), and it refuses when no attached device carries the pinned identifier. Without a pin
+the console says so at every boot. Pin every real installation, but understand what it is: the identifier is chosen by
+whoever formats the disk and is printed at every boot, so it keeps other disks out of consideration and does not
+authenticate the medium. A cloned identifier with the real medium absent behaves like an unpinned boot, and whoever can write
+the pinned medium can lower its state (SECURITY_BOUNDARIES 9a). Discovery ends when one medium has been found and no new
+device has appeared for a second (five seconds at most), so a disk that enumerates later is not seen.
+
+**State file.** `bootstate.cbor` is replaced through `bootstate.cbor.new`. A missing file beside a complete `.new` is what a
+power cut during a rename on FAT leaves behind, and the `.new` is used, so the floor survives.
+
 The **base image** is a zstd squashfs containing BusyBox, `jlr`, `jlrd`, `jlr-cell-init`, `jlr-release` and `jlr-init` as
 `/sbin/init`, all static musl. The **initramfs** contains `jlr-init` as `/init` and `etc/jlr/anchors.cbor`, the release
 public key(s) the boot will accept.
@@ -64,18 +91,25 @@ The rules follow ChromeOS's slot triple because they need nothing from a possibl
 
 - a slot is bootable if it verified **and** is either `successful` or has `tries > 0`;
 - the bootable slot with the highest `priority` is chosen; ties break by name;
-- before booting an unproven slot, its `tries` is decremented **and written durably**, so a crash or power cut during boot
-  consumes a try and the next boot falls back;
+- after an unproven slot's image has been read and verified, and before it is sealed, mounted or run, its `tries` is
+  decremented **and written durably**, so a crash or power cut during boot consumes a try and the next boot falls back. A
+  read error before that point spends nothing;
 - only after stage 2's health checks does the slot become `successful` and the **floor** rise to the release's
   `min_epoch`. Raising it earlier would let a bad update strand a machine with no bootable slot;
 - installing a new release gives it maximum priority and demotes the previous one, so the update is tried first but the
   previous proven slot stays the fallback;
-- a slot whose image fails is marked bad (priority 0) and is never tried again.
+- a slot whose image is **proven bad** (the same digest or size mismatch on two reads) is marked bad (priority 0) and is
+  never tried again. A read error, an out-of-memory condition, or reads that disagree with each other prove nothing about the
+  slot: it is skipped for that boot and tried again on the next, and no try is spent, because retiring a good slot over one
+  USB hiccup would strand the machine.
 
 Every one of these is a QEMU scenario: valid boot; tampered image; truncated image; tampered manifest; unknown signer;
 right key with the wrong record type; rollback below the floor; a broken update falling back to the proven slot; a good
 update proving itself and raising the floor, after which the old slot is refused as a rollback on the next boot; missing
-media; media without `/jlr`. A companion set of property tests covers the selection function over generated states.
+media; media without `/jlr`; a second disk carrying an older release, attached before and after the real one; a pinned
+initramfs that ignores a newer release on another disk and refuses when the pinned disk is absent; a write-protected
+medium that boots its proven slot and skips an unproven one; and an unreadable state file that stops the boot. A companion
+set of property tests covers the selection function over generated states, and unit tests cover the state file rules.
 
 **Rollback.** A validly signed old release is refused once the floor has risen. That is what stops an attacker reinstalling
 a known-vulnerable signed image.

@@ -98,7 +98,9 @@ never match.
 A policy that breaks any of these is **refused at compile time and again at load**; it is never partially applied and
 never replaced by a default (I-11):
 
-1. schema 1, a name, a positive epoch, between 1 and 64 tiers with unique names;
+1. schema 1, a name, a positive epoch, between 1 and 64 tiers with unique names; the policy name and every tier name are 1 to
+   128 characters from `A-Z a-z 0-9 . _ -`, so a name can never carry a control character, a line break or text that reads
+   like another field (`epoch=9`) into the ledger or a terminal;
 2. the final tier matches everything (all classes, provenance `UNKNOWN`, no required evidence);
 3. a tier that lets software run (`VERIFIED` or `ADMITTED`) requires at least `VERIFIED_CHECKSUM` provenance and at least one
    piece of required evidence, so **unknown software cannot be admitted by policy alone**;
@@ -147,9 +149,21 @@ or everything on disk (`--include-unmanaged`, for an installer whose verified ba
 
 Neither can lift a revocation or a prohibition. Neither survives a content change: the new bytes are a new EPN.
 
+**The ledger says which one is current.** A file in `approvals/` or `baselines/` counts only if its envelope digest is the
+evidence of the latest `OVERRIDE` event for its subject (the EPN, or `baseline:<name>`). A superseded or withdrawn file that
+is copied back still verifies on its signature, and is ignored and reported once. A copy stored under another name cannot
+shadow the current one for the same reason. Approving again with a shorter time or a smaller cell is how an approval is
+narrowed or withdrawn. The signed files are stored as `<artifact digest hex>.<first 16 hex of the file's digest>.cose` (approvals) and
+`<baseline name>.<first 16 hex of the file's digest>.cose` (baselines), so writing a new one
+never overwrites the one the ledger currently records; the ledger event that makes it current comes next, and older files
+are removed only after that. A crash or a full disk in between leaves the old authority in force and the new file ignored
+(and reported once) until the operator repeats the command.
+
 ## 8. Revocation
 
-Signed lists with an epoch that never goes backwards. Entries name an EPN, a content digest (`sha256:...`) or a signer.
+Signed lists with an epoch that never goes backwards. Entries name an EPN, a content digest (`sha256:...`) or a signer, and
+are validated and stored in one canonical form before they are signed, so a target that could never match is refused
+instead of being recorded as done. Signer entries are accepted but match nothing until an adapter records signers.
 Adding one moves every known matching artifact to `REVOKED` immediately and every future observation with it. It is
 terminal until a later signed record supersedes it (a supersession record is designed).
 

@@ -97,6 +97,18 @@ impl BootState {
         }
     }
 
+    /// Records that a slot's image failed to load. Only a failure that proves the content is bad retires the
+    /// slot; a transient failure (I/O error, out of memory) changes nothing and the slot is tried again next
+    /// boot. Returns whether the state changed.
+    pub fn record_image_failure(&mut self, name: &str, why: &BootError) -> bool {
+        if why.proves_bad_content() {
+            self.mark_bad(name);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Records that `name` booted and passed its self-test, and raises the
     /// rollback floor to the release's `min_epoch`.
     pub fn mark_successful(&mut self, name: &str, m: &ReleaseManifest) {

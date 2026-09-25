@@ -7,6 +7,8 @@
 #   other.key          a second release key that is NOT in the anchors (for negative tests)
 #   busybox            static busybox used inside the base image
 #
+# Environment: JLR_MEDIA_ID pins the initramfs to one boot medium; JLR_BOOT_OUT, JLR_BUSYBOX, JLR_VERSION.
+#
 # Requirements: cargo with the x86_64-unknown-linux-musl target, mksquashfs, python3, gzip,
 # and a static busybox (env JLR_BUSYBOX, else busybox-static on PATH, else extracted
 # from the localhost/jlr-buildenv:dev container image).
@@ -51,7 +53,7 @@ echo "==> base root filesystem"
 R="$OUT/rootfs"
 mkdir -p "$R"/{bin,sbin,usr/bin,usr/lib/jlr,etc,dev,proc,sys,run,tmp,mnt,var,lib,lib64}
 cp "$OUT/busybox" "$R/bin/busybox"
-for a in sh ash ls cat echo cp mv rm mkdir mount umount sleep true false id uname env grep sed tr wc head tail dmesg poweroff reboot ps kill test '[' date touch chmod ln readlink find printf df free sort cut wait; do
+for a in sh ash ls cat echo cp mv rm mkdir mount umount sleep true false id uname env grep sed tr wc head tail dmesg poweroff reboot ps kill test '[' date touch chmod ln readlink find printf df free sort cut wait truncate; do
   ln -sf busybox "$R/bin/$a"
 done
 cp "$BIN/jlr-init" "$R/usr/lib/jlr/jlr-init"
@@ -78,6 +80,15 @@ I="$OUT/initramfs"
 mkdir -p "$I"/{etc/jlr,proc,sys,dev,mnt,newroot,run,tmp}
 cp "$BIN/jlr-init" "$I/init"
 cp "$OUT/anchors.cbor" "$I/etc/jlr/anchors.cbor"
+# Optional: pin the initramfs to one boot medium (ext4 UUID or FAT volume serial). A pinned initramfs never
+# mounts any other disk. Example: JLR_MEDIA_ID=6f1b2c3d-0000-4444-8888-123456789abc boot/build.sh
+if [ -n "${JLR_MEDIA_ID:-}" ]; then
+  case "$JLR_MEDIA_ID" in
+    *[!0-9A-Fa-f-]*|"") echo "build.sh: JLR_MEDIA_ID must be an ext4 UUID or FAT volume serial (hex digits and hyphens)" >&2; exit 3 ;;
+  esac
+  [ "${#JLR_MEDIA_ID}" -le 64 ] || { echo "build.sh: JLR_MEDIA_ID is longer than 64 characters" >&2; exit 3; }
+  printf 'uuid=%s\n' "$JLR_MEDIA_ID" > "$I/etc/jlr/media-id"
+fi
 find "$I" -exec touch -h -d @"$SOURCE_DATE_EPOCH" {} +
 python3 "$ROOT/boot/mkcpio.py" "$I" | gzip -n -9 > "$OUT/initramfs.cpio.gz"
 

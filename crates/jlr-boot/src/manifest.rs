@@ -87,6 +87,15 @@ pub enum BootError {
     Io(String),
 }
 
+impl BootError {
+    /// Whether this error proves that the slot's *content* is bad (it will be bad on every boot), as opposed
+    /// to a transient condition such as an I/O error or a lack of memory. Only the former may permanently
+    /// retire a slot; retiring a good slot because a USB stick hiccuped would strand the machine.
+    pub fn proves_bad_content(&self) -> bool {
+        matches!(self, BootError::ImageDigest { .. } | BootError::ImageSize { .. })
+    }
+}
+
 impl fmt::Display for BootError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

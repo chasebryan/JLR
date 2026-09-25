@@ -166,6 +166,11 @@ pub struct OpenReport {
     /// preserved in `events.log.torn.N`, and the caller must record the repair
     /// as an event rather than ignore it.
     pub torn_tail_bytes: u64,
+    /// Bytes of an incomplete final checkpoint that were moved to `checkpoints.log.torn.N`.
+    ///
+    /// The unrepaired tail would otherwise sit between the last whole checkpoint and the next
+    /// one, mis-frame it, and make every later replay fail.
+    pub checkpoint_torn_bytes: u64,
 }
 
 /// Result of read-only verification.
@@ -181,6 +186,9 @@ pub struct VerifyReport {
     pub external_checkpoint_matched: bool,
     /// Bytes of an incomplete final record.
     pub torn_tail_bytes: u64,
+    /// Bytes of an incomplete final checkpoint. Opening the ledger for writing quarantines them; the newest
+    /// checkpoints, which anchor against rollback, may be missing.
+    pub checkpoint_torn_bytes: u64,
     /// Anchors that backed the latest checkpoint.
     pub anchor: Option<Anchor>,
 }
@@ -194,6 +202,8 @@ struct Replayed {
     checkpoints: Vec<Checkpoint>,
     boot_ids: Vec<[u8; 16]>,
     valid_len: u64,
+    cp_torn: u64,
+    cp_valid_len: u64,
 }
 
 /// Size of a frame header: `u32 length || u32 check`.
@@ -267,6 +277,30 @@ fn env_err(seq: u64, what: &str, e: EnvelopeError) -> LedgerError {
     LedgerError::Corrupt { seq, reason: format!("{what}: {e}") }
 }
 
+// Runs between the two reads of `replay` in tests, so a writer can be made to act at exactly that moment.
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_READS: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_between_reads_hook(hook: Option<Box<dyn FnMut()>>) {
+    BETWEEN_READS.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn between_reads() {
+    BETWEEN_READS.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn between_reads() {}
+
 /// Replays a ledger directory.
 ///
 /// With `full`, every event signature is verified. Otherwise events covered by
@@ -276,6 +310,11 @@ fn env_err(seq: u64, what: &str, e: EnvelopeError) -> LedgerError {
 /// checkpoint is always verified in full.
 fn replay(dir: &Path, node: &str, anchors: &TrustAnchors, full: bool) -> Result<Replayed, LedgerError> {
     let origin = format!("jlr/{node}/evidence");
+    // Checkpoints are read BEFORE events. A writer appends an event and only afterwards the checkpoint that commits
+    // to it, so any checkpoint seen here is covered by the events read next, even with a writer running (`jlr
+    // ledger verify` takes no lock). The other order reports a checkpoint appended in between as a truncated ledger.
+    let cp_data = read_all(&dir.join(CHECKPOINTS))?;
+    between_reads();
     let events_data = read_all(&dir.join(EVENTS))?;
     let (frames, valid_len, torn) = split_frames(&events_data)?;
 
@@ -286,8 +325,7 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors, full: bool) -> Result<
     }
 
     // Checkpoints: verify each signature (there are few) and check it against the tree.
-    let cp_data = read_all(&dir.join(CHECKPOINTS))?;
-    let (cp_frames, _, cp_torn) = split_frames(&cp_data)?;
+    let (cp_frames, cp_valid_len, cp_torn) = split_frames(&cp_data)?;
     let mut checkpoints: Vec<Checkpoint> = Vec::new();
     for (i, env) in cp_frames.iter().enumerate() {
         let seq = i as u64;
@@ -317,7 +355,7 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors, full: bool) -> Result<
         }
         checkpoints.push(cp);
     }
-    let _ = cp_torn; // A torn checkpoint tail only loses the newest checkpoint.
+    // A torn checkpoint tail only loses the newest checkpoint; opening for append quarantines and trims it.
 
     // Events at positions below this are covered by a verified checkpoint root.
     let trusted_prefix = if full { 0 } else { checkpoints.last().map_or(0, |c| c.size as usize) };
@@ -372,6 +410,8 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors, full: bool) -> Result<
         checkpoints,
         boot_ids,
         valid_len: valid_len as u64,
+        cp_torn,
+        cp_valid_len: cp_valid_len as u64,
     })
 }
 
@@ -423,6 +463,7 @@ pub fn verify_dir(
         checkpoints: r.checkpoints.len() as u64,
         external_checkpoint_matched: matched,
         torn_tail_bytes: r.torn,
+        checkpoint_torn_bytes: r.cp_torn,
         anchor: r.checkpoints.last().map(|c| c.anchor),
     })
 }
@@ -456,6 +497,9 @@ pub struct Ledger {
     last_checkpoint_size: u64,
     boot_id: [u8; 16],
     sync: bool,
+    /// Set when a failed write could not be rolled back. Anything appended after leftover bytes would be mis-framed,
+    /// so a poisoned ledger refuses every further write until it is reopened (which repairs a torn tail).
+    poisoned: bool,
 }
 
 impl fmt::Debug for Ledger {
@@ -472,13 +516,13 @@ fn open_append(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).read(true).mode(0o600).open(path)
 }
 
-/// Copies the bytes after `valid_len` into a new `events.log.torn.N` file so
+/// Copies the bytes of `name` after `valid_len` into a new `<name>.torn.N` file so
 /// that repairing a torn write never destroys evidence.
-fn quarantine_tail(dir: &Path, valid_len: u64) -> Result<(), LedgerError> {
-    let data = read_all(&dir.join(EVENTS))?;
-    let tail = &data[valid_len as usize..];
+fn quarantine_tail(dir: &Path, name: &str, valid_len: u64) -> Result<(), LedgerError> {
+    let data = read_all(&dir.join(name))?;
+    let tail = &data[(valid_len as usize).min(data.len())..];
     for n in 0..u32::MAX {
-        let path = dir.join(format!("{EVENTS}.torn.{n}"));
+        let path = dir.join(format!("{name}.torn.{n}"));
         match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
             Ok(mut f) => {
                 f.write_all(tail)?;
@@ -527,6 +571,7 @@ impl Ledger {
             last_checkpoint_size: 0,
             boot_id,
             sync: true,
+            poisoned: false,
         };
         l.append(EventDraft::new("jlr-ledger", EventKind::Genesis, &format!("ledger created for node {node}")))?;
         Ok(l)
@@ -560,17 +605,27 @@ impl Ledger {
         let _ = &r.boot_ids;
         let events = open_append(&dir.join(EVENTS))?;
         if r.torn > 0 {
-            quarantine_tail(dir, r.valid_len)?;
+            quarantine_tail(dir, EVENTS, r.valid_len)?;
             events.set_len(r.valid_len)?;
         }
+        let checkpoints = open_append(&dir.join(CHECKPOINTS))?;
+        if r.cp_torn > 0 {
+            quarantine_tail(dir, CHECKPOINTS, r.cp_valid_len)?;
+            checkpoints.set_len(r.cp_valid_len)?;
+        }
         let counter = r.checkpoints.last().map_or(0, |c| c.counter);
-        let report = OpenReport { events: r.events, checkpoints: r.checkpoints.len() as u64, torn_tail_bytes: r.torn };
+        let report = OpenReport {
+            events: r.events,
+            checkpoints: r.checkpoints.len() as u64,
+            torn_tail_bytes: r.torn,
+            checkpoint_torn_bytes: r.cp_torn,
+        };
         let l = Ledger {
             dir: dir.to_owned(),
             node: node.to_owned(),
             key,
             events,
-            checkpoints: open_append(&dir.join(CHECKPOINTS))?,
+            checkpoints,
             _lock: lock,
             tree: r.tree,
             last_env: r.last_env,
@@ -579,6 +634,7 @@ impl Ledger {
             last_checkpoint_size: r.checkpoints.last().map_or(0, |c| c.size),
             boot_id,
             sync: true,
+            poisoned: false,
         };
         Ok((l, report, r.events_parsed))
     }
@@ -586,6 +642,11 @@ impl Ledger {
     /// Disables `fsync` after each append. For tests and bulk import only.
     pub fn set_sync(&mut self, sync: bool) {
         self.sync = sync;
+    }
+
+    /// Whether each append is made durable before it returns (the default).
+    pub fn is_syncing(&self) -> bool {
+        self.sync
     }
 
     /// Flushes appended events to stable storage.
@@ -647,10 +708,7 @@ impl Ledger {
             prev: self.last_env,
         };
         let env = Envelope::sign(record_type::EVENT, &self.node, &ev.to_cbor(), &self.key);
-        self.events.write_all(&frame(&env))?;
-        if self.sync {
-            self.events.sync_data()?;
-        }
+        self.append_checked(true, &frame(&env))?;
         let digest = Digest::of(&env);
         self.tree.push(leaf_hash(&env));
         self.last_env = digest;
@@ -663,29 +721,104 @@ impl Ledger {
     /// The returned bytes are what should be copied to storage outside the
     /// ledger's own failure domain.
     pub fn checkpoint(&mut self) -> Result<Vec<u8>, LedgerError> {
-        self.counter += 1;
+        let counter = self.counter + 1;
         let cp = Checkpoint {
             origin: format!("jlr/{}/evidence", self.node),
             size: self.tree.size() as u64,
             root: self.tree.root(),
             boot_id: self.boot_id,
             wall_time: now(),
-            counter: self.counter,
+            counter,
             anchor: Anchor::Software,
         };
         let env = Envelope::sign(record_type::CHECKPOINT, &self.node, &cp.to_cbor(), &self.key);
-        self.checkpoints.write_all(&frame(&env))?;
-        if self.sync {
-            self.checkpoints.sync_data()?;
-        }
+        self.append_checked(false, &frame(&env))?;
+        self.counter = counter;
         self.last_checkpoint_size = cp.size;
         Ok(env)
+    }
+
+    fn append_checked(&mut self, events: bool, bytes: &[u8]) -> Result<(), LedgerError> {
+        if self.poisoned {
+            return Err(LedgerError::Io(std::io::Error::other(
+                "the ledger refuses writes: an earlier failed write could not be rolled back; reopen it",
+            )));
+        }
+        let file = if events { &mut self.events } else { &mut self.checkpoints };
+        match append_frame(file, bytes, self.sync) {
+            Ok(()) => Ok(()),
+            Err(AppendError::Failed(e)) => Err(LedgerError::Io(e)),
+            Err(AppendError::RollbackFailed { write, rollback }) => {
+                self.poisoned = true;
+                Err(LedgerError::Io(std::io::Error::other(format!(
+                    "append failed ({write}) and could not be rolled back ({rollback}); the ledger refuses further writes"
+                ))))
+            }
+        }
     }
 
     /// Directory this ledger lives in.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+/// Appends one frame. If the write or the sync fails, the file is cut back to its
+/// previous length, so a short write (`ENOSPC`, a signal, a quota) never leaves
+/// bytes that would mis-frame the next record, and the in-memory state, which was
+/// not advanced, still matches the file.
+pub(crate) fn append_frame<S: FrameSink>(sink: &mut S, bytes: &[u8], sync: bool) -> Result<(), AppendError> {
+    let before = sink.len().map_err(AppendError::Failed)?;
+    let result = sink.append(bytes).and_then(|()| if sync { sink.sync() } else { Ok(()) });
+    match result {
+        Ok(()) => Ok(()),
+        Err(write) => match sink.truncate(before) {
+            Ok(()) => Err(AppendError::Failed(write)),
+            // Leaving the partial frame and carrying on would mis-frame every later record.
+            Err(rollback) => Err(AppendError::RollbackFailed { write, rollback }),
+        },
+    }
+}
+
+/// Where frames are appended. A file in production; a fake that fails part-way in tests.
+pub(crate) trait FrameSink {
+    /// Current length.
+    fn len(&mut self) -> std::io::Result<u64>;
+    /// Writes all of `bytes` at the end.
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    /// Makes what was written durable.
+    fn sync(&mut self) -> std::io::Result<()>;
+    /// Cuts the sink back to `len` bytes.
+    fn truncate(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl FrameSink for File {
+    fn len(&mut self) -> std::io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        std::io::Write::write_all(self, bytes)
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.sync_data()
+    }
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+/// Why appending a frame failed.
+#[derive(Debug)]
+pub(crate) enum AppendError {
+    /// The write failed and the sink was restored to its previous length.
+    Failed(std::io::Error),
+    /// The write failed and the sink could NOT be restored.
+    RollbackFailed {
+        /// The original failure.
+        write: std::io::Error,
+        /// The failure to roll back.
+        rollback: std::io::Error,
+    },
 }
 
 fn mono_ns() -> u64 {

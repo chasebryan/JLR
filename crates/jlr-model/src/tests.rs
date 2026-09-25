@@ -240,3 +240,98 @@ fn identity_is_stable_across_observations() {
     assert_eq!(a.id(), b.id());
     assert_eq!(a.to_cbor(), b.to_cbor());
 }
+
+#[test]
+fn sanitize_makes_untrusted_text_one_line_of_visible_characters() {
+    assert_eq!(sanitize("/usr/bin/ls"), "/usr/bin/ls");
+    assert_eq!(sanitize("a\nb"), "a\\u{a}b", "a newline must not be able to start a forged ledger row");
+    assert_eq!(sanitize("x\x1b[2Jy"), "x\\u{1b}[2Jy", "terminal escapes are neutralised");
+    assert_eq!(sanitize("exe\u{202e}gpj.txt"), "exe\\u{202e}gpj.txt");
+    assert_eq!(sanitize("a\u{200b}b"), "a\\u{200b}b");
+    assert_eq!(sanitize("caf\u{e9}"), "caf\u{e9}", "ordinary non-ASCII text is kept");
+    assert_eq!(sanitize("\u{65e5}\u{672c}\u{8a9e}"), "\u{65e5}\u{672c}\u{8a9e}");
+    let long = "a".repeat(5000);
+    assert!(sanitize(&long).len() < 1100 && sanitize(&long).ends_with("[truncated]"));
+    assert!(!sanitize("\r\n\t\0").chars().any(char::is_control));
+}
+
+#[test]
+fn sanitize_also_escapes_separators_and_invisible_characters() {
+    // Line and paragraph separators are not control characters, yet Unicode-aware viewers, Python's splitlines and
+    // JSON consumers treat them as line breaks. The others let text hide or read as something else.
+    for c in [
+        '\u{2028}',
+        '\u{2029}',
+        '\u{85}',
+        '\u{9f}',
+        '\u{34f}',
+        '\u{115f}',
+        '\u{17b4}',
+        '\u{180b}',
+        '\u{2060}',
+        '\u{2800}',
+        '\u{3164}',
+        '\u{fe0f}',
+        '\u{feff}',
+        '\u{ffa0}',
+        '\u{fffc}',
+        '\u{e0041}',
+        '\u{e0100}',
+        '\u{202a}',
+        '\u{2066}',
+    ] {
+        let out = sanitize(&format!("a{c}b"));
+        assert!(!out.contains(c), "U+{:04X} passed through", c as u32);
+        assert!(out.starts_with('a') && out.ends_with('b') && out.contains("\\u{"), "{out:?}");
+    }
+    // Printable text in other scripts, and ordinary punctuation, is untouched.
+    for ok in ["\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}", "\u{5b89}\u{5168}", "a-b_c.d (e) [f] {g}", "\u{1f600}"] {
+        assert_eq!(sanitize(ok), ok);
+    }
+}
+
+#[test]
+fn sanitize_is_idempotent_so_layers_do_not_double_escape() {
+    for s in [
+        "plain",
+        "a\\b",
+        "CN=Doe\\, John",
+        "x\ny",
+        "\u{202e}rtl",
+        "already \\u{a} escaped",
+        "tab\there",
+        &"z".repeat(3000),
+    ] {
+        let once = sanitize(s);
+        assert_eq!(sanitize(&once), once, "{s:?}");
+        assert_eq!(sanitize(&sanitize(&once)), once);
+    }
+    assert_eq!(sanitize("C:\\dir"), "C:\\dir", "a backslash is data, not an escape");
+}
+
+#[test]
+fn sanitize_is_idempotent_when_the_limit_falls_inside_an_escape() {
+    // A hostile character right at the limit: the escape must be written whole or not at all, and the result must be
+    // a fixed point (an earlier version cut the escape in the middle on the second application).
+    for pad in 1000..1030 {
+        for tail in ["xyz", "", "\u{e0041}q", "\n", "\u{202e}\u{202e}\u{202e}"] {
+            let raw = format!("{}\u{e0041}{tail}", "a".repeat(pad));
+            let once = sanitize(&raw);
+            assert_eq!(sanitize(&once), once, "pad {pad}, tail {tail:?}");
+            assert!(!once.contains('\u{e0041}'));
+            assert!(once.len() <= 1024 + "\u{2026}[truncated]".len(), "{}", once.len());
+            // No escape is ever cut in half: every backslash-u is followed by a closing brace before the end.
+            for (k, _) in once.match_indices("\\u{") {
+                assert!(once[k..].contains('}'), "cut escape in {once:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn sanitize_to_bounds_each_field_so_the_fields_after_it_survive() {
+    let hostile_path = "/x/".to_owned() + &"d".repeat(3000);
+    let line = format!("exec gate: denied {}: state QUARANTINED [EVIDENCE_MISSING]", sanitize_to(&hostile_path, 200));
+    assert!(line.ends_with("state QUARANTINED [EVIDENCE_MISSING]"), "{line}");
+    assert!(line.len() < 400);
+}

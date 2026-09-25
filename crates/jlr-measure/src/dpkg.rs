@@ -6,6 +6,7 @@
 //! more. Host root can rewrite it. A verified package signature is a separate
 //! and stronger piece of evidence that this adapter does not claim.
 
+#[cfg(test)]
 use md5::{Digest as _, Md5};
 use std::collections::HashMap;
 use std::fs;
@@ -310,21 +311,4 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 pub fn md5_hex(data: &[u8]) -> String {
     Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// MD5 of an open file's contents, read from its start.
-pub fn md5_file(file: &mut fs::File) -> std::io::Result<String> {
-    use std::io::{Seek, SeekFrom};
-    file.seek(SeekFrom::Start(0))?;
-    let mut h = Md5::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    file.seek(SeekFrom::Start(0))?;
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }

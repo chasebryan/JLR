@@ -403,3 +403,157 @@ fn opening_verifies_only_the_events_since_the_last_checkpoint() {
     let (l, _) = Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).unwrap();
     assert_eq!(l.events_since_checkpoint(), 3, "the checkpoint position survives a reopen");
 }
+
+#[test]
+fn a_torn_checkpoint_tail_is_quarantined_and_does_not_brick_the_ledger() {
+    let (dir, mut l) = fresh(3);
+    l.checkpoint().unwrap();
+    drop(l);
+    let cps = path(&dir).join("checkpoints.log");
+    let whole = fs::read(&cps).unwrap();
+    // A crash mid-append: a valid header announcing 200 bytes, of which 30 arrived.
+    let mut partial = crate::store::frame_header(200).to_vec();
+    partial.extend_from_slice(&[0xab; 30]);
+    let mut torn = whole.clone();
+    torn.extend_from_slice(&partial);
+    fs::write(&cps, &torn).unwrap();
+
+    let (mut l, rep) = Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).unwrap();
+    assert_eq!(rep.checkpoint_torn_bytes, partial.len() as u64);
+    assert_eq!(fs::read(&cps).unwrap(), whole, "the log is cut back to the last whole checkpoint");
+    assert_eq!(fs::read(path(&dir).join("checkpoints.log.torn.0")).unwrap(), partial, "and the bytes are kept");
+
+    // Before the fix the next checkpoint was appended after the garbage and every later open failed.
+    l.checkpoint().unwrap();
+    l.append(EventDraft::new("test", EventKind::Discover, "after repair")).unwrap();
+    l.checkpoint().unwrap();
+    drop(l);
+    let r = verify_dir(&path(&dir), NODE, &anchors(), None).unwrap();
+    assert_eq!(r.checkpoints, 3);
+    assert!(Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).is_ok());
+}
+
+/// A sink that accepts `limit` bytes and then fails, as a full disk or a quota does part-way through a frame.
+struct Failing {
+    data: Vec<u8>,
+    limit: usize,
+    truncate_fails: bool,
+}
+
+impl crate::store::FrameSink for Failing {
+    fn len(&mut self) -> std::io::Result<u64> {
+        Ok(self.data.len() as u64)
+    }
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let room = self.limit.saturating_sub(self.data.len());
+        let n = room.min(bytes.len());
+        self.data.extend_from_slice(&bytes[..n]);
+        if n < bytes.len() { Err(std::io::Error::other("no space left on device")) } else { Ok(()) }
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        if self.truncate_fails {
+            return Err(std::io::Error::other("input/output error"));
+        }
+        self.data.truncate(len as usize);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failed_append_leaves_no_bytes_behind() {
+    use crate::store::{AppendError, append_frame};
+    // Room for 6 of the 9 bytes: a genuine partial write, not a write that fails before writing anything.
+    let mut sink = Failing { data: b"good".to_vec(), limit: 4 + 6, truncate_fails: false };
+    let r = append_frame(&mut sink, b"123456789", false);
+    assert!(matches!(r, Err(AppendError::Failed(_))), "{r:?}");
+    assert_eq!(sink.data, b"good", "the six bytes that were written must be taken back");
+
+    // A frame that fits is written whole.
+    let mut sink = Failing { data: b"good".to_vec(), limit: 100, truncate_fails: false };
+    append_frame(&mut sink, b"+more", true).unwrap();
+    assert_eq!(sink.data, b"good+more");
+
+    // A real file: the same guarantee through the production implementation.
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f");
+    let mut file = fs::OpenOptions::new().create(true).append(true).read(true).open(&f).unwrap();
+    append_frame(&mut file, b"good", true).unwrap();
+    append_frame(&mut file, b"+more", true).unwrap();
+    assert_eq!(fs::read(&f).unwrap(), b"good+more");
+}
+
+#[test]
+fn a_write_that_cannot_be_rolled_back_is_reported_so_the_ledger_can_stop() {
+    use crate::store::{AppendError, append_frame};
+    let mut sink = Failing { data: b"good".to_vec(), limit: 4 + 3, truncate_fails: true };
+    let r = append_frame(&mut sink, b"123456789", false);
+    assert!(matches!(r, Err(AppendError::RollbackFailed { .. })), "{r:?}");
+    assert_eq!(sink.data, b"good123", "the leftover is exactly what a failed rollback leaves behind");
+}
+
+#[test]
+fn a_checkpoint_written_between_the_two_reads_is_covered_by_the_events_read_afterwards() {
+    // Deterministic: the writer acts at exactly the moment between `replay`'s two reads. With events read first, the
+    // checkpoint it writes commits to more events than were read and verification reports a truncated ledger.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let dir = tempfile::tempdir().unwrap();
+    let mut l = Ledger::create(&path(&dir), NODE, key(), BOOT).unwrap();
+    l.append(EventDraft::new("test", EventKind::Discover, "before")).unwrap();
+    l.checkpoint().unwrap();
+    let writer = Rc::new(RefCell::new(l));
+    let fired = Rc::new(RefCell::new(0u32));
+    let (w, f) = (writer.clone(), fired.clone());
+    crate::store::set_between_reads_hook(Some(Box::new(move || {
+        *f.borrow_mut() += 1;
+        let mut l = w.borrow_mut();
+        l.append(EventDraft::new("test", EventKind::Discover, "during")).unwrap();
+        l.checkpoint().unwrap();
+    })));
+    let r = verify_dir(&path(&dir), NODE, &anchors(), None);
+    crate::store::set_between_reads_hook(None);
+    assert_eq!(*fired.borrow(), 1, "the hook must run between the reads");
+    let r = r.expect("a checkpoint written between the reads must not read as a truncated ledger");
+    assert!(r.events >= 2, "the events read afterwards include the new event: {r:?}");
+}
+
+#[test]
+fn a_reader_that_takes_no_lock_never_sees_a_checkpoint_the_events_do_not_cover() {
+    // A stress companion of the deterministic test above: it only fails occasionally with the old read order.
+    // `jlr ledger verify` runs beside the daemon. A checkpoint written between reading the events and reading the
+    // checkpoints used to be reported as a truncated ledger.
+    let dir = tempfile::tempdir().unwrap();
+    let mut l = Ledger::create(&path(&dir), NODE, key(), BOOT).unwrap();
+    l.set_sync(false); // fast enough that a checkpoint lands in the reader's window often
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d = path(&dir);
+    let reader_stop = stop.clone();
+    let reader = std::thread::spawn(move || {
+        let (mut ok, mut bad) = (0u32, Vec::new());
+        while !reader_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            match verify_dir(&d, NODE, &anchors(), None) {
+                Ok(_) => ok += 1,
+                Err(e) => bad.push(e.to_string()),
+            }
+        }
+        (ok, bad)
+    });
+    for i in 0..3000 {
+        l.append(EventDraft::new("test", EventKind::Discover, &format!("event {i}"))).unwrap();
+        if i % 2 == 0 {
+            l.checkpoint().unwrap();
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (ok, bad) = reader.join().unwrap();
+    assert!(ok > 0, "the reader never completed a verification");
+    assert!(
+        bad.is_empty(),
+        "verification beside a live writer failed {} times: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(3)]
+    );
+}

@@ -94,7 +94,7 @@ Start with the [documentation index](docs/README.md). Highlights:
 - [Overview](docs/OVERVIEW.md) · [Architecture](docs/ARCHITECTURE.md) · [Trust model](docs/TRUST_MODEL.md)
 - [Integrity protocol](docs/INTEGRITY_PROTOCOL.md) (wire formats, with [test vectors](docs/vectors/protocol-v1.json))
 - [Software admission](docs/SOFTWARE_ADMISSION.md) · [Jail model](docs/JAIL_MODEL.md) · [Boot and installation](docs/BOOT_INSTALLATION.md) · [Recovery](docs/RECOVERY.md)
-- [Threat model](docs/THREAT_MODEL.md) · [Security invariants](docs/SECURITY_INVARIANTS.md) · [Security boundaries and claims](docs/SECURITY_BOUNDARIES.md)
+- [Threat model](docs/THREAT_MODEL.md) · [Security invariants](docs/SECURITY_INVARIANTS.md) · [Security boundaries and claims](docs/SECURITY_BOUNDARIES.md) · [Adversarial review record](docs/REVIEW_2026-09.md)
 - [Operations](docs/OPERATIONS.md) · [Command reference](docs/CLI_REFERENCE.md) · [Development](docs/DEVELOPMENT.md)
 - [Decisions](docs/DECISIONS.md) · [Roadmap](docs/IMPLEMENTATION_ROADMAP.md) · [Glossary](docs/GLOSSARY.md) · [References](docs/REFERENCES.md)
 - [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)

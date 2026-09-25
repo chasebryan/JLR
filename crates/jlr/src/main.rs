@@ -216,7 +216,12 @@ fn run(cli: Cli) -> Result<u8, String> {
             println!("node        {}", s.node_id);
             println!("assurance   {}   (what this report can honestly claim)", s.assurance);
             println!("posture     {}   scope: {}", s.posture, s.scope);
-            println!("policy      {} epoch {}  {}", s.policy_name, s.policy_epoch, s.policy_digest);
+            println!(
+                "policy      {} epoch {}  {}",
+                jlr_model::sanitize(&s.policy_name),
+                s.policy_epoch,
+                s.policy_digest
+            );
             println!(
                 "exec gate   {}",
                 if s.enforce_exec {
@@ -257,36 +262,58 @@ fn run(cli: Cli) -> Result<u8, String> {
             let states: Vec<String> = r.by_state.iter().map(|(k, v)| format!("{k}={v}")).collect();
             println!("results       {}", states.join("  "));
             for p in &r.degraded {
-                println!("DEGRADED      {} changed after it was trusted", p.display());
+                println!(
+                    "DEGRADED      {} changed after it was trusted",
+                    jlr_model::sanitize(&p.display().to_string())
+                );
             }
             for (p, err) in r.errors.iter().take(5) {
-                println!("unreadable    {}: {err}", p.display());
+                println!(
+                    "unreadable    {}: {}",
+                    jlr_model::sanitize(&p.display().to_string()),
+                    jlr_model::sanitize(err)
+                );
             }
             if r.errors.len() > 5 {
                 println!("              ... and {} more", r.errors.len() - 5);
             }
-            Ok(u8::from(!r.degraded.is_empty()))
+            // 1 = something trusted changed; 3 = the scan could not look at everything, so "clean" would be a lie.
+            Ok(if !r.degraded.is_empty() {
+                1
+            } else if r.errors.is_empty() {
+                0
+            } else {
+                3
+            })
         }
         Cmd::Explain { path } => {
             let eng = open(&cli).map_err(e)?;
             let x = eng.explain(path).map_err(e)?;
             println!("{}", x.record.id());
             println!("  class       {}   size {}   sha256 {}", x.record.class, x.record.size, x.record.digest.hex());
-            println!("  source      {} {}", x.record.source.channel, x.record.source.origin.as_deref().unwrap_or(""));
+            println!(
+                "  source      {} {}",
+                jlr_model::sanitize(&x.record.source.channel),
+                jlr_model::sanitize(x.record.source.origin.as_deref().unwrap_or(""))
+            );
             println!("  provenance  {}", x.record.provenance);
             println!("  recorded    {}", x.prior.map_or("never seen".to_owned(), |s| s.to_string()));
             println!("  decision    {}", describe(&x.decision));
             println!("  evidence:");
             for i in &x.evidence {
-                println!("    {:<24} {:<8} {}", i.kind.to_string(), i.source, i.detail);
+                println!(
+                    "    {:<24} {:<8} {}",
+                    i.kind.to_string(),
+                    jlr_model::sanitize(&i.source),
+                    jlr_model::sanitize(&i.detail)
+                );
             }
             if let Some(q) = &x.decision.needs_user {
-                println!("  needs you   {q}");
+                println!("  needs you   {}", jlr_model::sanitize(q));
             }
             Ok(0)
         }
         Cmd::Run { caps, command } => {
-            let mut eng = open(&cli).map_err(e)?;
             let requested = caps_of(caps)?;
             let env: Vec<String> = ["PATH", "HOME", "LANG", "TERM"]
                 .iter()
@@ -299,7 +326,9 @@ fn run(cli: Cli) -> Result<u8, String> {
                 which(&command[0]).ok_or_else(|| format!("{} not found in PATH", command[0]))?
             };
             let path = std::fs::canonicalize(&path).map_err(|x| x.to_string())?;
-            match eng.run(&path, &command[1..], &env, &requested, false) {
+            let paths = cli.state.clone().map_or_else(Paths::default_location, Paths::new);
+            // The ledger is held only to measure and record, never while the program runs.
+            match Engine::run_detached(paths, Config::default(), &path, &command[1..], &env, &requested, false) {
                 Ok(r) => {
                     eprintln!(
                         "jlr: {} enforcement={:?} unavailable=[{}]",
@@ -307,13 +336,22 @@ fn run(cli: Cli) -> Result<u8, String> {
                         r.report.status,
                         r.report.unavailable.join("; ")
                     );
+                    if let Some(why) = &r.record_error {
+                        eprintln!(
+                            "jlr: warning: the program ran, but its end could not be recorded in the ledger: {}",
+                            jlr_model::sanitize(why)
+                        );
+                    }
                     Ok(r.exit_code.clamp(0, 255) as u8)
                 }
                 Err(EngineError::NotRunnable(d)) => {
                     eprintln!("jlr: denied: {}", describe(&d));
                     if let Some(q) = &d.needs_user {
-                        eprintln!("jlr: {q}");
-                        eprintln!("jlr: to allow it: jlr explain {} ; jlr approve <EPN>", path.display());
+                        eprintln!("jlr: {}", jlr_model::sanitize(q));
+                        eprintln!(
+                            "jlr: to allow it: jlr explain {} ; jlr approve <EPN>",
+                            jlr_model::sanitize(&path.display().to_string())
+                        );
                     }
                     Ok(126)
                 }
@@ -365,8 +403,24 @@ fn run(cli: Cli) -> Result<u8, String> {
                 (None, None, Some(p)) => (RevocationKind::Epn, p.clone()),
                 _ => return Err("give exactly one of --digest, --signer or --epn".into()),
             };
-            let n = eng.revoke(kind, &target, &a.reason).map_err(e)?;
-            println!("revoked {target}; {n} known artifacts moved to REVOKED");
+            let r = eng.revoke_report(kind, &target, &a.reason).map_err(e)?;
+            let n = r.moved;
+            println!("revoked {}; {n} known artifacts moved to REVOKED", jlr_model::sanitize(target.trim()));
+            if r.unchecked > 0 {
+                println!(
+                    "warning: {} known artifacts could not be checked against this entry because their records are missing from the object store; they were NOT cleared. Run `jlr scan --full` to re-measure them",
+                    r.unchecked
+                );
+            }
+            if kind == RevocationKind::Signer {
+                println!(
+                    "note: no source adapter records a signer identity yet, so a signer revocation matches nothing today. \
+                     Revoke the digests or EPNs you know are affected as well."
+                );
+            }
+            if n == 0 && r.unchecked == 0 {
+                println!("note: nothing known to this installation matched; the entry still blocks a match in future");
+            }
             Ok(0)
         }
         Cmd::Policy { cmd: PolicyCmd::Show } => {
@@ -393,33 +447,46 @@ fn run(cli: Cli) -> Result<u8, String> {
             println!("exec gate enforcement {mode}: policy epoch {epoch} {digest}");
             Ok(0)
         }
+        Cmd::Ledger { cmd: LedgerCmd::Verify { checkpoint } } => {
+            // Read-only: no signing key is loaded, no lock is taken, and nothing is written, so this also
+            // works on read-only storage and from a recovery environment.
+            let paths = cli.state.clone().map_or_else(Paths::default_location, Paths::new);
+            let ext = checkpoint
+                .as_ref()
+                .map(|p| std::fs::read(p).map_err(|x| format!("{}: {x}", p.display())))
+                .transpose()?;
+            let r = jlr_engine::verify_ledger_at(&paths, ext.as_deref()).map_err(e)?;
+            println!("ledger OK: {} events, {} checkpoints, root {}", r.events, r.checkpoints, r.root);
+            println!(
+                "anchor: {}",
+                match r.anchor {
+                    Some(a) => format!("{a:?} counter (not hardware-backed unless TPM)"),
+                    None => "no checkpoint yet".into(),
+                }
+            );
+            println!(
+                "external checkpoint: {}",
+                if r.external_checkpoint_matched {
+                    "matched"
+                } else {
+                    "none supplied; rollback of this whole directory would not be detected"
+                }
+            );
+            if r.torn_tail_bytes > 0 {
+                println!("warning: {} bytes of an incomplete final record are present", r.torn_tail_bytes);
+            }
+            if r.checkpoint_torn_bytes > 0 {
+                println!(
+                    "warning: {} bytes of an incomplete final checkpoint are present; the newest checkpoints may be missing",
+                    r.checkpoint_torn_bytes
+                );
+            }
+            Ok(0)
+        }
         Cmd::Ledger { cmd } => {
             let mut eng = open(&cli).map_err(e)?;
             match cmd {
-                LedgerCmd::Verify { checkpoint } => {
-                    let ext = checkpoint
-                        .as_ref()
-                        .map(|p| std::fs::read(p).map_err(|x| format!("{}: {x}", p.display())))
-                        .transpose()?;
-                    let r = eng.verify_ledger(ext.as_deref()).map_err(e)?;
-                    println!("ledger OK: {} events, {} checkpoints, root {}", r.events, r.checkpoints, r.root);
-                    println!(
-                        "anchor: {}",
-                        match r.anchor {
-                            Some(a) => format!("{a:?} counter (not hardware-backed unless TPM)"),
-                            None => "no checkpoint yet".into(),
-                        }
-                    );
-                    println!(
-                        "external checkpoint: {}",
-                        if r.external_checkpoint_matched {
-                            "matched"
-                        } else {
-                            "none supplied; rollback of this whole directory would not be detected"
-                        }
-                    );
-                    Ok(0)
-                }
+                LedgerCmd::Verify { .. } => unreachable!("handled above without opening the engine"),
                 LedgerCmd::Log { n } => {
                     for ev in eng.recent_events(*n).map_err(e)? {
                         let t = match (ev.old_state, ev.new_state) {
@@ -427,7 +494,8 @@ fn run(cli: Cli) -> Result<u8, String> {
                             (None, Some(n)) => format!("->{n}"),
                             _ => String::new(),
                         };
-                        let subj = ev.subject.as_deref().map(|s| &s[..s.len().min(24)]).unwrap_or("");
+                        let subj =
+                            ev.subject.as_deref().map(|s| s.chars().take(24).collect::<String>()).unwrap_or_default();
                         println!(
                             "{:>6} {:<11} {:<24} {:<26} {:<14} {}",
                             ev.seq,
@@ -435,7 +503,7 @@ fn run(cli: Cli) -> Result<u8, String> {
                             subj,
                             t,
                             ev.basis.to_string(),
-                            ev.detail
+                            jlr_model::sanitize(&ev.detail)
                         );
                     }
                     Ok(0)

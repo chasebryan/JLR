@@ -9,11 +9,11 @@ explainability, performance, convenience.
 | Phase | Deliverable | Status | Evidence |
 |---|---|---|---|
 | 0 Reproducible baseline | Toolchain pinned, SBOM path, EPN/event/policy schemas, deterministic fixtures, reproducible image recipe | **Done**, SBOM pending | `rust-toolchain.toml`, [protocol vectors](vectors/protocol-v1.json), `boot/build.sh` builds identical artifacts twice |
-| 1 Bootable governance core | Immutable base, RAM boot, A/B slots, manifest verification, offline key workflow, CLI status | **Done (prototype anchor)** | 13 QEMU boots: refusals for every failure class, fallback, upgrade, rollback |
+| 1 Bootable governance core | Immutable base, RAM boot, A/B slots, manifest verification, offline key workflow, CLI status | **Done (prototype anchor)** | 19 QEMU tests: refusals for every failure class, fallback, upgrade, rollback, several and pinned media, write-protected media, unreadable state |
 | 2 Measurement | Descriptor hashing, classification, package inventory, EPN assignment, evidence store, chained events | **Done for files** | Mutation of a protected executable is detected and recorded; ledger replay validates. Processes, modules, listeners: designed |
 | 3 Admission and quarantine | State machine, deterministic policy engine, capability model, approvals, baselines, revocation | **Done** | Property tests; mutation-checked; approvals distinguishable from cryptographic verification |
-| 4 Jail fabric | Namespaces, private root, seccomp, Landlock, caps, cgroup, rlimits, enforcement report | **Done for CELL-0/1/2** | Real-cell tests for filesystem, network, syscalls, privileges, PID visibility, sealed exec |
-| 4b Continuous enforcement | Exec gate with audit and enforce modes, rescan, state watcher | **Done** | QEMU guest: audit, enforce, tamper, confined run, daemon stop |
+| 4 Jail fabric | Namespaces, private root, seccomp, Landlock, caps, cgroup, rlimits, enforcement report | **Done for CELL-0/1/2** | Real-cell tests for filesystem, network, syscalls, privileges, PID visibility, sealed exec, inherited descriptors, terminals, kernel log, allow-listed ports |
+| 4b Continuous enforcement | Exec gate with audit and enforce modes, rescan, state watcher | **Done** | QEMU guest: audit, enforce, tamper, unmeasurable file, later mount, confined run, daemon stop |
 | 5 JLR-first installation | Installer, partition planner, host handoff, measured host launch, protected JLR partitions | **Designed** | Boot chain exists; installer does not |
 | 6 Recovery maturity | Read-only inspect, export, restore, boot repair, key rotation, evidence bundle | **Designed** | A/B fallback and ledger verification exist |
 | 7 Advanced | Behaviour baselining, remote attestation, reproducible package rebuilds, VM cells, fleet policy | **Designed** | n/a |

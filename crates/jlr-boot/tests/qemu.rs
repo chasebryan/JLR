@@ -141,7 +141,19 @@ fn flip(mut v: Vec<u8>, at: usize) -> Vec<u8> {
 }
 
 fn build_disk(env: &Env, dir: &Path, slots: &[Slot], state: Option<&BootState>) -> PathBuf {
-    let tree = dir.join("disk-tree");
+    build_named_disk(env, dir, "disk", slots, state, None)
+}
+
+/// Like [`build_disk`], for tests that attach several disks; `uuid` fixes the ext4 file system UUID.
+fn build_named_disk(
+    env: &Env,
+    dir: &Path,
+    name: &str,
+    slots: &[Slot],
+    state: Option<&BootState>,
+    uuid: Option<&str>,
+) -> PathBuf {
+    let tree = dir.join(format!("{name}-tree"));
     for s in slots {
         let d = tree.join(format!("jlr/slot-{}", s.name));
         fs::create_dir_all(&d).unwrap();
@@ -152,14 +164,13 @@ fn build_disk(env: &Env, dir: &Path, slots: &[Slot], state: Option<&BootState>) 
     if let Some(st) = state {
         fs::write(tree.join("jlr/bootstate.cbor"), st.to_cbor()).unwrap();
     }
-    let img = dir.join("disk.img");
-    let st = Command::new(&env.mke2fs)
-        .args(["-q", "-t", "ext4", "-F", "-d"])
-        .arg(&tree)
-        .arg(&img)
-        .arg("48M")
-        .status()
-        .unwrap();
+    let img = dir.join(format!("{name}.img"));
+    let mut mk = Command::new(&env.mke2fs);
+    mk.args(["-q", "-t", "ext4", "-F"]);
+    if let Some(u) = uuid {
+        mk.args(["-U", u]);
+    }
+    let st = mk.arg("-d").arg(&tree).arg(&img).arg("48M").status().unwrap();
     assert!(st.success(), "mke2fs failed");
     img
 }
@@ -187,6 +198,12 @@ impl Boot {
 }
 
 fn boot(env: &Env, disk: Option<&Path>, extra: &str) -> Boot {
+    let disks: Vec<(&Path, bool)> = disk.into_iter().map(|d| (d, false)).collect();
+    boot_disks(env, &disks, extra)
+}
+
+/// Boots with any number of virtio disks, each optionally attached write-protected.
+fn boot_disks(env: &Env, disks: &[(&Path, bool)], extra: &str) -> Boot {
     let kvm = fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
     let mut cmd = Command::new(&env.qemu);
     if let Some(d) = &env.qemu_data {
@@ -200,8 +217,9 @@ fn boot(env: &Env, disk: Option<&Path>, extra: &str) -> Boot {
     cmd.args(["-m", "1024", "-smp", "2", "-nographic", "-no-reboot", "-nic", "none"]);
     cmd.arg("-kernel").arg(&env.kernel).arg("-initrd").arg(env.out.join("initramfs.cpio.gz"));
     cmd.arg("-append").arg(format!("console=ttyS0 panic=-1 loglevel=1 jlr.onfail=poweroff jlr.test=poweroff {extra}"));
-    if let Some(d) = disk {
-        cmd.arg("-drive").arg(format!("file={},format=raw,if=virtio", d.display()));
+    for (d, read_only) in disks {
+        let ro = if *read_only { ",readonly=on" } else { "" };
+        cmd.arg("-drive").arg(format!("file={},format=raw,if=virtio{ro}", d.display()));
     }
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).spawn().unwrap();
     let mut stdout = child.stdout.take().unwrap();
@@ -381,7 +399,7 @@ fn a_broken_update_falls_back_to_the_proven_slot() {
     let disk = build_disk(&env, dir.path(), &[a, b_slot], Some(&state));
     let b = boot(&env, Some(&disk), "");
     assert!(!b.timed_out, "{}", b.dump());
-    let sel_b = b.pos("selected slot=b").expect("B is tried first");
+    let sel_b = b.pos("trying slot=b").expect("B is tried first");
     let bad_b = b.pos("slot=b REFUSED image").expect("B's image is refused");
     let sel_a = b.pos("selected slot=a").expect("then A is selected");
     assert!(sel_b < bad_b && bad_b < sel_a, "{}", b.dump());
@@ -492,6 +510,11 @@ fn the_exec_gate_audits_then_enforces_and_notices_tampering_under_a_real_kernel(
         "GUEST: enforce stranger: BLOCKED",
         "GUEST: enforce stranger2: BLOCKED",
         "GUEST: enforce system tool: ran",
+        // A file the gate cannot measure is denied, and so is anything on a file system mounted later.
+        "GUEST: enforce unmeasurable: BLOCKED",
+        "GUEST: late mount stranger: BLOCKED",
+        "GUEST: remounted stranger: BLOCKED",
+        "GUEST: odd name stranger: BLOCKED",
         // Tampering with an enrolled binary revokes its standing.
         "GUEST: tampered known: BLOCKED",
         // A blocked program can still run, confined.
@@ -511,4 +534,182 @@ fn the_exec_gate_audits_then_enforces_and_notices_tampering_under_a_real_kernel(
         }
     }
     assert!(b.has("Operation not permitted"), "a denied exec must fail with EPERM:\n{}", b.dump());
+}
+
+// ---- adversarial-review follow-ups: several media, read-only media, transient failures ----------------------
+
+/// A state with slot `a` proven at the given floor.
+fn proven_state(floor: u64) -> BootState {
+    BootState { floor, slots: vec![SlotState { name: "a".into(), priority: 15, tries: 0, successful: true }] }
+}
+
+fn file_digest(p: &Path) -> Digest {
+    Digest::of(&fs::read(p).unwrap())
+}
+
+#[test]
+fn filesystem_ids_agree_with_what_mke2fs_writes() {
+    let Some(env) = env() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = "6f1b2c3d-0000-4444-8888-123456789abc";
+    let disk = build_named_disk(&env, dir.path(), "id", &[good_slot(&env, "a", 1)], None, Some(uuid));
+    let head = fs::read(&disk).unwrap();
+    assert_eq!(jlr_boot::media::filesystem_id(&head[..jlr_boot::media::HEAD_LEN]).as_deref(), Some(uuid));
+}
+
+#[test]
+fn a_second_disk_with_an_older_release_cannot_downgrade_the_machine() {
+    let Some(env) = env() else { return };
+    // The real medium has proven epoch 2 (floor 2). The other disk carries a validly signed but older public
+    // release with no state file, which reads as floor zero when looked at on its own.
+    for attacker_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let real = build_named_disk(&env, dir.path(), "real", &[good_slot(&env, "a", 2)], Some(&proven_state(2)), None);
+        let old = build_named_disk(&env, dir.path(), "old", &[good_slot(&env, "a", 1)], None, None);
+        let old_before = file_digest(&old);
+        let disks: Vec<(&Path, bool)> =
+            if attacker_first { vec![(&old, false), (&real, false)] } else { vec![(&real, false), (&old, false)] };
+        let b = boot_disks(&env, &disks, "");
+        assert!(!b.timed_out, "{}", b.dump());
+        assert!(
+            b.has("selected slot=a epoch=2"),
+            "the current release must boot (attacker first: {attacker_first}):\n{}",
+            b.dump()
+        );
+        assert!(!b.has("selected slot=a epoch=1"), "an older release booted:\n{}", b.dump());
+        assert!(b.has("media=2 rollback floor=2"), "the highest floor on any medium applies:\n{}", b.dump());
+        assert!(b.has("examining /dev/vda") && b.has("examining /dev/vdb"), "unpinned, every disk is looked at");
+        if attacker_first {
+            // The old disk is looked at first and refused on the floor learned from the other one.
+            assert!(b.has("slot=a REFUSED rollback"), "the old release is refused as a rollback:\n{}", b.dump());
+        }
+        assert!(b.has("JLR-STAGE2: ready"), "{}", b.dump());
+        assert_eq!(file_digest(&old), old_before, "a disk that held nothing bootable must not be written to");
+    }
+}
+
+#[test]
+fn an_unpinned_boot_says_so_in_the_log() {
+    let Some(env) = env() else { return };
+    // With no real medium attached there is no floor to consult: this is the residual risk the pin removes, and
+    // it must still be visible in the log rather than silent.
+    let dir = tempfile::tempdir().unwrap();
+    let old = build_named_disk(&env, dir.path(), "old", &[good_slot(&env, "a", 1)], None, None);
+    let b = boot(&env, Some(&old), "");
+    assert!(b.has("boot media is not pinned"), "the unpinned state must be announced:\n{}", b.dump());
+}
+
+#[test]
+fn a_pinned_boot_never_uses_or_mounts_another_disk() {
+    let Some(env) = env() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let real_uuid = "6f1b2c3d-0000-4444-8888-123456789abc";
+    let real =
+        build_named_disk(&env, dir.path(), "real", &[good_slot(&env, "a", 2)], Some(&proven_state(2)), Some(real_uuid));
+    let other = build_named_disk(
+        &env,
+        dir.path(),
+        "other",
+        &[good_slot(&env, "a", 3)],
+        None,
+        Some("11111111-2222-3333-4444-555555555555"),
+    );
+    let other_before = file_digest(&other);
+    let b = boot_disks(&env, &[(&other, false), (&real, false)], &format!("jlr.media=uuid={real_uuid}"));
+    assert!(!b.timed_out, "{}", b.dump());
+    assert!(b.has(&format!("boot media is pinned to id={real_uuid}")), "{}", b.dump());
+    assert!(b.has("ignoring /dev/vda: not the pinned boot medium"), "{}", b.dump());
+    assert!(b.has("media found dev=/dev/vdb"), "{}", b.dump());
+    // The other disk carries a *newer*, validly signed release; the pin still keeps it out.
+    assert!(b.has("selected slot=a epoch=2") && !b.has("epoch=3"), "{}", b.dump());
+    assert!(b.has("JLR-STAGE2: ready"), "{}", b.dump());
+    // The boot log says which devices were opened to look for a /jlr tree; the other disk must not be one of them.
+    assert!(b.has("examining /dev/vdb for a /jlr tree"), "{}", b.dump());
+    assert!(
+        !b.has("examining /dev/vda"),
+        "the disk that is not the pinned medium must never be mounted:\n{}",
+        b.dump()
+    );
+    assert_eq!(file_digest(&other), other_before, "and it must not have been written");
+
+    // A pin that matches nothing attached is a refusal, never a fall back to whatever is there.
+    let b = boot_disks(&env, &[(&other, false), (&real, false)], "jlr.media=uuid=99999999-9999-9999-9999-999999999999");
+    assert_refused_without_running(&b, "no boot media");
+}
+
+#[test]
+fn a_write_protected_medium_boots_its_proven_slot_and_skips_an_unproven_one() {
+    let Some(env) = env() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    // B is a fresh, unproven update that would be tried first, which needs a durable "try spent" record.
+    let mut state = BootState::fresh();
+    state.install("b");
+    let disk = build_named_disk(
+        &env,
+        dir.path(),
+        "ro",
+        &[good_slot(&env, "a", 1), good_slot(&env, "b", 2)],
+        Some(&state),
+        None,
+    );
+    let b = boot_disks(&env, &[(&disk, true)], "");
+    assert!(!b.timed_out, "{}", b.dump());
+    assert!(b.has("slot=b skipped: cannot record the boot attempt"), "{}", b.dump());
+    // The image is read and verified first; only then is the try recorded (and here, refused).
+    let (verified, skipped) = (b.pos("image verified slot=b"), b.pos("slot=b skipped: cannot record"));
+    assert!(
+        verified.is_some() && verified < skipped,
+        "a try must not be spent before the image was read:\n{}",
+        b.dump()
+    );
+    assert!(b.has("selected slot=a epoch=1"), "the proven slot must still boot:\n{}", b.dump());
+    assert!(!b.has("selected slot=b"), "an update must not run without its try being recorded:\n{}", b.dump());
+    assert!(b.has("JLR-STAGE2: ready"), "{}", b.dump());
+    // (The drive is attached `readonly=on`, so QEMU itself keeps the image unchanged; what this test shows is what
+    // the boot does about a medium it cannot write.)
+}
+
+#[test]
+fn an_unreadable_boot_state_stops_the_boot_instead_of_resetting_the_floor() {
+    let Some(env) = env() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("t");
+    fs::create_dir_all(tree.join("jlr/slot-a")).unwrap();
+    let slot = good_slot(&env, "a", 1);
+    fs::write(tree.join("jlr/slot-a/manifest.cose"), &slot.manifest).unwrap();
+    fs::write(tree.join("jlr/slot-a/base.sqfs"), &slot.image).unwrap();
+    // A state file that is present but does not parse, as a torn or damaged write leaves it.
+    fs::write(tree.join("jlr/bootstate.cbor"), b"\xa1\x01").unwrap();
+    let img = dir.path().join("d.img");
+    assert!(
+        Command::new(&env.mke2fs)
+            .args(["-q", "-t", "ext4", "-F", "-d"])
+            .arg(&tree)
+            .arg(&img)
+            .arg("48M")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let b = boot(&env, Some(&img), "");
+    assert_refused_without_running(&b, "boot state of /dev/vda cannot be read");
+}
+
+#[test]
+fn the_highest_floor_on_any_medium_is_written_to_the_medium_that_boots() {
+    let Some(env) = env() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    // The booting disk's release has epoch 6 but a `min_epoch` of only 4, and its own state says floor 0. The other
+    // disk recorded floor 5. After the boot proves itself, the booting disk must record 5, not the 4 that its own
+    // release would raise it to: the floor that applied to this boot must not be lost from the medium that ran it.
+    let image = fs::read(env.out.join("base.sqfs")).unwrap();
+    let slot = Slot { name: "a", manifest: manifest(&image, 6, 4, &release_key()), image };
+    let booting = build_named_disk(&env, dir.path(), "boot", &[slot], None, None);
+    let other = build_named_disk(&env, dir.path(), "other", &[good_slot(&env, "a", 5)], Some(&proven_state(5)), None);
+    let b = boot_disks(&env, &[(&booting, false), (&other, false)], "");
+    assert!(!b.timed_out, "{}", b.dump());
+    assert!(b.has("media=2 rollback floor=5"), "{}", b.dump());
+    assert!(b.has("selected slot=a epoch=6"), "{}", b.dump());
+    assert!(b.has("slot a marked successful; rollback floor is now 5"), "{}", b.dump());
+    assert_eq!(read_state(&env, &booting).floor, 5);
 }

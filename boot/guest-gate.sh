@@ -37,6 +37,35 @@ cp /bin/busybox /tmp/opt/stranger2/busybox
 try "enforce stranger2" /tmp/opt/stranger2/busybox
 try "enforce system tool" /bin/busybox
 
+# A file the gate cannot measure (padded past the size limit by whoever owns it) is DENIED, never waved through.
+mkdir -p /tmp/opt/padded
+cp /bin/busybox /tmp/opt/padded/busybox
+truncate -s 600M /tmp/opt/padded/busybox
+try "enforce unmeasurable" /tmp/opt/padded/busybox
+
+# A file system mounted AFTER the daemon started is gated as well.
+mkdir -p /tmp/late
+mount -t tmpfs tmpfs /tmp/late
+cp /bin/busybox /tmp/late/busybox
+sleep 1
+try "late mount stranger" /tmp/late/busybox
+
+# The next file system reuses the device number of the one just unmounted; it must be gated too.
+umount /tmp/late
+mkdir -p /tmp/late2
+mount -t tmpfs tmpfs /tmp/late2
+cp /bin/busybox /tmp/late2/busybox
+sleep 1
+try "remounted stranger" /tmp/late2/busybox
+
+# A mount point whose name has a tab in it (mountinfo writes it as \011).
+ODD="$(printf '/tmp/odd\tname')"
+mkdir -p "$ODD"
+mount -t tmpfs tmpfs "$ODD"
+cp /bin/busybox "$ODD/busybox"
+sleep 1
+try "odd name stranger" "$ODD/busybox"
+
 # Tamper with an enrolled binary: it must stop being trusted.
 echo tampered >> /tmp/opt/known/busybox
 try "tampered known" /tmp/opt/known/busybox

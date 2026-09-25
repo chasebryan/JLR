@@ -5,7 +5,8 @@ use crate::sealed::SealedExe;
 use crate::spec::{CellError, CellSpec, EnforcementReport, Status};
 use crate::sys;
 use jlr_cbor::Cbor;
-use nix::unistd::pipe;
+use nix::fcntl::OFlag;
+use nix::unistd::pipe2;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -67,7 +68,9 @@ pub fn launch(helper: &Path, exe: &SealedExe, spec: &CellSpec, io: Stdio3) -> Re
     if !exe.is_fully_sealed() {
         return Err(CellError::Setup("executable is not sealed".into()));
     }
-    let (read_end, write_end) = pipe().map_err(|e| CellError::Io(e.into()))?;
+    // Close-on-exec, so neither end can leak into this or any concurrently launched cell. The write end
+    // reaches the helper only through the explicit placement at descriptor 4 below.
+    let (read_end, write_end) = pipe2(OFlag::O_CLOEXEC).map_err(|e| CellError::Io(e.into()))?;
     let exe_fd = exe.file().as_raw_fd();
     let wr = write_end.as_raw_fd();
 

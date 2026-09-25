@@ -60,11 +60,22 @@ struct Builder {
     unavailable: Vec<(Control, String)>,
     landlock_abi: Option<u32>,
     seccomp_denied: u32,
+    /// Capability grants that could not be applied (missing path, hidden path). They make the report Partial.
+    skipped: Vec<String>,
 }
 
 impl Builder {
     fn new(spec: CellSpec) -> Self {
-        Builder { spec, active: Vec::new(), unavailable: Vec::new(), landlock_abi: None, seccomp_denied: 0 }
+        Builder {
+            spec,
+            active: Vec::new(),
+            unavailable: Vec::new(),
+            // The kernel's Landlock ABI is a fact about the machine, so every report carries it, including a
+            // refusal that happens before Landlock is applied.
+            landlock_abi: sys::landlock_abi(),
+            seccomp_denied: 0,
+            skipped: Vec::new(),
+        }
     }
 
     fn ok(&mut self, c: Control) {
@@ -91,7 +102,8 @@ impl Builder {
                 unavailable.push(format!("{c}: not established"));
             }
         }
-        let all_requested_active = requested.iter().all(|c| self.active.contains(c));
+        unavailable.extend(self.skipped.iter().map(|s| format!("capability: {s}")));
+        let all_requested_active = requested.iter().all(|c| self.active.contains(c)) && self.skipped.is_empty();
         let status = if !missing_mandatory.is_empty() {
             Status::Refused
         } else if all_requested_active {
@@ -146,7 +158,15 @@ fn refuse(mut b: Builder, why: &str) -> i32 {
 // ---------------------------------------------------------------------------
 
 fn stage1(spec: CellSpec, spec_hex: &str) -> i32 {
+    // Only descriptors 0-2 (the workload's standard streams), 3 (the sealed program) and 4 (the report pipe) may
+    // cross into the cell. Anything else the caller left open is closed before anything else happens.
+    sys::close_from(REPORT_FD + 1);
     let _ = nix::sys::prctl::set_pdeathsig(Signal::SIGKILL);
+    // A new session removes the caller's controlling terminal. Without this the workload can use terminal
+    // ioctls on a shared tty (TIOCSTI types into the operator's shell after the cell exits).
+    if let Err(e) = nix::unistd::setsid() {
+        return refuse(Builder::new(spec), &format!("cannot detach from the controlling terminal: {e}"));
+    }
     let (euid, egid) = sys::effective_ids();
     let use_userns = euid != 0;
     let netns = matches!(spec.network, NetworkMode::None | NetworkMode::LoopbackOnly);
@@ -251,6 +271,30 @@ fn cleanup_cgroup(name: &str) {
 struct Layout {
     read: Vec<String>,
     write: Vec<String>,
+    /// Grants that were not applied, with the reason.
+    skipped: Vec<String>,
+}
+
+/// Picks the directory the private root is assembled in. The tmpfs mounted there hides whatever was below it
+/// in this mount namespace, so it must not be, or contain, any path a capability grants.
+fn assembly_dir(spec: &CellSpec) -> Result<&'static str, String> {
+    let granted: Vec<&str> = spec
+        .capabilities
+        .iter()
+        .filter_map(|c| match c {
+            Capability::FsRead(p) | Capability::FsWrite(p) => Some(p.as_str()),
+            _ => None,
+        })
+        .collect();
+    let overlaps = |dir: &str, p: &str| {
+        // `/` contains every path, and `strip_prefix("/")` leaves a remainder that does not start with a slash.
+        let within = |a: &str, b: &str| b == "/" || a == b || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'));
+        within(p, dir) || within(dir, p)
+    };
+    ["/tmp", "/mnt", "/media", "/srv", "/opt", "/run"]
+        .into_iter()
+        .find(|d| fs::metadata(d).is_ok_and(|m| m.is_dir()) && !granted.iter().any(|p| overlaps(d, p)))
+        .ok_or_else(|| "no directory is free to assemble the private root in (every candidate overlaps a grant)".into())
 }
 
 fn none() -> Option<&'static str> {
@@ -324,8 +368,8 @@ fn tmpfs(dst: &str, opts: &str, extra: MsFlags) -> Result<(), String> {
 fn build_root(spec: &CellSpec) -> Result<Layout, String> {
     mount(none(), "/", none(), MsFlags::MS_REC | MsFlags::MS_PRIVATE, none())
         .map_err(|e| format!("make / private: {e}"))?;
-    // The private root is assembled on a tmpfs mounted over /tmp, which is only visible in this mount namespace.
-    let nr = "/tmp";
+    // The private root is assembled on a tmpfs that is only visible in this mount namespace.
+    let nr = assembly_dir(spec)?;
     tmpfs(nr, "mode=0755,size=4m", MsFlags::MS_NOEXEC)?;
     for d in ["usr", "etc", "dev", "proc", "tmp", "run", ".old"] {
         fs::create_dir_all(format!("{nr}/{d}")).map_err(|e| format!("mkdir {d}: {e}"))?;
@@ -393,16 +437,19 @@ fn build_root(spec: &CellSpec) -> Result<Layout, String> {
     tmpfs(&format!("{nr}/run"), "mode=0755,size=4m", MsFlags::MS_NOEXEC)?;
 
     // Paths granted by capabilities (never for CELL-0, which has none).
-    let mut layout = Layout { read: Vec::new(), write: Vec::new() };
+    let mut layout = Layout { read: Vec::new(), write: Vec::new(), skipped: Vec::new() };
     for c in &spec.capabilities {
         match c {
-            Capability::FsRead(p) if fs::metadata(p).is_ok() => {
-                bind(p, &format!("{nr}{p}"), true)?;
-                layout.read.push(p.clone());
-            }
-            Capability::FsWrite(p) if fs::metadata(p).is_ok() => {
-                bind(p, &format!("{nr}{p}"), false)?;
-                layout.write.push(p.clone());
+            Capability::FsRead(p) | Capability::FsWrite(p) => {
+                // Paths were validated (absolute, normalised) when the spec was decoded, so what can go wrong
+                // here is the world: the path does not exist, or cannot be examined.
+                let write = matches!(c, Capability::FsWrite(_));
+                if let Err(e) = fs::metadata(p) {
+                    layout.skipped.push(format!("{c} not applied: {e}"));
+                } else {
+                    bind(p, &format!("{nr}{p}"), !write)?;
+                    if write { layout.write.push(p.clone()) } else { layout.read.push(p.clone()) }
+                }
             }
             _ => {}
         }
@@ -530,6 +577,7 @@ fn stage2(spec: CellSpec, ns_note: &str, cgroup_name: &str) -> i32 {
     let layout = match build_root(&spec) {
         Ok(l) => {
             b.ok(Control::MountNs);
+            b.skipped.extend(l.skipped.iter().cloned());
             l
         }
         Err(e) => {
@@ -578,7 +626,14 @@ fn stage2(spec: CellSpec, ns_note: &str, cgroup_name: &str) -> i32 {
                 if o.net {
                     b.ok(Control::LandlockNet);
                 } else {
-                    b.fail(Control::LandlockNet, "kernel Landlock ABI has no TCP rules");
+                    b.fail(
+                        Control::LandlockNet,
+                        match b.landlock_abi {
+                            Some(v) if v >= 4 => format!("TCP rules were not fully enforced (kernel ABI {v})"),
+                            Some(v) => format!("kernel Landlock ABI {v} has no TCP rules (needs 4)"),
+                            None => "Landlock is not available".into(),
+                        },
+                    );
                 }
             }
         }
@@ -610,6 +665,9 @@ fn stage2(spec: CellSpec, ns_note: &str, cgroup_name: &str) -> i32 {
         return EXIT_REFUSED;
     }
 
+    // Descriptor 4 was closed when the report was sent; sweep anything else opened during setup. Descriptor 3
+    // stays: it is the sealed program, and a script's interpreter opens it through /proc/self/fd/3.
+    sys::close_from(REPORT_FD);
     let _ = chdir("/tmp");
     let mut argv = spec.argv.iter();
     let name = argv.next().cloned().unwrap_or_else(|| "cell".into());
@@ -649,6 +707,40 @@ pub fn cell_main() -> i32 {
         other => {
             eprintln!("jlr-cell: unknown stage {other}");
             2
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jlr_model::{AdmissionState, Basis, CellClass, Decision, ReasonCode};
+
+    fn spec_with(caps: &[&str]) -> CellSpec {
+        let d = Decision {
+            state: AdmissionState::Verified,
+            cell: CellClass::Cell1,
+            network: NetworkMode::None,
+            capabilities: caps.iter().map(|c| Capability::parse(c).unwrap()).collect(),
+            reasons: vec![ReasonCode::DefaultTier],
+            basis: Basis::None,
+            needs_user: None,
+            policy: jlr_crypto::Digest::ZERO,
+        };
+        CellSpec::from_decision(&d, vec!["x".into()], vec![]).unwrap()
+    }
+
+    #[test]
+    fn the_private_root_is_never_assembled_over_a_granted_path() {
+        assert_eq!(assembly_dir(&spec_with(&[])).unwrap(), "/tmp", "without grants /tmp is the first choice");
+        for grant in ["FS_WRITE:/tmp/data", "FS_READ:/tmp", "FS_WRITE:/tmp/a/b/c"] {
+            let dir = assembly_dir(&spec_with(&[grant])).unwrap();
+            assert_ne!(dir, "/tmp", "{grant} would be hidden by a tmpfs mounted over /tmp");
+        }
+        // A grant that contains a candidate hides it too, as does one that contains all of them.
+        for grant in ["FS_READ:/", "FS_WRITE:/"] {
+            let r = assembly_dir(&spec_with(&[grant]));
+            assert!(r.is_err(), "{grant} contains every candidate directory, so none is free: {r:?}");
         }
     }
 }
