@@ -505,7 +505,10 @@ impl Engine {
             }
             let mut d = EventDraft::new("jlr-engine", EventKind::Degraded, &detail);
             d.policy = policy.digest();
-            ledger.append(d)?;
+            // Best effort: a report about an ignored file must not make the engine unopenable when the ledger
+            // cannot grow (a full disk), because the daemon opens the engine for every decision and an open that
+            // fails is a decision that fails open. The file grants nothing whether or not the note is written.
+            let _ = ledger.append(d);
         }
 
         let (file, lost) = load_index(&paths);
@@ -554,7 +557,7 @@ impl Engine {
                 ),
             );
             d.policy = policy.digest();
-            ledger.append(d)?;
+            let _ = ledger.append(d); // best effort, as above
             let _ = save_index(&paths, &IndexFile { rows: index.values().cloned().collect() });
         }
         Ok(Engine {
@@ -1117,7 +1120,7 @@ impl Engine {
             None,
             vec![Digest::of(&bytes)],
             Basis::ManualOverride,
-            &format!("baseline {name} enrolled by {granted_by}: {count} members"),
+            &format!("baseline {name} enrolled by {}: {count} members", jlr_model::sanitize_to(granted_by, 100)),
         ) {
             // The new file is left in place: it is harmless (not the one the ledger records, so it is ignored and
             // reported once), while deleting it could remove the very file the ledger names, if this event was
@@ -1364,7 +1367,11 @@ impl Engine {
             None,
             vec![Digest::of(&bytes)],
             Basis::ManualOverride,
-            &format!("operator {granted_by} approved {} cell={cell} network={network}", record.name),
+            &format!(
+                "operator {} approved {} cell={cell} network={network}",
+                jlr_model::sanitize_to(granted_by, 100),
+                jlr_model::sanitize_to(&record.name, 100)
+            ),
         ) {
             // The new file is left in place; see `enroll_baseline`.
             match previous {
@@ -1490,11 +1497,9 @@ impl Engine {
 
     /// Installs a new signed policy. The epoch must be strictly greater than the current one.
     pub fn set_policy(&mut self, new: Policy) -> Result<Digest, EngineError> {
-        // A policy that keeps the installed policy's name (the `enforce on|off` toggle does) may keep a name that
-        // predates the alphabet rule; any other new policy must follow it.
-        let keeps_installed_name = new.name == self.policy.name;
-        let valid = if keeps_installed_name { new.validate_loaded() } else { new.validate() };
-        valid.map_err(|e| EngineError::Invalid(e.to_string()))?;
+        // A policy may keep the names the installed policy already carries (the `enforce on|off` toggle does), even
+        // if they predate the alphabet rule; it may not introduce a new one.
+        new.validate_replacing(&self.policy).map_err(|e| EngineError::Invalid(e.to_string()))?;
         if new.epoch <= self.policy.epoch {
             return Err(EngineError::Rollback(format!(
                 "policy epoch {} must be greater than the current epoch {}",

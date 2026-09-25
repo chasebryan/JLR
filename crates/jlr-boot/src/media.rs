@@ -109,15 +109,18 @@ pub fn promote_recovered(media: &Path) -> io::Result<bool> {
     if path.exists() || !tmp.exists() {
         return Ok(false);
     }
-    match fs::read(&tmp).map(|b| BootState::from_cbor(&b).is_ok()) {
-        Ok(true) => {
+    // Only bytes that were read and did not parse prove a torn first write. A file that could not be read (a transient
+    // I/O error from a flaky medium, a permission problem) may be the only copy of the floor and is never removed.
+    match fs::read(&tmp) {
+        Ok(bytes) if BootState::from_cbor(&bytes).is_ok() => {
             fs::rename(&tmp, &path)?;
             Ok(true)
         }
-        _ => {
+        Ok(_) => {
             let _ = fs::remove_file(&tmp);
             Ok(false)
         }
+        Err(e) => Err(e),
     }
 }
 

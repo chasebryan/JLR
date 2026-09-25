@@ -1387,3 +1387,89 @@ fn an_epn_revocation_that_names_something_else_does_not_count_lost_records_as_un
     assert_eq!((r.moved, r.unchecked), (0, 0), "an EPN revocation never needs the record: {r:?}");
     assert_eq!(e.state_of(&id), Some(S::Observed));
 }
+
+#[test]
+fn a_replacement_policy_may_carry_the_installed_names_and_nothing_new() {
+    // A plain-named installation cannot slip a hostile tier name in through the "same name" path...
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let mut sneaky = e.policy().clone();
+    sneaky.epoch += 1;
+    let last = sneaky.tiers.len() - 1;
+    sneaky.tiers[last].name = "evil\n\u{1b}[2J\u{202e}forged".into();
+    assert!(matches!(e.set_policy(sneaky), Err(EngineError::Invalid(_))));
+    let mut long = e.policy().clone();
+    long.epoch += 1;
+    let last = long.tiers.len() - 1;
+    long.tiers[last].name = "x".repeat(200);
+    assert!(
+        matches!(e.set_policy(long), Err(EngineError::Invalid(_))),
+        "a 200-byte tier name is new, so it must conform"
+    );
+    drop(e);
+
+    // ...and an installation with older names may keep exactly those, but not add another.
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut old = jlr_policy::Policy::workstation(1);
+    old.name = "site policy: main".into();
+    let last = old.tiers.len() - 1;
+    old.tiers[last].name = "catch all (legacy)".into();
+    let key = jlr_crypto::SigningKeypair::load(&lab.paths().policy_key()).unwrap();
+    fs::write(
+        lab.paths().policy(),
+        jlr_crypto::Envelope::sign(jlr_model::record_type::POLICY, "*", &old.to_cbor(), &key),
+    )
+    .unwrap();
+    let mut e = lab.open();
+    let mut toggled = e.policy().clone();
+    toggled.epoch += 1;
+    toggled.enforce_exec = true;
+    e.set_policy(toggled).expect("the toggle carries the installed legacy names");
+    let mut renamed_tier = e.policy().clone();
+    renamed_tier.epoch += 1;
+    let last = renamed_tier.tiers.len() - 1;
+    renamed_tier.tiers[last].name = "another legacy name".into();
+    assert!(matches!(e.set_policy(renamed_tier), Err(EngineError::Invalid(_))), "a new non-conforming name is refused");
+}
+
+#[test]
+fn a_hostile_file_name_cannot_push_what_was_granted_out_of_the_approval_record() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    // 250 control characters: legal in a Linux file name, and each becomes a six-byte escape.
+    let exe = lab.file(&format!("opt/{}", "\u{1}".repeat(120)), &elf());
+    e.scan(std::slice::from_ref(&lab.sys), &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    e.approve(&id.to_string(), CellClass::Cell1, NetworkMode::None, vec![], 3600, &"operator".repeat(50)).unwrap();
+    let ev = events(&lab).into_iter().rev().find(|x| x.kind == EventKind::Override).unwrap();
+    assert!(
+        ev.detail.contains("cell=CELL-1") && ev.detail.contains("network=NONE"),
+        "what was granted must survive a hostile name: {}",
+        ev.detail
+    );
+}
+
+#[test]
+fn many_degraded_records_are_written_in_order_with_one_flush_at_the_end() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let mut e = lab.open();
+    let before = e.status().ledger_events;
+    let lines: Vec<String> = (0..25).map(|i| format!("summary line {i}")).collect();
+    e.record_degraded_many(&lines).unwrap();
+    assert_eq!(e.status().ledger_events, before + 25);
+    let written: Vec<String> = events(&lab)
+        .into_iter()
+        .filter(|x| x.kind == EventKind::Degraded && x.detail.starts_with("summary line"))
+        .map(|x| x.detail)
+        .collect();
+    assert_eq!(written, lines, "every record is written, in order");
+    // The ledger is durable and still verifies after a batch.
+    assert!(verify_ledger_at(&lab.paths(), None).is_ok());
+    // An empty batch writes nothing and is not an error.
+    e.record_degraded_many(&[]).unwrap();
+    assert_eq!(e.status().ledger_events, before + 25);
+}

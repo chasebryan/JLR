@@ -69,6 +69,16 @@ impl fmt::Display for PolicyError {
 }
 impl std::error::Error for PolicyError {}
 
+/// Which names a policy may carry.
+enum NameRule<'a> {
+    /// A new policy: plain names only.
+    Strict,
+    /// An installed policy: what was accepted before the alphabet rule.
+    Loaded,
+    /// A replacement of an installed policy: plain names, or names the installed policy already carries.
+    Carry(&'a Policy),
+}
+
 /// Names reach the ledger and operator terminals. Keeping them to a plain alphabet means a name can never carry
 /// control characters, line breaks or text that reads like another field (for example `epoch=9`).
 fn plain_name(name: &str) -> bool {
@@ -94,7 +104,16 @@ impl Policy {
     /// trust it should not. A policy that fails validation must be refused;
     /// the caller must not fall back to a permissive default (I-11).
     pub fn validate(&self) -> Result<(), PolicyError> {
-        self.validate_with(true)
+        self.validate_with(&NameRule::Strict)
+    }
+
+    /// Validation for a policy that replaces `installed` (the `enforce on|off` toggle installs a copy of the current
+    /// policy with one flag changed). Every rule of [`Policy::validate`] applies, except that a policy name or tier
+    /// name that **the installed policy already carries** is accepted even if it predates the alphabet rule, so an
+    /// installation with an older name can still change its own settings. No new non-conforming name can be
+    /// introduced this way.
+    pub fn validate_replacing(&self, installed: &Policy) -> Result<(), PolicyError> {
+        self.validate_with(&NameRule::Carry(installed))
     }
 
     /// Validation for a policy that was **already signed and installed**. Every rule of [`Policy::validate`]
@@ -103,14 +122,22 @@ impl Policy {
     /// policy. The name is only ever printed after escaping, so accepting it is safe. New policies still go
     /// through [`Policy::validate`].
     pub fn validate_loaded(&self) -> Result<(), PolicyError> {
-        self.validate_with(false)
+        self.validate_with(&NameRule::Loaded)
     }
 
-    fn validate_with(&self, strict_names: bool) -> Result<(), PolicyError> {
+    fn validate_with(&self, rule: &NameRule<'_>) -> Result<(), PolicyError> {
         // Before the alphabet rule a policy name was 1 to 128 bytes and a tier name only had to be non-empty; an
         // installed policy is held to exactly that, so nothing that loaded before stops loading.
-        let name_ok = |n: &str| if strict_names { plain_name(n) } else { !n.is_empty() && n.len() <= 128 };
-        let tier_name_ok = |n: &str| if strict_names { plain_name(n) } else { !n.is_empty() };
+        let name_ok = |n: &str| match rule {
+            NameRule::Strict => plain_name(n),
+            NameRule::Loaded => !n.is_empty() && n.len() <= 128,
+            NameRule::Carry(old) => plain_name(n) || (n == old.name && !n.is_empty() && n.len() <= 128),
+        };
+        let tier_name_ok = |n: &str| match rule {
+            NameRule::Strict => plain_name(n),
+            NameRule::Loaded => !n.is_empty(),
+            NameRule::Carry(old) => plain_name(n) || (!n.is_empty() && old.tiers.iter().any(|t| t.name == n)),
+        };
         if self.schema != Self::SCHEMA {
             return bad(format!("unsupported schema {}", self.schema));
         }

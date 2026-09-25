@@ -249,8 +249,8 @@ struct Booted {
 /// mounted at [`MEDIA`]; otherwise it is unmounted and `None` is returned so the next medium can be tried.
 fn try_medium(medium: &Medium, floor: u64, anchors: &TrustAnchors) -> Option<Booted> {
     let dev = medium.dev.as_str();
-    // Mounted read-only: a medium is remounted read-write only at the moment state must be written, so a disk
-    // that turns out to hold nothing bootable is never modified.
+    // Mounted read-only: a medium is remounted read-write only at the moment state must be written (a try, a
+    // success, or retiring a slot that proved bad), so a disk that holds nothing bootable is not written to.
     let Some(fstype) = mount_medium(dev, false) else {
         log(&format!("{dev}: cannot be mounted; skipped"));
         return None;

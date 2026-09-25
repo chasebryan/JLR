@@ -173,14 +173,25 @@ fn parse_mountinfo(table: &[u8]) -> Vec<(PathBuf, String)> {
 fn say_once(msg: &str) {
     static SEEN: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
     let Ok(mut guard) = SEEN.lock() else { return };
-    let seen = guard.get_or_insert_with(HashSet::new);
-    if seen.len() < 256 && seen.insert(msg.to_owned()) {
+    if should_report(guard.get_or_insert_with(HashSet::new), msg) {
         say(msg);
     }
 }
 
-/// The mount table, opened and armed: the kernel raises `POLLPRI` on it whenever the table changes after the last
-/// read, so it is opened **before** the first marking and nothing mounted in between can be missed.
+/// Whether `msg` should be reported now. Each distinct message is reported once; the memory of what was said is
+/// bounded, and when it is full it starts over instead of suppressing everything from then on, so a condition that
+/// turns up late is still reported (at the cost of repeating an old one occasionally).
+fn should_report(seen: &mut HashSet<String>, msg: &str) -> bool {
+    if seen.len() >= 256 {
+        seen.clear();
+    }
+    seen.insert(msg.to_owned())
+}
+
+/// The mount table, held open. The kernel takes its change baseline when the file is **opened** and moves it forward
+/// each time a `poll` reports a change (reading does not re-arm anything), and raises `POLLPRI | POLLERR` when the
+/// table differs from that baseline. So the table is opened **before** the first marking, and a mount made between
+/// the open and the first `poll` is still reported.
 struct MountTable {
     file: File,
 }
@@ -192,7 +203,7 @@ impl MountTable {
         Ok(t)
     }
 
-    /// Reads the whole table from the start, which also re-arms the change notification.
+    /// Reads the whole table from the start.
     fn read(&mut self) -> Result<Vec<u8>, String> {
         self.file.seek(SeekFrom::Start(0)).map_err(|e| format!("mountinfo: {e}"))?;
         let mut bytes = Vec::new();
@@ -241,9 +252,11 @@ struct CacheEntry {
     allow: bool,
     /// A verdict is answered from the cache for at most an hour.
     expires: Instant,
-    /// The verdict's real lifetime: the earlier of the evidence age limit and the expiry of the approval or baseline
-    /// it relied on. A verdict past this is never honoured, not even for a throttled user.
-    valid_until: Instant,
+    /// The verdict's real lifetime, in seconds since the Unix epoch: the earlier of the evidence age limit and the
+    /// expiry of the approval or baseline it relied on. It is wall-clock time, like the approvals it mirrors, so a
+    /// suspend does not stretch it (the monotonic clock does not count time asleep). A verdict past this is not
+    /// honoured, not even for a throttled user.
+    valid_until: u64,
 }
 
 #[derive(Default)]
@@ -251,6 +264,28 @@ struct Tally {
     path: String,
     audited: u64,
     denied: u64,
+}
+
+/// Seconds since the Unix epoch.
+fn wall_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The answer for an execution whose user has used up the slow-path allowance. It is never measured. A file this
+/// daemon already judged allowable, that has not changed since, under the same signed state, and whose verdict is
+/// still inside its real validity, stays allowed: its cached verdict merely aged out of the hour it is kept, and it is
+/// not made to pay for its user's other executions. Anything else gets the policy's default: denied when enforcing,
+/// allowed (and counted) when auditing.
+fn throttled_answer(
+    entry: Option<&CacheEntry>,
+    stamp: (u64, i64, i64),
+    generation: u64,
+    now: u64,
+    enforcing: bool,
+) -> bool {
+    let known_good =
+        entry.is_some_and(|c| c.stamp == stamp && c.generation == generation && c.allow && now < c.valid_until);
+    known_good || !enforcing
 }
 
 fn say(msg: &str) {
@@ -429,10 +464,7 @@ fn run() -> Result<(), String> {
                     // A file this daemon already judged allowable, and that has not changed since, is not made
                     // to pay for its user's other executions: its cached verdict merely aged out of the hour
                     // it is kept. Its real lifetime (evidence age, approval or baseline expiry) still applies.
-                    let known_good = cache.get(&key).is_some_and(|c| {
-                        c.stamp == stamp && c.generation == g && c.allow && Instant::now() < c.valid_until
-                    });
-                    respond(known_good || !enforce_hint);
+                    respond(throttled_answer(cache.get(&key), stamp, g, wall_secs(), enforce_hint));
                     continue;
                 }
                 let mut worked = Duration::ZERO;
@@ -475,7 +507,7 @@ fn run() -> Result<(), String> {
                         // Only real verdicts are cached, so an error is retried on the next attempt.
                         let now = Instant::now();
                         let expires = now + Duration::from_secs(v.max_age_secs.min(3600));
-                        let valid_until = now + Duration::from_secs(v.max_age_secs);
+                        let valid_until = wall_secs().saturating_add(v.max_age_secs);
                         cache.insert(key, CacheEntry { stamp, generation: g, allow, expires, valid_until });
                         allow
                     }
@@ -535,6 +567,20 @@ fn write_summaries(
     throttled: &mut HashMap<u32, u64>,
     tally: &HashMap<String, Tally>,
 ) {
+    let lines = summary_lines(pending, throttled, tally);
+    if !lines.is_empty() {
+        let _ = e.record_degraded_many(&lines);
+    }
+}
+
+/// The text of what to record, and the bookkeeping that goes with it (the queue and the throttle counts are emptied).
+/// At most [`SUMMARY_EVENTS`] individual records of each kind plus one line for the rest, with each attacker-influenced
+/// part bounded on its own so the counts that follow it are not cut off.
+fn summary_lines(
+    pending: &mut Vec<String>,
+    throttled: &mut HashMap<u32, u64>,
+    tally: &HashMap<String, Tally>,
+) -> Vec<String> {
     let extra = pending.len().saturating_sub(SUMMARY_EVENTS);
     let mut lines: Vec<String> = pending.drain(..).take(SUMMARY_EVENTS).collect();
     if extra > 0 {
@@ -555,11 +601,18 @@ fn write_summaries(
     let mut repeated: Vec<(&String, &Tally)> = tally.iter().filter(|(_, t)| t.audited + t.denied > 0).collect();
     repeated.sort_by(|a, b| (b.1.audited + b.1.denied).cmp(&(a.1.audited + a.1.denied)).then(a.0.cmp(b.0)));
     for (id, t) in repeated.iter().take(SUMMARY_EVENTS) {
+        // Counts first, then the parts an attacker chooses (the path, and the key when it embeds one), each bounded.
+        // An unmeasurable file is keyed by its path, so the key is not repeated after the path.
+        let key = if id.starts_with("unmeasurable:") {
+            String::new()
+        } else {
+            format!(" {}", jlr_model::sanitize_to(id, 100))
+        };
         lines.push(format!(
-            "exec gate summary {id} {}: audited {} denied {}",
-            jlr_model::sanitize_to(&t.path, 300),
+            "exec gate summary: audited {} denied {}{key} {}",
             t.audited,
-            t.denied
+            t.denied,
+            jlr_model::sanitize_to(&t.path, 300)
         ));
     }
     if repeated.len() > SUMMARY_EVENTS {
@@ -568,9 +621,7 @@ fn write_summaries(
             repeated.len() - SUMMARY_EVENTS
         ));
     }
-    if !lines.is_empty() {
-        let _ = e.record_degraded_many(&lines);
-    }
+    lines
 }
 
 /// Marks the file system under each path. Marking is idempotent, so it is repeated for every mount-table change
@@ -597,8 +648,9 @@ fn mark_filesystems(fan: &Fanotify, root: &File, paths: &[PathBuf]) -> usize {
 /// events (each of which can take a while) is still marked promptly.
 fn mount_watcher(fan: Arc<Fanotify>, root: Arc<File>, mut table: MountTable, shutdown: Arc<AtomicBool>) {
     let mut known: HashSet<PathBuf> = HashSet::new();
-    // Refresh once straight away: anything mounted between the first marking and this thread starting raised no
-    // event, because the table was armed before that marking and read again since.
+    // The first refresh runs after a short wait rather than at once: a mount made since the table was opened is
+    // reported by the first poll anyway, and this also covers a first refresh that fails (a change reported by a
+    // poll is not reported again, so a failed read must be retried on a timer, not waited for).
     let mut retry = true;
     while !shutdown.load(Ordering::SeqCst) {
         let changed = table.wait_changed(if retry { 1000 } else { 250 });
@@ -747,6 +799,76 @@ mod tests {
                 (&b"/mnt/sp ace"[..], "tmpfs"),
                 (&b"/mnt/\xff\xfe\ttab"[..], "ext4"),
             ]
+        );
+    }
+
+    fn entry(allow: bool, generation: u64, valid_until: u64) -> CacheEntry {
+        let now = Instant::now();
+        CacheEntry { stamp: (10, 20, 30), generation, allow, expires: now, valid_until }
+    }
+
+    #[test]
+    fn a_throttled_user_is_served_from_a_verdict_only_inside_its_real_validity() {
+        let stamp = (10, 20, 30);
+        let good = entry(true, 7, 2_000);
+        // Enforcing: a known-good file is still allowed while its verdict is valid...
+        assert!(throttled_answer(Some(&good), stamp, 7, 1_999, true));
+        // ...but not once it is not (an approval or baseline that has since expired), nor if the file changed, nor
+        // under different signed state, nor if it was a denial.
+        assert!(!throttled_answer(Some(&good), stamp, 7, 2_000, true), "past its validity");
+        assert!(!throttled_answer(Some(&good), (11, 20, 30), 7, 1_999, true), "the file changed");
+        assert!(!throttled_answer(Some(&good), stamp, 8, 1_999, true), "the signed state changed");
+        assert!(!throttled_answer(Some(&entry(false, 7, 2_000)), stamp, 7, 1_999, true), "a denial stays a denial");
+        assert!(!throttled_answer(None, stamp, 7, 1_999, true), "an unknown file is denied when enforcing");
+        // Auditing lets everything through (and the caller counts it).
+        assert!(throttled_answer(None, stamp, 7, 1_999, false));
+    }
+
+    #[test]
+    fn what_the_daemon_writes_about_throttling_and_repeats_is_bounded_and_keeps_its_counts() {
+        let mut throttled: HashMap<u32, u64> = (100_000..105_000u32).map(|u| (u, u64::from(u % 7) + 1)).collect();
+        let mut pending: Vec<String> = (0..300).map(|i| format!("error {i}")).collect();
+        let mut tally: HashMap<String, Tally> = HashMap::new();
+        for i in 0..200 {
+            tally.insert(
+                format!("EPN-1-EXE-{i:064x}"),
+                Tally { path: format!("/tmp/{}/x", "d".repeat(2000)), audited: i + 1, denied: 0 },
+            );
+        }
+        // An unmeasurable file is keyed by its (attacker-chosen, long) path.
+        tally.insert(
+            format!("unmeasurable:/tmp/{}", "u".repeat(2000)),
+            Tally { path: "/tmp/u".repeat(400), audited: 0, denied: 9 },
+        );
+        let lines = summary_lines(&mut pending, &mut throttled, &tally);
+        assert!(lines.len() <= 3 * SUMMARY_EVENTS + 4, "{} lines", lines.len());
+        assert!(pending.is_empty() && throttled.is_empty(), "what was written is not kept for another round");
+        let total: u64 = (100_000..105_000u32).map(|u| u64::from(u % 7) + 1).sum();
+        let t = lines.iter().find(|l| l.contains("exceeded the slow-path budget")).unwrap();
+        assert!(t.contains(&format!("{total} executions from 5000 users")), "{t}");
+        assert!(lines.iter().any(|l| l.contains("more internal errors")), "queue overflow is stated");
+        assert!(lines.iter().any(|l| l.contains("more files were audited or denied repeatedly")));
+        for l in lines.iter().filter(|l| l.starts_with("exec gate summary: audited")) {
+            assert!(l.len() < 600, "each line is bounded: {} bytes", l.len());
+            assert!(l.starts_with("exec gate summary: audited "), "the counts come first and cannot be cut off: {l}");
+        }
+        // The busiest file is listed first, with its real count.
+        let first = lines.iter().find(|l| l.starts_with("exec gate summary: audited")).unwrap();
+        assert!(first.starts_with("exec gate summary: audited 200 denied 0"), "{first}");
+    }
+
+    #[test]
+    fn the_daemon_never_goes_silent_after_many_distinct_messages() {
+        let mut seen = HashSet::new();
+        assert!(should_report(&mut seen, "cannot examine /mnt/a"));
+        assert!(!should_report(&mut seen, "cannot examine /mnt/a"), "the same condition is reported once");
+        for i in 0..1000 {
+            should_report(&mut seen, &format!("distinct message {i}"));
+        }
+        assert!(seen.len() <= 256, "the memory of what was said is bounded");
+        assert!(
+            should_report(&mut seen, "cannot read the mount table"),
+            "a new condition must still be reported after many others"
         );
     }
 

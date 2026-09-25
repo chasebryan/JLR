@@ -120,7 +120,7 @@ still returned with a note. *Adopted; refines ADR-028.*
 the command that prints it), and escaping backslashes doubled them at each layer and made a legitimate identifier such as
 `CN=Doe\, John` "unprintable". Control, separator and invisible characters are escaped and a backslash is left alone; text
 that is already safe and short enough is returned as it is, which makes applying the function again change nothing, even
-when a limit falls inside an escape. Every attacker-influenced part (a path, a file name) of a composed event is bounded on
+when a limit falls inside an escape. Every attacker-influenced part (a path, a file name, an operator name) of an event the engine composes is bounded on
 its own before the message is assembled, so truncation cannot remove the state, reasons or step that follow it. *Adopted.*
 
 **ADR-041 - The gate's budget is charged for work and capped overall.** A user is charged for opening the engine and

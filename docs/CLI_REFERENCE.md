@@ -118,9 +118,11 @@ bounds how much work each non-root user may cost per minute (opening the engine 
 the ledger lock), and all non-root users together may use 30 seconds of it a minute; beyond that their unknown executions are
 answered at once by policy without being measured (denied when enforcing, allowed and counted when auditing), so one user,
 or one person with many uids, cannot stall everyone's `exec`. A file the daemon already allowed and that has not changed
-is still allowed. Each throttled user leaves a summary event. `--lock-wait-ms` (default 3000) bounds how long the gate
-waits for the ledger lock; a timeout follows `--fail-closed`, and is recorded as a DEGRADED event as soon as the ledger
-can be opened (it is kept in memory and written at the next opportunity, not lost).
+is still allowed (inside its real validity). Throttling is recorded as one aggregate event per flush (the total, the number
+of users and the busiest few), never one per user. `--lock-wait-ms` (default 3000) bounds how long the gate
+waits for the ledger lock; a timeout follows `--fail-closed`. Its DEGRADED record is kept in memory (up to 256) and written
+at the next opportunity or at shutdown, in a bounded batch with one flush; a longer backlog is folded into one line saying
+how many were not recorded individually.
 
 ## `jlr-release`
 

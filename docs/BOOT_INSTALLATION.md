@@ -60,8 +60,9 @@ machine waits (or powers off or reboots, per `jlr.onfail`). The independent reco
 ```
 
 The boot media is ext4 (or vfat or iso9660, read-only) and needs no special handling: nothing on it is trusted until verified.
-Media are mounted read-only and remounted read-write only at the moment state must be written, so no *state* is ever written
-to a disk that is not booted. (A read-only mount of an ext4 volume that was not cleanly unmounted still replays its journal
+Media are mounted read-only and remounted read-write only at the moment state must be written: to record a try or the success
+of a slot that is booting, or to retire a slot that proved bad on that medium (which then may not be the one that boots). No
+other *state* is written. (A read-only mount of an ext4 volume that was not cleanly unmounted still replays its journal
 when the device is writable, so "never modified" would be too strong.) A write-protected medium boots a proven slot; an unproven update needs its "try spent" record
 written first and is skipped there.
 

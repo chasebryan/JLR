@@ -273,9 +273,8 @@ fn missing_mandatory_control_refuses_and_runs_nothing() {
         Err(CellError::Refused(r)) => {
             assert_eq!(r.status, Status::Refused);
             assert!(r.mandatory_missing.iter().any(|m| m == "net-ns"), "{r:?}");
-            // Every report carries the kernel's Landlock ABI, including a refusal that happens before Landlock is
-            // applied (this one is decided while the namespaces are being set up).
-            assert_eq!(r.landlock_abi, kernel_landlock_abi(), "{r:?}");
+            // (This refusal is decided after the controls were applied; the ABI on a refusal that comes *before*
+            // Landlock is tested by `a_grant_of_root_refuses_the_launch_for_the_reason_it_names`.)
         }
         Err(CellError::Setup(_)) | Err(CellError::Io(_)) => {}
         Ok(_) => panic!("a cell with a missing mandatory control was started"),
@@ -634,4 +633,29 @@ fn the_host_kernel_log_cannot_be_read_from_inside_a_cell() {
         out.contains("r=-1") && out.contains(&format!("errno={}", libc::EPERM)),
         "kernel log readable? {out} {err}"
     );
+}
+
+#[test]
+fn a_grant_of_root_refuses_the_launch_for_the_reason_it_names() {
+    // `/` contains every place the private root could be assembled, so no directory is free. The helper refuses while
+    // it builds the root, before Landlock is applied, and the report must still carry the kernel's Landlock ABI (it
+    // used to be filled in only when Landlock ran) and say why.
+    let cap = Capability::parse("FS_READ:/").unwrap();
+    let d = decision(CellClass::Cell1, NetworkMode::None, vec![cap], AdmissionState::Verified);
+    let exe = seal("/bin/true");
+    let spec = spec_for(&d, &["true"]);
+    match launch(Path::new(HELPER), &exe, &spec, Stdio3::captured()) {
+        Err(CellError::Refused(r)) => {
+            assert_eq!(r.status, Status::Refused, "{r:?}");
+            assert!(
+                r.unavailable.iter().any(|u| u.contains("no directory is free")),
+                "the refusal must name its real reason: {:?}",
+                r.unavailable
+            );
+            assert_eq!(r.landlock_abi, kernel_landlock_abi(), "a refusal before Landlock still carries the ABI: {r:?}");
+            assert!(!r.active.iter().any(|a| a == "landlock-fs"), "Landlock had not been applied yet: {r:?}");
+        }
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("a cell whose private root cannot be built was started"),
+    }
 }

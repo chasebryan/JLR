@@ -506,6 +506,55 @@ mod recovery_tests {
     }
 
     #[test]
+    fn a_replacement_that_cannot_be_read_is_never_removed() {
+        // It may be the only copy of the floor, and a read error (a flaky stick, a permission problem) proves nothing
+        // about its content.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("jlr")).unwrap();
+        let new = d.path().join("jlr/bootstate.cbor.new");
+        fs::write(&new, state_at(12).to_cbor()).unwrap();
+        fs::set_permissions(&new, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&new).is_ok() {
+            eprintln!("SKIPPED: running with privileges that ignore file permissions");
+            return;
+        }
+        assert!(promote_recovered(d.path()).is_err(), "an unreadable replacement is an error, not a verdict");
+        assert!(new.exists(), "the only copy of the floor was removed");
+        fs::set_permissions(&new, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&new).unwrap(), state_at(12).to_cbor());
+    }
+
+    #[test]
+    fn write_state_promotes_a_recovered_copy_before_it_can_touch_it() {
+        // With the directory unwritable, nothing can be created or renamed. The order of the steps decides what is
+        // left: promoting first fails at the rename and leaves the recovered copy exactly as it was; skipping the
+        // promotion would truncate and rewrite it (an existing file can be opened for writing in a read-only
+        // directory) and leave the *new* state in the only copy.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("jlr")).unwrap();
+        let new = d.path().join("jlr/bootstate.cbor.new");
+        fs::write(&new, state_at(12).to_cbor()).unwrap();
+        fs::set_permissions(d.path().join("jlr"), fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = d.path().join("jlr/probe");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(d.path().join("jlr"), fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("SKIPPED: running with privileges that ignore directory permissions");
+            return;
+        }
+        let r = crate::media::write_state(d.path(), &state_at(20));
+        fs::set_permissions(d.path().join("jlr"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+        assert_eq!(
+            read_state(d.path()).unwrap(),
+            StateRead::Recovered(state_at(12)),
+            "a failed write must leave the recovered floor as it was"
+        );
+    }
+
+    #[test]
     fn a_torn_replacement_is_removed_and_promotes_nothing() {
         let d = tempfile::tempdir().unwrap();
         fs::create_dir(d.path().join("jlr")).unwrap();
