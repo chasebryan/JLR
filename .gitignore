@@ -1,0 +1,6 @@
+/target/
+/out/
+/build/cache/
+*.swp
+*.jlrkey
+/.jlr-dev/

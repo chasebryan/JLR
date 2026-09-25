@@ -1,0 +1,34 @@
+# systemd unit for the JLR daemon (companion mode).
+#
+# Install:   sudo install -m 0644 contrib/jlrd.service /etc/systemd/system/
+#            sudo systemctl daemon-reload && sudo systemctl enable --now jlrd
+#
+# Start in audit mode: `jlr policy enforce on` is a separate, signed, logged decision
+# that you take after reading `jlr ledger log` and being satisfied nothing you need
+# would be blocked. If the daemon stops, the kernel releases every held exec, so the
+# gate opens; Restart= brings it back and the ledger records the gap.
+[Unit]
+Description=JLR governance daemon (exec gate, rescan)
+Documentation=https://github.com/chasebryan/JLR/blob/main/docs/OPERATIONS.md
+After=local-fs.target
+ConditionPathExists=/var/lib/jlr/node.cbor
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/jlrd --state /var/lib/jlr --scan-every 3600
+Restart=always
+RestartSec=2
+Environment=JLR_CELL_INIT=/usr/local/bin/jlr-cell-init
+# The daemon needs CAP_SYS_ADMIN (fanotify filesystem marks) and read access everywhere it measures.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+NoNewPrivileges=yes
+ProtectHome=read-only
+PrivateTmp=no
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

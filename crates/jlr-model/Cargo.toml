@@ -1,0 +1,18 @@
+[package]
+name = "jlr-model"
+description = "JLR domain model: EPN records, admission states, capabilities, cells, evidence, decisions and events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+jlr-cbor.workspace = true
+jlr-crypto.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true

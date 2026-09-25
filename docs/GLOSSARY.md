@@ -1,43 +1,87 @@
-# JLR Glossary
+# Glossary
 
-**Admission** — authorization for an identified artifact to execute with a defined capability set.
+**Admission** - authorisation for an identified artifact to execute with a defined capability set. Never "unrestricted".
 
-**Artifact** — a file, image, package, service definition, configuration object, firmware object, or other governed software/data object.
+**Approval** - a signed, scoped, expiring operator authorisation for one EPN. Authority, not proof.
 
-**Base image** — the immutable JLR operating image loaded into RAM.
+**Artifact** - a file, image, package, service definition, configuration object, firmware object or other governed object.
 
-**Capability** — a specific permission granted by JLR policy.
+**Assurance label** - what a report may honestly claim given the boundary it runs behind: `prototype`, `companion`, `supervisor`, `recovery`.
 
-**Cell** — an isolated execution environment produced by the JLR jail fabric.
+**Audit mode** - the exec gate records what it would deny and blocks nothing. The default.
 
-**Degraded** — a state indicating that previously valid trust evidence no longer fully matches current reality.
+**Baseline** - an operator-signed set of EPN record digests standing for a machine's initial state. Members are admitted as manual overrides.
 
-**Evidence** — an observed or externally authenticated fact used by policy.
+**Base image** - the immutable, signed JLR operating image loaded into RAM.
 
-**Governance plane** — JLR components that measure, classify, authorize, isolate, and recover.
+**Basis** - why a state was reached: `CRYPTOGRAPHIC`, `POLICY`, `MANUAL_OVERRIDE`, or `NONE`.
 
-**Host** — the general-purpose operating system governed by JLR.
+**Capability** - one specific permission in a semantic vocabulary (`FS_READ:/path`, `NET_CONNECT:host:port`, ...). Absence is denial.
 
-**Immutable** — not writable during ordinary runtime; updates occur by authenticated replacement.
+**Cell** - an isolated execution environment produced by the jail fabric; CELL-0 (analysis) to CELL-3, and CELL-R for recovery.
 
-**Encryption Protocol Number (EPN)** — stable identifier for a versioned JLR security record.
+**Checkpoint** - a signed commitment to the ledger's size and Merkle root.
 
-**Jail fabric** — composition of kernel isolation and resource-control mechanisms used to enforce JLR capability policy.
+**Companion** - the deployment where JLR runs beside the host on the host kernel; host root can subvert it.
 
-**Manifest** — signed metadata binding a release to exact expected artifacts.
+**Degraded** - previously valid trust evidence no longer fully matches reality (an artifact state), or evidence is missing or stale (a posture).
 
-**Measurement** — cryptographic or structural observation of system state.
+**Device key** - the per-machine key that signs ledger events and checkpoints.
 
-**Observation cell** — restrictive jail used to execute software while collecting behavior evidence.
+**Enforcement report** - what a cell launch actually established: controls requested, active and unavailable, mandatory controls missing, and an overall `Full`, `Partial` or `Refused`.
 
-**Policy** — signed rules mapping normalized evidence to state and allowed capabilities.
+**Envelope** - the COSE_Sign1 structure that carries every signed record, bound to its record type and node.
 
-**Quarantine** — storage/execution state in which an artifact is prevented from ordinary host execution.
+**EPN (Encryption Protocol Number)** - the public, content-addressed identifier of an artifact identity record: `EPN-1-<CLASS>-<sha256>`. Not a secret and not itself encryption.
 
-**Recovery plane** — independently bootable JLR environment used when normal host trust is unavailable.
+**Evidence** - an observed or externally authenticated fact used by policy, with source and time.
 
-**Revocation** — explicit invalidation of prior trust or admission.
+**Exec gate** - the fanotify permission mark that holds each `exec` until the daemon answers.
 
-**Root of trust** — a component or key accepted as an initial trust anchor rather than deriving trust from the mutable system being evaluated.
+**Floor (rollback floor)** - the lowest release epoch that may boot; it only rises, and only after a successful health check.
 
-**Trust Engine** — deterministic JLR component that evaluates evidence under a specific policy version.
+**Governance plane** - the JLR components that measure, decide, record, enforce and recover.
+
+**Host** - the general-purpose operating system JLR governs.
+
+**Immutable** - not writable during ordinary runtime; changed only by authenticated replacement.
+
+**Jail fabric** - the composition of kernel isolation and resource controls that enforces a decision.
+
+**JLR-DCBOR/1** - the deterministic CBOR profile all signed objects use.
+
+**Ledger** - the signed, hash-linked, Merkle-committed record of security-relevant events.
+
+**Manifest** - a signed statement binding a release to the exact digest and size of its image.
+
+**Manual override** - a state reached by human authority despite incomplete evidence; always recorded as such.
+
+**Measurement** - a cryptographic or structural observation of state.
+
+**Observation cell** - a restrictive cell in which unknown software runs while its behaviour is recorded.
+
+**Policy** - signed rules mapping normalised evidence to state, cell, network and capabilities.
+
+**Posture** - the trust state of a named scope (`DEGRADED`, `PROVEN`, `ISOLATED`, `RECOVERY`). Always scoped, never "clean".
+
+**Provenance rank** - how strongly an artifact's origin is authenticated, from `REPRODUCED` (1) to `UNKNOWN` (6).
+
+**Quarantine** - a state in which an artifact is denied ordinary execution.
+
+**Recovery plane** - the independently bootable environment used when the host's trust is unavailable.
+
+**Revocation** - explicit, signed, terminal-until-superseded invalidation of prior trust, by EPN, content digest or signer.
+
+**Root of trust** - a component or key accepted as an initial anchor rather than derived from the mutable system being evaluated.
+
+**Sealed memfd** - an in-memory file whose contents can no longer be changed; what a cell executes.
+
+**Slot** - one of the A/B boot images with its priority, remaining tries and success flag.
+
+**Supervisor** - the deployment where JLR boots first from verified media and governs the host as a workload.
+
+**Torn tail** - an incomplete final ledger record left by a crash during append; quarantined, never deleted.
+
+**Trust anchor** - a key or artifact the verifier accepts without deriving it from anything else.
+
+**Trust engine** - the deterministic decision function over evidence and a policy version.

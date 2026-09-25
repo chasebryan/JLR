@@ -1,58 +1,66 @@
-# JLR Configuration and Cloning
+# Configuration and Cloning
 
-JLR installations SHOULD be cloneable without cloning secrets or historical machine identity. A portable JLR configuration is a **signed profile bundle**; device identity, private keys, boot identity, and evidence history remain local unless explicitly migrated.
+JLR installations should be cloneable **without cloning secrets or historical machine identity**. What is portable is a
+*profile*: the rules. What is never portable is anything that identifies one machine or lets someone act as it.
 
-## Profile bundle
+## 1. What is a profile
 
-A bundle MAY contain schema version, profile name, policy epoch, admission defaults, jail profiles, capability rules, measurement targets, network defaults, recovery behavior, retention rules, update channels, minimum required enforcement features, and signer identity.
+A profile is a **policy**: the ordered tiers, the guards (setuid, writable-path and manual-grant ceilings), the
+evidence age limit, the blocked classes and the exec-gate mode. It is authored as TOML, compiled to canonical CBOR,
+validated, and signed under the **policy** role with scope `*`, meaning valid on any node that trusts the signing key.
 
-A portable bundle MUST NOT contain device-unique private keys by default.
+```sh
+jlr policy show > profile.toml         # on the source machine
+$EDITOR profile.toml                   # optional; bump `epoch`
+jlr policy set profile.toml            # on the target: compile, validate, sign with the target's policy key, install
+```
 
-## Conceptual profile
+Parsing and effective-policy calculation are deterministic. **The same TOML gives the same compiled policy and the same
+digest on every machine and every build**; `jlr status` prints the digest, so two machines can be compared at a glance,
+and a round trip through TOML is tested to be byte-identical.
 
-~~~text
-profile:
-  name: workstation-strict
-  schema: 1
-  policy_epoch: 17
-admission:
-  unknown: quarantine
-  require_user_approval: true
-  default_cell: CELL-0
-runtime:
-  supervisor_mode: ram
-  fail_on_missing_enforcement: true
-network:
-  unknown_default: none
-recovery:
-  readonly_host_mount_default: true
-~~~
+## 2. What is node-scoped, and therefore not cloned
 
-Parsing and effective-policy calculation MUST be deterministic.
+| Object | Scope | Why it stays local |
+|---|---|---|
+| Device key, policy key (companion mode) | This machine | Signing authority |
+| Node identifier, boot ids, execution ids | This machine | Identity |
+| Ledger and checkpoints | This machine | History cannot be inherited |
+| Baselines | This node | They vouch for *this* machine's files |
+| Approvals | This node | A grant for one artifact on one machine |
+| Object store, index, caches | This machine | Derived from local measurement |
+| Trust anchors | This machine | They decide whose signatures count here |
 
-## Clone workflow
+Approvals, baselines, events, checkpoints and EPN envelopes carry the node identifier in the signed context, so a valid one
+copied to another machine **does not verify there**. A cloned machine must not silently authorise its new hardware's
+devices, storage or network, and it does not: nothing device-specific is in a profile.
 
-1. export signed non-secret profile bundle
-2. install and verify JLR on target
-3. generate new device identity and local keys
-4. import profile
-5. resolve hardware-specific grants
-6. install/register host Linux
-7. create fresh host baseline and evidence chain
-8. optionally enroll independent checkpoints
+## 3. Clone workflow
 
-## Never cloned automatically
+1. Export the profile as TOML (above). It contains no key, no identity and no history.
+2. Install and verify JLR on the target; run `jlr init`. This generates a **new** device identity and new keys.
+3. Import the profile with `jlr policy set`. It must have a higher `epoch` than the fresh install's (1). It is compiled
+   and validated; a profile the target cannot enforce, or one that breaks the safety rules, is **refused**, never
+   partially applied.
+4. Install or register the host; take a fresh inventory; enrol a fresh baseline; take a first checkpoint off the machine.
 
-Private signing keys, disk-encryption keys, TPM-sealed secrets, credentials, device identity, boot IDs, execution-instance IDs, ledger MAC/checkpoint secrets, and network credentials require explicit migration.
+## 4. Effective policy and missing enforcement
 
-## Hardware adaptation
+`jlr status` shows the policy name, epoch and digest. `jlr doctor` shows which enforcement features this machine actually
+has. A profile whose tiers assume a control the machine lacks is not silently weakened: cells built from it report the
+unavailable controls, and mandatory controls refuse the launch.
 
-A cloned profile MUST NOT silently authorize a new machine's cameras, microphones, GPUs, SDRs, raw USB devices, removable storage, TPM, or other hardware.
+## 5. Duplicate identities
 
-## Effective policy
+Copying a state directory byte for byte after initialisation duplicates the node identifier, keys and ledger. Two machines
+would then sign as one. This is a **duplicate identity incident**; both identities should be treated as untrusted until
+re-enrolled. Detection is **designed, not built**: comparing checkpoints from the two machines shows a fork (two different
+roots at the same size). Until an enrolment authority exists, do not clone state directories; clone profiles.
 
-JLR SHOULD display the resolved policy digest, source bundle(s), local overrides, policy epoch, signer, required enforcement features, and missing enforcement features.
+## 6. Fleet use (designed)
 
-Import MUST fail or enter a clearly degraded mode when a mandatory control cannot be enforced.
-
-A profile bundle plus a JLR release SHOULD produce the same effective-policy digest across compatible machines, excluding explicitly declared local fields.
+An organisation-wide policy signed by a key held centrally needs the machines to *trust that key as their policy
+anchor*. `jlr init` currently generates a local policy key and does not accept an external one, so a portable, centrally
+signed profile is not available yet. Roles with signed manifests (`S0`, `S1`, `R`, `F`, `V`, `DEV`) from the earlier draft
+remain the model for what such an enrolment would bind: image digest, role, node identifier, minimum epoch, policy digest,
+device assignments and backup destination, with revocation of a node or role that does not destroy encrypted backups.

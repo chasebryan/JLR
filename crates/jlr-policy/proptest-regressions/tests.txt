@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8743467251faae467fa655689d80b5e8c16f4612a11c739406e887beacfd132a # shrinks to class = Boot, prov = Reproduced, kinds = [ContentDigestMatch], prior = None, caps = [KernelModuleLoad]
+cc 4186a100289704d4c67db8b6cb27830ddf67832f09cd7fc01cf026d24eb81e30 # shrinks to class = Boot, prov = Reproduced, kinds = [RevocationHit, ContentDigestMatch], prior = None, strict = false
+cc 772cd29e7ec81a2be0e1dcbeb71dffd4c3ee5efd22e1b88b7ba0a9fa3e52f64d # shrinks to class = Boot, prov = Reproduced, kinds = [ContentDigestMatch, ForbiddenBehavior], prior = None, strict = false
