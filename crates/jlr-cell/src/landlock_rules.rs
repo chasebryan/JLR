@@ -1,10 +1,18 @@
 //! Landlock rules for a cell.
 //!
-//! Landlock is defence in depth on top of the mount namespace: even if a
-//! process could reach a path outside its private root, the kernel would
-//! still refuse the access. `EXECUTE` is deliberately not handled, because a
-//! sealed memfd has no place in the file hierarchy for a path rule to name;
-//! executability is controlled by read-only, `noexec` mounts instead.
+//! Landlock is defence in depth on top of the mount namespace, and it is
+//! scoped to what it can express cleanly:
+//!
+//! * **Writes** are handled: a process can create, remove or modify only
+//!   below the paths granted to the cell, even if it could reach some other
+//!   path. What a cell can *see* is decided by its private mount namespace,
+//!   because Landlock rules are recursive and cannot allow listing `/`
+//!   without allowing everything beneath it.
+//! * **Execute** is deliberately not handled: a sealed memfd has no place in
+//!   the file hierarchy for a path rule to name. Executability is controlled
+//!   by read-only, `noexec` mounts instead.
+//! * **TCP connect and bind** are handled when the network mode is a
+//!   destination allow-list.
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -22,9 +30,7 @@ pub struct LandlockOutcome {
 
 /// Inputs to the ruleset.
 pub struct LandlockPlan<'a> {
-    /// Paths readable (directories recursively).
-    pub read: &'a [String],
-    /// Paths readable and writable.
+    /// Paths that may be written (directories recursively).
     pub write: &'a [String],
     /// When set, TCP `connect` is limited to these ports and `bind` to `bind_ports`.
     pub tcp: Option<(&'a [u16], &'a [u16])>,
@@ -33,7 +39,7 @@ pub struct LandlockPlan<'a> {
 /// Applies the ruleset to the calling process.
 pub fn apply(plan: &LandlockPlan<'_>) -> Result<LandlockOutcome, String> {
     let abi = ABI::V4;
-    let handled_fs = AccessFs::from_all(abi) & !AccessFs::Execute;
+    let handled_fs = AccessFs::from_write(abi);
     let mut ruleset = Ruleset::default().set_compatibility(CompatLevel::BestEffort);
     ruleset = ruleset.handle_access(handled_fs).map_err(|e| e.to_string())?;
     if plan.tcp.is_some() {
@@ -41,12 +47,6 @@ pub fn apply(plan: &LandlockPlan<'_>) -> Result<LandlockOutcome, String> {
     }
     let mut created = ruleset.create().map_err(|e| e.to_string())?;
 
-    let read_access = AccessFs::from_read(abi) & !AccessFs::Execute;
-    for p in plan.read {
-        if let Ok(fd) = PathFd::new(p) {
-            created = created.add_rule(PathBeneath::new(fd, read_access)).map_err(|e| e.to_string())?;
-        }
-    }
     for p in plan.write {
         if let Ok(fd) = PathFd::new(p) {
             created = created.add_rule(PathBeneath::new(fd, handled_fs)).map_err(|e| e.to_string())?;

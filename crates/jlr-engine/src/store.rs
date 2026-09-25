@@ -57,8 +57,10 @@ pub fn mkdir_private(p: &Path) -> std::io::Result<()> {
     fs::DirBuilder::new().recursive(true).mode(0o700).create(p)
 }
 
-/// Writes a file atomically: temp file, fsync, rename, fsync of the directory.
-pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Writes a file atomically. With `durable`, the data and the directory entry
+/// are flushed before returning; otherwise the caller must flush the file
+/// system (see [`sync_fs`]) before anything that depends on the file.
+fn write_atomic_inner(path: &Path, data: &[u8], durable: bool) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     mkdir_private(dir)?;
     let tmp =
@@ -66,11 +68,30 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     {
         let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
         f.write_all(data)?;
-        f.sync_all()?;
+        if durable {
+            f.sync_all()?;
+        }
     }
     fs::rename(&tmp, path)?;
-    fs::File::open(dir).and_then(|d| d.sync_all())?;
+    if durable {
+        fs::File::open(dir).and_then(|d| d.sync_all())?;
+    }
     Ok(())
+}
+
+/// Writes a file atomically and durably: temp file, fsync, rename, fsync of the directory.
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomic_inner(path, data, true)
+}
+
+/// Flushes the whole file system that holds `dir`.
+///
+/// Objects are written without individual syncs for speed; this makes them
+/// durable in one call, and must run before the ledger events that reference
+/// them are made durable.
+pub fn sync_fs(dir: &Path) -> std::io::Result<()> {
+    let f = fs::File::open(dir)?;
+    nix::unistd::syncfs(&f).map_err(std::io::Error::from)
 }
 
 /// Stores `data` under its own SHA-256 in `<objects>/<kind>/<aa>/<rest>.cbor`, once.
@@ -79,7 +100,7 @@ pub fn put_object(paths: &Paths, kind: &str, data: &[u8]) -> std::io::Result<Dig
     let hex = d.hex();
     let path = paths.objects().join(kind).join(&hex[..2]).join(format!("{}.cbor", &hex[2..]));
     if !path.exists() {
-        write_atomic(&path, data)?;
+        write_atomic_inner(&path, data, false)?;
     }
     Ok(d)
 }

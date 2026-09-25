@@ -4,7 +4,7 @@ use crate::error::{EngineError, runnable};
 use crate::paths::Paths;
 use crate::setup::hex;
 use crate::store::{
-    IndexFile, IndexRow, NodeInfo, get_object, has_object, load_index, put_object, save_index, write_atomic,
+    IndexFile, IndexRow, NodeInfo, get_object, has_object, load_index, put_object, save_index, sync_fs, write_atomic,
 };
 use jlr_cbor::{Cbor, Value};
 use jlr_cell::{CellSpec, EnforcementReport, SealedExe, Stdio3, launch};
@@ -23,6 +23,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// A checkpoint is written after this many events, so that opening the ledger
+/// verifies at most this many signatures.
+const CHECKPOINT_EVERY: u64 = 256;
 
 /// Engine configuration.
 #[derive(Clone)]
@@ -297,8 +301,8 @@ impl Engine {
         let device = SigningKeypair::load(&paths.device_key())
             .map_err(|e| EngineError::Verification(format!("device key: {e}")))?;
         let boot = random_bytes::<16>().map_err(|e| EngineError::Invalid(e.to_string()))?;
-        let (mut ledger, report) = Ledger::open(&paths.ledger(), &node.node_id, device, &anchors, boot)?;
-        let events = jlr_ledger::read_events(&paths.ledger(), &node.node_id, &anchors)?;
+        let (mut ledger, report, events) =
+            Ledger::open_with_events(&paths.ledger(), &node.node_id, device, &anchors, boot)?;
 
         // State is derived from the ledger, never from a cache.
         let mut states: HashMap<EpnId, AdmissionState> = HashMap::new();
@@ -397,8 +401,29 @@ impl Engine {
         (self.cfg.clock)()
     }
 
+    /// Makes every object durable, then the ledger. The order matters: an event
+    /// must never reference an object that a crash could still lose.
+    fn flush(&mut self) -> Result<(), EngineError> {
+        sync_fs(self.paths.root())?;
+        // Keep the tail that must be verified in full at the next start short.
+        if self.ledger.events_since_checkpoint() >= CHECKPOINT_EVERY {
+            self.ledger.checkpoint()?;
+            self.checkpoints += 1;
+        }
+        self.ledger.sync()?;
+        Ok(())
+    }
+
     fn load_dpkg(&self) -> Option<DpkgDb> {
-        DpkgDb::load(self.cfg.dpkg_root.as_deref().unwrap_or(Path::new("/"))).ok()
+        let root = self.cfg.dpkg_root.as_deref().unwrap_or(Path::new("/"));
+        DpkgDb::load_cached(root, &self.paths.cache().join("dpkg.idx")).ok()
+    }
+
+    /// Reads the most recent ledger events, oldest first, after full verification.
+    pub fn recent_events(&self, n: usize) -> Result<Vec<jlr_model::Event>, EngineError> {
+        let mut all = jlr_ledger::read_events(&self.paths.ledger(), &self.node.node_id, &self.anchors)?;
+        let skip = all.len().saturating_sub(n);
+        Ok(all.split_off(skip))
     }
 
     /// Node identity.
@@ -642,7 +667,7 @@ impl Engine {
             Ok(())
         })();
         self.ledger.set_sync(true);
-        self.ledger.sync()?;
+        self.flush()?;
         self.save_index()?;
         result?;
         Ok((report, ()))
@@ -735,7 +760,7 @@ impl Engine {
             }
         }
         self.ledger.set_sync(true);
-        self.ledger.sync()?;
+        self.flush()?;
         self.save_index()?;
         if let Some(e) = fail {
             return Err(e);
@@ -780,7 +805,7 @@ impl Engine {
                 Basis::None,
                 &format!("denied execution of {}: state {}", seen.path, decision.state),
             )?;
-            self.ledger.sync()?;
+            self.flush()?;
             return Err(EngineError::NotRunnable(Box::new(decision)));
         }
         let mut argv = vec![obs.record.name.clone()];
@@ -793,7 +818,7 @@ impl Engine {
             Err(e) => {
                 let detail = format!("could not start {}: {e}", seen.path);
                 self.log(EventKind::Enforcement, Some(&id), None, None, vec![], Basis::None, &detail)?;
-                self.ledger.sync()?;
+                self.flush()?;
                 return Err(e.into());
             }
         };
@@ -827,7 +852,7 @@ impl Engine {
             Basis::None,
             &format!("{} exited with code {}", seen.path, outcome.code),
         )?;
-        self.ledger.sync()?;
+        self.flush()?;
         Ok(RunResult { decision, report, exit_code: outcome.code, stdout, stderr })
     }
 
@@ -886,7 +911,7 @@ impl Engine {
             }
             _ => self.evaluate_now(&record, &[], &[]),
         };
-        self.ledger.sync()?;
+        self.flush()?;
         Ok(decision)
     }
 
@@ -929,8 +954,37 @@ impl Engine {
                 n += self.apply_decision(&id, &d, ev, &format!("revoked: {reason}"))?;
             }
         }
-        self.ledger.sync()?;
+        self.flush()?;
         Ok(n)
+    }
+
+    /// Installs a new signed policy. The epoch must be strictly greater than the current one.
+    pub fn set_policy(&mut self, new: Policy) -> Result<Digest, EngineError> {
+        new.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
+        if new.epoch <= self.policy.epoch {
+            return Err(EngineError::Rollback(format!(
+                "policy epoch {} must be greater than the current epoch {}",
+                new.epoch, self.policy.epoch
+            )));
+        }
+        let key = SigningKeypair::load(&self.paths.policy_key())
+            .map_err(|e| EngineError::Verification(format!("policy key: {e}")))?;
+        let bytes = Envelope::sign(record_type::POLICY, "*", &new.to_cbor(), &key);
+        Envelope::verify(
+            &bytes,
+            record_type::POLICY,
+            "*",
+            &self.anchors,
+            record_type::allowed_signers(record_type::POLICY),
+        )
+        .map_err(|e| EngineError::Verification(e.to_string()))?;
+        write_atomic(&self.paths.policy(), &bytes)?;
+        let digest = new.digest();
+        let detail = format!("policy={} epoch={} digest={}", new.name, new.epoch, digest);
+        self.policy = new;
+        self.log(EventKind::PolicyLoad, None, None, None, vec![digest], Basis::Policy, &detail)?;
+        self.flush()?;
+        Ok(digest)
     }
 
     /// Writes a signed checkpoint and returns its envelope for off-machine storage.

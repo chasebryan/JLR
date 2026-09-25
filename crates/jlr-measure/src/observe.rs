@@ -123,7 +123,6 @@ pub fn observe(path: &Path, dpkg: Option<&mut DpkgDb>, opts: &ObserveOptions) ->
         signer: None,
         source,
         dependencies: Vec::new(),
-        discovered_at: opts.now,
     };
     let _ = ArtifactClass::Other;
     Ok(Observation { file, record, evidence, path: real })

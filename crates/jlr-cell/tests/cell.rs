@@ -111,6 +111,13 @@ fn host_files_are_invisible() {
     assert!(out.contains("nohome"), "{out}");
     assert!(!out.contains("root:"), "shadow must not be readable: {out}");
     let root_listing = out.lines().next().unwrap();
+    assert!(!root_listing.trim().is_empty(), "`ls /` printed nothing inside the cell: {out}");
+    for needed in ["usr", "tmp", "proc", "dev"] {
+        assert!(
+            root_listing.split_whitespace().any(|e| e == needed),
+            "{needed} missing from the private root: {root_listing}"
+        );
+    }
     for allowed in root_listing.split_whitespace() {
         assert!(
             ["bin", "dev", "etc", "lib", "lib32", "lib64", "libx32", "proc", "run", "sbin", "tmp", "usr"]

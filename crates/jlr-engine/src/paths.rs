@@ -80,6 +80,10 @@ impl Paths {
     pub fn objects(&self) -> PathBuf {
         self.root.join("objects")
     }
+    /// Disposable derived data; safe to delete at any time.
+    pub fn cache(&self) -> PathBuf {
+        self.root.join("cache")
+    }
     /// The path index (a cache).
     pub fn index(&self) -> PathBuf {
         self.root.join("index.cbor")

@@ -214,7 +214,6 @@ fn observe_reports_manifest_match_and_mismatch_without_claiming_a_signature() {
     assert_eq!(o.record.provenance, ProvenanceRank::SourceKnown);
     assert_eq!(o.record.source.channel, "dpkg");
     assert_eq!(o.record.class, ArtifactClass::Script, "executable of unknown format");
-    assert_eq!(o.record.discovered_at, 42);
 
     // Tamper with the file: it no longer matches the package manifest.
     fs::write(&good, b"evil-bytes").unwrap();
@@ -282,4 +281,58 @@ fn real_host_dpkg_database_loads_when_present() {
     assert!(db.package_count() > 10);
     let own = db.ownership("/bin/sh").or_else(|| db.ownership("/usr/bin/sh"));
     assert!(own.is_some(), "/bin/sh must be owned by a package on a Debian-family host");
+}
+
+#[test]
+fn cached_index_matches_a_fresh_load_and_is_invalidated_by_changes() {
+    let sys = tempfile::tempdir().unwrap();
+    fake_dpkg(sys.path(), &[("/usr/bin/tool", b"tool-bytes"), ("/usr/bin/other", b"other")]);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = cache_dir.path().join("dpkg.idx");
+
+    let mut fresh = DpkgDb::load(sys.path()).unwrap();
+    let mut first = DpkgDb::load_cached(sys.path(), &cache).unwrap(); // builds and writes
+    assert!(cache.exists());
+    let mut second = DpkgDb::load_cached(sys.path(), &cache).unwrap(); // reads
+    for db in [&mut fresh, &mut first, &mut second] {
+        assert_eq!(db.package_count(), 1);
+        let own = db.ownership("/usr/bin/tool").unwrap();
+        assert_eq!(own.package, "coreutils");
+        assert_eq!(own.manifest_md5.as_deref(), Some(dpkg::md5_hex(b"tool-bytes").as_str()));
+        assert!(db.ownership("/usr/bin/nothing").is_none());
+        assert!(db.ownership("/bin/other").is_some(), "usr-merge lookups work through the index");
+    }
+
+    // A change to dpkg's own files must invalidate the cache.
+    let list = sys.path().join("var/lib/dpkg/info/coreutils.list");
+    let mut text = fs::read_to_string(&list).unwrap();
+    text.push_str("/usr/bin/added\n");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&list, text).unwrap();
+    let mut third = DpkgDb::load_cached(sys.path(), &cache).unwrap();
+    assert!(third.ownership("/usr/bin/added").is_some(), "stale cache was used after dpkg's files changed");
+}
+
+#[test]
+fn damaged_or_truncated_caches_are_ignored_not_trusted() {
+    let sys = tempfile::tempdir().unwrap();
+    fake_dpkg(sys.path(), &[("/usr/bin/tool", b"x")]);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = cache_dir.path().join("dpkg.idx");
+    DpkgDb::load_cached(sys.path(), &cache).unwrap();
+    let good = fs::read(&cache).unwrap();
+    for cut in [0usize, 5, 20, 45, good.len() / 2, good.len() - 1] {
+        fs::write(&cache, &good[..cut]).unwrap();
+        let mut db = DpkgDb::load_cached(sys.path(), &cache).unwrap();
+        assert!(db.ownership("/usr/bin/tool").is_some(), "cut at {cut} must fall back to a fresh build");
+    }
+    // Garbage that keeps the header but corrupts offsets.
+    let mut bad = good.clone();
+    let n = bad.len();
+    for b in &mut bad[n - 40..] {
+        *b = 0xff;
+    }
+    fs::write(&cache, &bad).unwrap();
+    let mut db = DpkgDb::load_cached(sys.path(), &cache).unwrap();
+    assert!(db.ownership("/usr/bin/tool").is_some());
 }

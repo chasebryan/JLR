@@ -21,7 +21,6 @@ fn artifact(class: ArtifactClass, prov: P, name: &str) -> EpnRecord {
         signer: Some("vendor-a".into()),
         source: Source { channel: "test".into(), origin: None, path: None },
         dependencies: vec![],
-        discovered_at: NOW,
     }
 }
 

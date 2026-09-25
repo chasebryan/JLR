@@ -543,7 +543,6 @@ fn stage2(spec: CellSpec, ns_note: &str, cgroup_name: &str) -> i32 {
     // Landlock.
     let (connect, bind_ports) = ports(&spec);
     let plan = LandlockPlan {
-        read: &layout.read,
         write: &layout.write,
         tcp: (spec.network == NetworkMode::DestinationAllowlist).then_some((connect.as_slice(), bind_ports.as_slice())),
     };

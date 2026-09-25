@@ -517,3 +517,48 @@ fn a_file_swapped_after_measurement_never_runs() {
         Err(e) => panic!("{e}"),
     }
 }
+
+#[test]
+fn set_policy_requires_a_higher_epoch_and_takes_effect() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let exe = lab.file("opt/tool", &elf());
+    let mut e = lab.open();
+    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    let id = id_of(&e, &exe);
+    assert_eq!(e.state_of(&id), Some(S::Observed));
+
+    assert!(
+        matches!(e.set_policy(jlr_policy::Policy::strict(1)), Err(EngineError::Rollback(_))),
+        "same epoch must be refused"
+    );
+    let mut invalid = jlr_policy::Policy::strict(2);
+    invalid.tiers.pop();
+    assert!(matches!(e.set_policy(invalid), Err(EngineError::Invalid(_))), "an invalid policy must be refused");
+    assert_eq!(e.policy().epoch, 1);
+
+    e.set_policy(jlr_policy::Policy::strict(2)).unwrap();
+    assert_eq!((e.policy().name.as_str(), e.policy().epoch), ("strict", 2));
+    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    assert_eq!(e.state_of(&id), Some(S::Quarantined), "the stricter policy re-evaluates known artifacts");
+    drop(e);
+    assert_eq!(lab.open().policy().epoch, 2, "the new policy survives a restart");
+    assert!(events(&lab).iter().any(|x| x.kind == EventKind::PolicyLoad && x.detail.contains("epoch=2")));
+}
+
+#[test]
+fn the_same_file_has_the_same_identity_at_different_times() {
+    let lab = Lab::new();
+    lab.init(PolicyKind::Workstation);
+    let exe = lab.file("opt/prog", &elf());
+    let mut e = lab.open();
+    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    let first = id_of(&e, &exe);
+    lab.clock.fetch_add(86_400, Ordering::SeqCst);
+    let second = id_of(&e, &exe);
+    assert_eq!(first, second, "identity must not depend on when the file is observed");
+    assert_eq!(e.state_of(&second), Some(S::Observed), "and the recorded state must be found again");
+    let before = e.status().ledger_events;
+    e.scan(&[lab.sys.clone()], &Lab::scan_opts()).unwrap();
+    assert_eq!(e.status().ledger_events, before, "rescanning later must not look like a new artifact");
+}

@@ -23,12 +23,20 @@ pub struct DpkgOwnership {
     pub manifest_md5: Option<String>,
 }
 
-/// An in-memory index of installed packages and their files.
+/// An index of installed packages and the paths they own.
+///
+/// Paths are held in one sorted byte blob and found by binary search, so a
+/// lookup allocates nothing and the whole index can be cached on disk and
+/// reloaded in milliseconds.
 #[derive(Debug, Default)]
 pub struct DpkgDb {
     root: PathBuf,
-    owner: HashMap<String, String>,
-    versions: HashMap<String, String>,
+    /// `(name, version)` per package; owners index into this.
+    packages: Vec<(String, String)>,
+    blob: Vec<u8>,
+    /// `offsets[i]..offsets[i + 1]` is path `i` inside `blob`; one extra entry closes the last path.
+    offsets: Vec<u32>,
+    owners: Vec<u32>,
     md5: HashMap<String, HashMap<String, String>>,
 }
 
@@ -41,16 +49,63 @@ fn strip_usrmerge(p: &str) -> Option<String> {
     None
 }
 
+const CACHE_MAGIC: &[u8; 8] = b"JLRDPKG1";
+
+/// Fingerprint of everything the index is derived from: the status file and
+/// the name, size and change times of every list and manifest file. If dpkg
+/// or anyone else touches them, the fingerprint changes and the cache is rebuilt.
+fn fingerprint(root: &Path) -> std::io::Result<[u8; 32]> {
+    use jlr_crypto::Digest;
+    use std::os::unix::fs::MetadataExt;
+    let mut parts: Vec<u8> = Vec::new();
+    let mut add = |name: &str, m: &fs::Metadata| {
+        parts.extend_from_slice(name.as_bytes());
+        for v in [m.len(), m.mtime() as u64, m.mtime_nsec() as u64, m.ctime() as u64, m.ctime_nsec() as u64, m.ino()] {
+            parts.extend_from_slice(&v.to_le_bytes());
+        }
+    };
+    add("status", &fs::metadata(root.join("var/lib/dpkg/status"))?);
+    let mut names: Vec<(String, fs::Metadata)> = Vec::new();
+    for e in fs::read_dir(root.join("var/lib/dpkg/info"))? {
+        let e = e?;
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.ends_with(".list") || n.ends_with(".md5sums") {
+            names.push((n, e.metadata()?));
+        }
+    }
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (n, m) in &names {
+        add(n, m);
+    }
+    Ok(Digest::of_parts("jlr-dpkg-index-v1", &[&parts]).0)
+}
+
 impl DpkgDb {
-    /// Loads the database rooted at `root` (normally `/`).
+    /// Loads the database rooted at `root` (normally `/`) by parsing dpkg's files.
     pub fn load(root: &Path) -> std::io::Result<DpkgDb> {
+        Self::build(root)
+    }
+
+    /// Loads through an on-disk cache at `cache`, rebuilding it when dpkg's
+    /// files have changed. A missing, stale or damaged cache is never an error.
+    pub fn load_cached(root: &Path, cache: &Path) -> std::io::Result<DpkgDb> {
+        let fp = fingerprint(root)?;
+        if let Some(db) = Self::read_cache(root, cache, &fp) {
+            return Ok(db);
+        }
+        let db = Self::build(root)?;
+        let _ = db.write_cache(cache, &fp); // best effort
+        Ok(db)
+    }
+
+    fn build(root: &Path) -> std::io::Result<DpkgDb> {
         let info = root.join("var/lib/dpkg/info");
         let status = root.join("var/lib/dpkg/status");
         let mut db = DpkgDb { root: root.to_owned(), ..DpkgDb::default() };
 
-        // Installed packages and versions from the status file.
         let mut text = String::new();
         fs::File::open(&status)?.read_to_string(&mut text)?;
+        let mut index_of: HashMap<String, u32> = HashMap::new();
         for stanza in text.split("\n\n") {
             let (mut name, mut arch, mut version, mut installed, mut multi) = (None, None, None, false, false);
             for line in stanza.lines() {
@@ -72,37 +127,128 @@ impl DpkgDb {
                     (true, Some(a)) => format!("{n}:{a}"),
                     _ => n,
                 };
-                db.versions.insert(key, v);
+                index_of.insert(key.clone(), db.packages.len() as u32);
+                db.packages.push((key, v));
             }
         }
 
+        let mut pairs: Vec<(String, u32)> = Vec::new();
         for entry in fs::read_dir(&info)? {
             let entry = entry?;
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str() else { continue };
-            if let Some(pkg) = name.strip_suffix(".list") {
-                if !db.versions.contains_key(pkg) {
-                    continue;
-                }
-                let content = fs::read_to_string(entry.path()).unwrap_or_default();
-                for line in content.lines() {
-                    if line.starts_with('/') && line != "/." {
-                        db.owner.entry(line.to_owned()).or_insert_with(|| pkg.to_owned());
-                    }
+            let Some(pkg) = name.strip_suffix(".list") else { continue };
+            let Some(&idx) = index_of.get(pkg) else { continue };
+            let content = fs::read_to_string(entry.path()).unwrap_or_default();
+            for line in content.lines() {
+                if line.starts_with('/') && line != "/." {
+                    pairs.push((line.to_owned(), idx));
                 }
             }
         }
+        // Stable sort keeps the first package that claims a path, as before.
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs.dedup_by(|later, first| later.0 == first.0);
+        db.offsets.reserve(pairs.len() + 1);
+        db.owners.reserve(pairs.len());
+        for (path, owner) in pairs {
+            db.offsets.push(db.blob.len() as u32);
+            db.blob.extend_from_slice(path.as_bytes());
+            db.owners.push(owner);
+        }
+        db.offsets.push(db.blob.len() as u32);
         Ok(db)
+    }
+
+    fn write_cache(&self, path: &Path, fp: &[u8; 32]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out: Vec<u8> = Vec::with_capacity(self.blob.len() + self.offsets.len() * 8 + 4096);
+        out.extend_from_slice(CACHE_MAGIC);
+        out.extend_from_slice(fp);
+        out.extend_from_slice(&(self.packages.len() as u32).to_le_bytes());
+        for (n, v) in &self.packages {
+            out.extend_from_slice(&(n.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            out.extend_from_slice(n.as_bytes());
+            out.extend_from_slice(v.as_bytes());
+        }
+        out.extend_from_slice(&(self.owners.len() as u32).to_le_bytes());
+        for o in &self.offsets {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        for o in &self.owners {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        out.extend_from_slice(&self.blob);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        fs::File::create(&tmp)?.write_all(&out)?;
+        fs::rename(tmp, path)
+    }
+
+    fn read_cache(root: &Path, path: &Path, fp: &[u8; 32]) -> Option<DpkgDb> {
+        let data = fs::read(path).ok()?;
+        let mut r = Reader { data: &data, pos: 0 };
+        if r.take(8)? != CACHE_MAGIC || r.take(32)? != fp {
+            return None;
+        }
+        let n_pkgs = r.u32()? as usize;
+        let mut packages = Vec::with_capacity(n_pkgs.min(1 << 20));
+        for _ in 0..n_pkgs {
+            let (nl, vl) = (r.u16()? as usize, r.u16()? as usize);
+            let n = String::from_utf8(r.take(nl)?.to_vec()).ok()?;
+            let v = String::from_utf8(r.take(vl)?.to_vec()).ok()?;
+            packages.push((n, v));
+        }
+        let n_paths = r.u32()? as usize;
+        let mut offsets = Vec::with_capacity(n_paths + 1);
+        for _ in 0..=n_paths {
+            offsets.push(r.u32()?);
+        }
+        let mut owners = Vec::with_capacity(n_paths);
+        for _ in 0..n_paths {
+            let o = r.u32()?;
+            if o as usize >= packages.len() {
+                return None;
+            }
+            owners.push(o);
+        }
+        let blob = data.get(r.pos..)?.to_vec();
+        // Structural validation: offsets must be monotonic and within the blob.
+        if offsets.first() != Some(&0)
+            || *offsets.last()? as usize != blob.len()
+            || offsets.windows(2).any(|w| w[0] > w[1])
+        {
+            return None;
+        }
+        Some(DpkgDb { root: root.to_owned(), packages, blob, offsets, owners, md5: HashMap::new() })
     }
 
     /// Number of installed packages.
     pub fn package_count(&self) -> usize {
-        self.versions.len()
+        self.packages.len()
     }
 
     /// Number of owned paths.
     pub fn path_count(&self) -> usize {
-        self.owner.len()
+        self.owners.len()
+    }
+
+    fn find(&self, path: &str) -> Option<u32> {
+        let target = path.as_bytes();
+        let (mut lo, mut hi) = (0usize, self.owners.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let cur = &self.blob[self.offsets[mid] as usize..self.offsets[mid + 1] as usize];
+            match cur.cmp(target) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(self.owners[mid]),
+            }
+        }
+        None
     }
 
     fn manifest(&mut self, pkg: &str) -> &HashMap<String, String> {
@@ -125,8 +271,8 @@ impl DpkgDb {
     pub fn ownership(&mut self, path: &str) -> Option<DpkgOwnership> {
         let candidates = [Some(path.to_owned()), strip_usrmerge(path), path.strip_prefix("/usr").map(str::to_owned)];
         for cand in candidates.into_iter().flatten() {
-            if let Some(pkg) = self.owner.get(&cand).cloned() {
-                let version = self.versions.get(&pkg).cloned().unwrap_or_default();
+            if let Some(idx) = self.find(&cand) {
+                let (pkg, version) = self.packages[idx as usize].clone();
                 let manifest = self.manifest(&pkg);
                 let md5 = manifest
                     .get(&cand)
@@ -137,6 +283,25 @@ impl DpkgDb {
             }
         }
         None
+    }
+}
+
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.data.get(self.pos..self.pos.checked_add(n)?)?;
+        self.pos += n;
+        Some(s)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 }
 

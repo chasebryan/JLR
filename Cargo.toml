@@ -9,6 +9,7 @@ members = [
     "crates/jlr-measure",
     "crates/jlr-cell",
     "crates/jlr-engine",
+    "crates/jlr",
 ]
 
 [workspace.package]

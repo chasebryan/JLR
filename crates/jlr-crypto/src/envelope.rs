@@ -190,6 +190,20 @@ impl Envelope {
         })
     }
 
+    /// Extracts the payload of a well-formed envelope **without verifying its signature**.
+    ///
+    /// Only for callers that already hold independent proof that these exact
+    /// bytes are authentic, such as a Merkle root over them that a trusted key
+    /// has signed. Everything else must use [`Envelope::verify`].
+    pub fn unverified_payload(bytes: &[u8]) -> Option<Vec<u8>> {
+        let top = decode(bytes).ok()?;
+        let parts = top.as_tag(COSE_SIGN1_TAG).ok()?.as_array().ok()?;
+        if parts.len() != 4 {
+            return None;
+        }
+        Some(parts[2].as_bytes().ok()?.to_vec())
+    }
+
     /// Reads the signing key identifier without verifying anything.
     ///
     /// The result is untrusted routing information only, for choosing which

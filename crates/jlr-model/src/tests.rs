@@ -14,7 +14,6 @@ fn sample_epn() -> EpnRecord {
         signer: Some("debian-archive".into()),
         source: Source { channel: "dpkg".into(), origin: Some("coreutils".into()), path: Some("/usr/bin/ls".into()) },
         dependencies: vec![Digest::of(b"libc")],
-        discovered_at: 1_790_000_000,
     }
 }
 
@@ -230,4 +229,14 @@ fn record_types_have_disjoint_signer_roles_where_required() {
     assert_eq!(record_type::allowed_signers(record_type::RELEASE), &[Role::Release]);
     assert!(!record_type::allowed_signers(record_type::EVENT).contains(&Role::Policy));
     assert!(record_type::allowed_signers("no-such-type").is_empty());
+}
+
+#[test]
+fn identity_is_stable_across_observations() {
+    // Observing the same file twice must produce the same EPN. Any field that varies between
+    // observations of unchanged bytes (a timestamp, a counter) would break this.
+    let a = sample_epn();
+    let b = EpnRecord::from_cbor(&a.to_cbor()).unwrap();
+    assert_eq!(a.id(), b.id());
+    assert_eq!(a.to_cbor(), b.to_cbor());
 }

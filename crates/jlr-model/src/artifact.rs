@@ -141,6 +141,11 @@ record! {
     /// The immutable identity of an artifact. Its EPN identifier is derived
     /// from the SHA-256 of these canonical bytes, so it can be recomputed by
     /// anyone and never changes when local admission state does.
+    ///
+    /// Nothing volatile belongs here. In particular there is no timestamp:
+    /// when an artifact was first seen is recorded by the ledger's DISCOVER
+    /// event, because a time in the record would give the same bytes a new
+    /// identity on every observation.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct EpnRecord {
         /// Schema version, currently 1.
@@ -163,8 +168,6 @@ record! {
         9 => source: Source,
         /// Content digests of dependencies that the admission depends on.
         10 => dependencies: Vec<Digest>,
-        /// Seconds since the Unix epoch at first discovery (advisory).
-        11 => discovered_at: u64,
     }
 }
 

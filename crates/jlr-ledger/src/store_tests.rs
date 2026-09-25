@@ -296,3 +296,110 @@ fn read_events_returns_verified_history_in_order() {
     fs::write(&file, data).unwrap();
     assert!(crate::read_events(&path(&dir), NODE, &anchors()).is_err());
 }
+
+/// Builds a ledger directory by hand in which event `bad_index` is signed by a stranger,
+/// with a device-signed checkpoint over `checkpoint_size` events.
+fn forge_with_stranger_event(bad_index: usize, total: usize, checkpoint_size: usize) -> TempDir {
+    use jlr_cbor::Cbor;
+    use jlr_crypto::{Digest, Envelope};
+    use jlr_model::{Basis, Event};
+    let dir = tempfile::tempdir().unwrap();
+    let evdir = path(&dir);
+    fs::create_dir_all(&evdir).unwrap();
+    let stranger = SigningKeypair::from_seed([9; 32], Role::Device);
+    let mut tree = crate::merkle::Tree::new();
+    let mut log = Vec::new();
+    let mut prev = Digest::ZERO;
+    for i in 0..total {
+        let ev = Event {
+            seq: i as u64,
+            boot_id: BOOT,
+            wall_time: 0,
+            mono_ns: i as u64,
+            actor: "forge".into(),
+            subject: None,
+            kind: if i == 0 { EventKind::Genesis } else { EventKind::Discover },
+            old_state: None,
+            new_state: None,
+            policy: Digest::ZERO,
+            evidence: vec![],
+            basis: Basis::None,
+            detail: format!("e{i}"),
+            prev,
+        };
+        let signer = if i == bad_index { &stranger } else { &key() };
+        let env = Envelope::sign(jlr_model::record_type::EVENT, NODE, &ev.to_cbor(), signer);
+        prev = Digest::of(&env);
+        tree.push(crate::merkle::leaf_hash(&env));
+        log.extend_from_slice(&crate::store::frame_header(env.len() as u32));
+        log.extend_from_slice(&env);
+    }
+    fs::write(evdir.join("events.log"), &log).unwrap();
+    let cp = Checkpoint {
+        origin: format!("jlr/{NODE}/evidence"),
+        size: checkpoint_size as u64,
+        root: tree.root_at(checkpoint_size).unwrap(),
+        boot_id: BOOT,
+        wall_time: 0,
+        counter: 1,
+        anchor: Anchor::Software,
+    };
+    let env = Envelope::sign(jlr_model::record_type::CHECKPOINT, NODE, &cp.to_cbor(), &key());
+    let mut cpl = crate::store::frame_header(env.len() as u32).to_vec();
+    cpl.extend_from_slice(&env);
+    fs::write(evdir.join("checkpoints.log"), cpl).unwrap();
+    dir
+}
+
+#[test]
+fn checkpointed_prefix_is_covered_by_the_signed_root_not_by_per_event_signatures() {
+    // Event 2 carries a stranger's signature, but a device-signed checkpoint vouches for events 0..5.
+    let dir = forge_with_stranger_event(2, 8, 5);
+    // The exhaustive check verifies every signature and refuses.
+    assert!(verify_dir(&path(&dir), NODE, &anchors(), None).is_err());
+    // Opening trusts the signed root over the prefix, which is the documented trade-off:
+    // a checkpoint is the device key vouching for exactly those bytes.
+    assert_eq!(crate::read_events(&path(&dir), NODE, &anchors()).unwrap().len(), 8);
+}
+
+#[test]
+fn events_after_the_newest_checkpoint_are_always_verified_in_full() {
+    // The stranger's event is at position 6, after the checkpoint over 0..5.
+    let dir = forge_with_stranger_event(6, 8, 5);
+    assert!(verify_dir(&path(&dir), NODE, &anchors(), None).is_err());
+    assert!(crate::read_events(&path(&dir), NODE, &anchors()).is_err(), "the tail must never skip signature checks");
+    assert!(Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).is_err());
+}
+
+#[test]
+fn any_single_bit_flip_is_still_detected_on_the_fast_path() {
+    // Flips inside the checkpointed prefix change the Merkle root; flips in the tail fail signatures.
+    let (dir, mut l) = fresh(6);
+    l.checkpoint().unwrap();
+    l.append(EventDraft::new("test", EventKind::Discover, "tail")).unwrap();
+    drop(l);
+    let file = path(&dir).join("events.log");
+    let good = fs::read(&file).unwrap();
+    assert!(crate::read_events(&path(&dir), NODE, &anchors()).is_ok());
+    for i in 0..good.len() {
+        let mut bad = good.clone();
+        bad[i] ^= 0x01;
+        fs::write(&file, &bad).unwrap();
+        assert!(crate::read_events(&path(&dir), NODE, &anchors()).is_err(), "flip at byte {i} passed the fast path");
+    }
+}
+
+#[test]
+fn opening_verifies_only_the_events_since_the_last_checkpoint() {
+    let (dir, mut l) = fresh(20);
+    assert_eq!(l.events_since_checkpoint(), 21);
+    l.checkpoint().unwrap();
+    assert_eq!(l.events_since_checkpoint(), 0);
+    for i in 0..3 {
+        l.append(EventDraft::new("test", EventKind::Discover, &format!("t{i}"))).unwrap();
+    }
+    assert_eq!(l.events_since_checkpoint(), 3);
+    drop(l);
+    let (l, _) = Ledger::open(&path(&dir), NODE, key(), &anchors(), BOOT).unwrap();
+    assert_eq!(l.events_since_checkpoint(), 3, "the checkpoint position survives a reopen");
+}

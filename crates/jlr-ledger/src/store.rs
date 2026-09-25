@@ -267,42 +267,25 @@ fn env_err(seq: u64, what: &str, e: EnvelopeError) -> LedgerError {
     LedgerError::Corrupt { seq, reason: format!("{what}: {e}") }
 }
 
-fn replay(dir: &Path, node: &str, anchors: &TrustAnchors) -> Result<Replayed, LedgerError> {
+/// Replays a ledger directory.
+///
+/// With `full`, every event signature is verified. Otherwise events covered by
+/// the newest checkpoint whose Merkle root matches the bytes on disk skip
+/// signature verification: that root was signed by a trusted device key over
+/// exactly those bytes, so they cannot have changed. Everything after the
+/// checkpoint is always verified in full.
+fn replay(dir: &Path, node: &str, anchors: &TrustAnchors, full: bool) -> Result<Replayed, LedgerError> {
     let origin = format!("jlr/{node}/evidence");
     let events_data = read_all(&dir.join(EVENTS))?;
     let (frames, valid_len, torn) = split_frames(&events_data)?;
 
+    // Leaf hashes for every frame: plain SHA-256, no signatures involved.
     let mut tree = Tree::new();
-    let mut prev = Digest::ZERO;
-    let mut boot_ids: Vec<[u8; 16]> = Vec::new();
-    let mut parsed: Vec<Event> = Vec::with_capacity(frames.len());
-    for (i, env) in frames.iter().enumerate() {
-        let seq = i as u64;
-        let v =
-            Envelope::verify(env, record_type::EVENT, node, anchors, record_type::allowed_signers(record_type::EVENT))
-                .map_err(|e| env_err(seq, "event signature", e))?;
-        let ev = Event::from_cbor(&v.payload)
-            .map_err(|e| LedgerError::Corrupt { seq, reason: format!("event payload: {e}") })?;
-        if ev.seq != seq {
-            return Err(LedgerError::Corrupt { seq, reason: format!("sequence number {} out of place", ev.seq) });
-        }
-        if ev.prev != prev {
-            return Err(LedgerError::Corrupt { seq, reason: "previous-event link does not match".into() });
-        }
-        if i == 0 && ev.kind != EventKind::Genesis {
-            return Err(LedgerError::Corrupt { seq, reason: "first event is not GENESIS".into() });
-        }
-        if i > 0 && ev.kind == EventKind::Genesis {
-            return Err(LedgerError::Corrupt { seq, reason: "GENESIS may appear only once".into() });
-        }
-        if boot_ids.last() != Some(&ev.boot_id) {
-            boot_ids.push(ev.boot_id);
-        }
-        prev = v.envelope_digest;
+    for env in &frames {
         tree.push(leaf_hash(env));
-        parsed.push(ev);
     }
 
+    // Checkpoints: verify each signature (there are few) and check it against the tree.
     let cp_data = read_all(&dir.join(CHECKPOINTS))?;
     let (cp_frames, _, cp_torn) = split_frames(&cp_data)?;
     let mut checkpoints: Vec<Checkpoint> = Vec::new();
@@ -336,6 +319,50 @@ fn replay(dir: &Path, node: &str, anchors: &TrustAnchors) -> Result<Replayed, Le
     }
     let _ = cp_torn; // A torn checkpoint tail only loses the newest checkpoint.
 
+    // Events at positions below this are covered by a verified checkpoint root.
+    let trusted_prefix = if full { 0 } else { checkpoints.last().map_or(0, |c| c.size as usize) };
+
+    let mut prev = Digest::ZERO;
+    let mut boot_ids: Vec<[u8; 16]> = Vec::new();
+    let mut parsed: Vec<Event> = Vec::with_capacity(frames.len());
+    for (i, env) in frames.iter().enumerate() {
+        let seq = i as u64;
+        let (payload, envelope_digest) = if i < trusted_prefix {
+            let payload = Envelope::unverified_payload(env)
+                .ok_or_else(|| LedgerError::Corrupt { seq, reason: "malformed envelope".into() })?;
+            (payload, Digest::of(env))
+        } else {
+            let v = Envelope::verify(
+                env,
+                record_type::EVENT,
+                node,
+                anchors,
+                record_type::allowed_signers(record_type::EVENT),
+            )
+            .map_err(|e| env_err(seq, "event signature", e))?;
+            (v.payload, v.envelope_digest)
+        };
+        let ev = Event::from_cbor(&payload)
+            .map_err(|e| LedgerError::Corrupt { seq, reason: format!("event payload: {e}") })?;
+        if ev.seq != seq {
+            return Err(LedgerError::Corrupt { seq, reason: format!("sequence number {} out of place", ev.seq) });
+        }
+        if ev.prev != prev {
+            return Err(LedgerError::Corrupt { seq, reason: "previous-event link does not match".into() });
+        }
+        if i == 0 && ev.kind != EventKind::Genesis {
+            return Err(LedgerError::Corrupt { seq, reason: "first event is not GENESIS".into() });
+        }
+        if i > 0 && ev.kind == EventKind::Genesis {
+            return Err(LedgerError::Corrupt { seq, reason: "GENESIS may appear only once".into() });
+        }
+        if boot_ids.last() != Some(&ev.boot_id) {
+            boot_ids.push(ev.boot_id);
+        }
+        prev = envelope_digest;
+        parsed.push(ev);
+    }
+
     Ok(Replayed {
         events_parsed: parsed,
         tree,
@@ -359,7 +386,7 @@ pub fn verify_dir(
     anchors: &TrustAnchors,
     external: Option<&[u8]>,
 ) -> Result<VerifyReport, LedgerError> {
-    let r = replay(dir, node, anchors)?;
+    let r = replay(dir, node, anchors, true)?;
     if r.events == 0 {
         return Err(LedgerError::Empty);
     }
@@ -400,12 +427,14 @@ pub fn verify_dir(
     })
 }
 
-/// Reads and fully verifies every event of a ledger directory.
+/// Reads the events of a ledger directory.
 ///
-/// Verification is identical to [`verify_dir`]; the events are returned only
-/// when every signature, link and checkpoint is valid.
+/// Events after the newest checkpoint are verified in full; earlier events are
+/// covered by that checkpoint's signed Merkle root (see `replay`). Use
+/// [`verify_dir`] for an exhaustive check. Events are returned only when every
+/// link and checkpoint is valid.
 pub fn read_events(dir: &Path, node: &str, anchors: &TrustAnchors) -> Result<Vec<Event>, LedgerError> {
-    let r = replay(dir, node, anchors)?;
+    let r = replay(dir, node, anchors, false)?;
     if r.events == 0 {
         return Err(LedgerError::Empty);
     }
@@ -424,6 +453,7 @@ pub struct Ledger {
     last_env: Digest,
     next_seq: u64,
     counter: u64,
+    last_checkpoint_size: u64,
     boot_id: [u8; 16],
     sync: bool,
 }
@@ -494,6 +524,7 @@ impl Ledger {
             last_env: Digest::ZERO,
             next_seq: 0,
             counter: 0,
+            last_checkpoint_size: 0,
             boot_id,
             sync: true,
         };
@@ -501,7 +532,7 @@ impl Ledger {
         Ok(l)
     }
 
-    /// Opens and fully re-verifies an existing ledger for appending.
+    /// Opens an existing ledger for appending, verifying it as [`read_events`] does.
     pub fn open(
         dir: &Path,
         node: &str,
@@ -509,8 +540,20 @@ impl Ledger {
         anchors: &TrustAnchors,
         boot_id: [u8; 16],
     ) -> Result<(Ledger, OpenReport), LedgerError> {
+        Self::open_with_events(dir, node, key, anchors, boot_id).map(|(l, r, _)| (l, r))
+    }
+
+    /// Like [`Ledger::open`], and also returns the events that were replayed so
+    /// callers need not replay the ledger a second time.
+    pub fn open_with_events(
+        dir: &Path,
+        node: &str,
+        key: SigningKeypair,
+        anchors: &TrustAnchors,
+        boot_id: [u8; 16],
+    ) -> Result<(Ledger, OpenReport, Vec<Event>), LedgerError> {
         let lock = lock(dir)?;
-        let r = replay(dir, node, anchors)?;
+        let r = replay(dir, node, anchors, false)?;
         if r.events == 0 {
             return Err(LedgerError::Empty);
         }
@@ -533,10 +576,11 @@ impl Ledger {
             last_env: r.last_env,
             next_seq: r.events,
             counter,
+            last_checkpoint_size: r.checkpoints.last().map_or(0, |c| c.size),
             boot_id,
             sync: true,
         };
-        Ok((l, report))
+        Ok((l, report, r.events_parsed))
     }
 
     /// Disables `fsync` after each append. For tests and bulk import only.
@@ -551,6 +595,12 @@ impl Ledger {
         self.events.sync_data()?;
         self.checkpoints.sync_data()?;
         Ok(())
+    }
+
+    /// Events appended since the newest checkpoint. Opening the ledger verifies
+    /// exactly these signatures, so callers checkpoint when this grows large.
+    pub fn events_since_checkpoint(&self) -> u64 {
+        self.next_seq - self.last_checkpoint_size
     }
 
     /// Number of events in the ledger.
@@ -628,6 +678,7 @@ impl Ledger {
         if self.sync {
             self.checkpoints.sync_data()?;
         }
+        self.last_checkpoint_size = cp.size;
         Ok(env)
     }
 
