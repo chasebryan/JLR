@@ -1,24 +1,24 @@
 # JLR Integrity Protocol
 
-## 1. JLR Protocol Number
+## 1. Encryption Protocol Number
 
-Every governed artifact is represented by a **JLR Protocol Number (JPN)**.
+Every governed artifact is represented by an **Encryption Protocol Number (EPN)**.
 
-A JPN is a stable identifier for a versioned security record.
+An EPN is a public, versioned identifier for a signed JLR integrity-and-policy record. The name reflects the protection protocol bound to the artifact; the EPN itself is **not** a secret, password, cipher key, or proof that the software is benevolent.
 
-Recommended textual form:
+Recommended EPN v1 textual form:
 
 ~~~text
-JPN-1-<class>-<128-bit-id>
+EPN-1-<class>-<record-id>
 ~~~
 
 Example:
 
 ~~~text
-JPN-1-EXE-7f3c64d2c6244a889fe64dc8a95e3132
+EPN-1-EXE-7f3c64d2c6244a889fe64dc8a95e3132
 ~~~
 
-The random identifier prevents path- or name-based ambiguity. The record itself contains cryptographic digests.
+The full record binds the random record identity to exact cryptographic measurements and policy. Security MUST NOT depend on secrecy of the EPN.
 
 ## 2. Artifact classes
 
@@ -47,13 +47,14 @@ Initial classes:
 
 ~~~text
 schema_version
-jpn
+epn
 artifact_class
 canonical_name
 version
 created_at
 discovered_at
 content_digests
+normalized_metadata_digest
 size
 source
 provenance
@@ -66,6 +67,7 @@ filesystem_profile
 network_profile
 device_profile
 sandbox_profile
+protection_profile
 state
 state_reason
 policy_version
@@ -77,52 +79,52 @@ superseded_by
 record_signature
 ~~~
 
-## 4. Digest policy
+The immutable artifact identity and the mutable local admission state SHOULD be separable in storage so a state transition never rewrites the historical artifact measurement.
 
-At minimum, production records should support SHA-256 and SHA-512.
+## 4. Cryptographic baseline
 
-The schema must permit future algorithms without reinterpreting old records.
+EPN v1 production baseline:
 
-A digest field includes the algorithm name:
+- SHA-256 MUST be supported for artifact and manifest digests.
+- SHA-512 MAY be recorded as an additional digest.
+- JLR-owned protocol records SHOULD use Ed25519 signatures.
+- Signed machine records SHOULD use a deterministic canonical representation such as canonical CBOR.
+- Human-readable JSON MAY mirror a signed record but MUST NOT create a second ambiguous signing format.
+- Random record identifiers MUST come from a cryptographically secure operating-system RNG.
 
-~~~text
-sha256:...
-sha512:...
-~~~
+Every digest field includes its algorithm name. Bare unlabeled digests are forbidden.
 
-JLR must never use a bare unlabeled digest in a protocol record.
+## 5. Protection profile
 
-## 5. Content identity versus instance identity
+The word **Encryption** in EPN binds an artifact to an explicit storage/protection policy. It does not mean every executable is necessarily encrypted at rest.
 
-Two files with the same bytes may have the same content digest but exist in different security contexts.
+Initial profile classes may include:
 
-Therefore JLR distinguishes:
+- NONE — no JLR-managed at-rest encryption
+- HOST — protection delegated to host disk encryption
+- JLR-SEALED — protected by a JLR-managed encrypted object store
+- TPM-SEALED — key release additionally bound to measured platform state
 
-- **content identity** — cryptographic hash of bytes
-- **record identity** — JPN
-- **instance identity** — a particular filesystem/process occurrence
+Cipher suites and key-derivation parameters belong to versioned protection profiles and MUST NOT be encoded as undocumented defaults.
 
-This permits one binary to be admitted in one context and denied in another.
+## 6. Identity separation
 
-## 6. Verification evidence
+JLR distinguishes:
 
-Evidence may include:
+- **content identity** — digest of exact bytes
+- **record identity** — EPN
+- **installation instance identity** — one filesystem/package occurrence
+- **execution instance identity** — one launched process tree
 
-- hash match
-- release signature
-- package signature
-- reproducible-build match
-- known-good snapshot match
-- dependency closure match
-- measured boot value
-- user approval
-- static analysis result
-- sandbox observation result
-- policy exception
+This permits identical bytes to have different local permissions without confusing artifact identity with execution context.
 
-Evidence records must include source and timestamp.
+## 7. Evidence
 
-## 7. State machine
+Evidence may include content hash matches, release/package signatures, reproducible-build matches, dependency closure, measured-boot values, static-analysis results, observation-cell results, operator authorization, and attributed external classifications.
+
+Evidence records MUST identify source and timestamp. Operator authorization is authority, not cryptographic verification.
+
+## 8. Admission state
 
 ~~~text
 UNKNOWN
@@ -133,7 +135,7 @@ QUARANTINED ----> REVOKED
   v
 OBSERVED
   |
-  +----> HOSTILE
+  +----> POLICY_BLOCKED
   |
   v
 VERIFIED
@@ -144,40 +146,42 @@ ADMITTED
   +----> DEGRADED ----> QUARANTINED / REVOKED
 ~~~
 
+POLICY_BLOCKED means evidence satisfies a prohibition in the active policy. It does not claim JLR has independently proven a developer's or process's intent.
+
 Transitions are policy-driven and auditable.
 
-## 8. Protocol numbers are not secrets
+## 9. Release manifest
 
-A JPN may appear in logs, UI, and reports.
-
-Security must not depend on keeping JPN values secret.
-
-## 9. Manifest format
-
-A JLR release manifest should bind:
-
-- release version
-- build commit
-- build environment identifier
-- base image digest
-- loader digest
-- policy bundle digest
-- recovery image digest
-- supported migration paths
-- minimum allowed version when rollback protection is enabled
+A JLR release manifest SHOULD bind release version, source commit, build-environment identity, SBOM digest, base-image digest, loader digest, policy-bundle digest, recovery-image digest, supported migrations, and minimum allowed version when rollback protection is enabled.
 
 The manifest is signed separately from the image.
 
-## 10. Revocation
+## 10. Evidence ledger
 
-Revocation entries must support:
+Security-relevant records SHOULD form a tamper-evident chain containing at least:
 
-- exact JPN
-- exact content digest
-- signing key
-- package coordinate
-- version range
-- policy capability
-- whole release
+~~~text
+sequence
+boot_id
+actor
+subject_epn
+event_type
+policy_version
+decision
+evidence_digest
+previous_event_digest
+record_digest
+signature_or_mac
+~~~
 
-Revocation must be monotonic unless an explicit superseding revocation record restores eligibility.
+A hash chain detects rewriting only relative to a trusted checkpoint. Higher-assurance deployments SHOULD periodically checkpoint ledger heads outside mutable host state.
+
+## 11. Revocation
+
+Revocation entries MUST support exact EPN, exact content digest, signing key, package coordinate/version range, policy capability, and whole release.
+
+Revocation wins over stale admission evidence unless an explicit later signed record supersedes it.
+
+## 12. Protocol principle
+
+**Hashes identify. Signatures authenticate provenance. Encryption protects data under key control. Policy constrains authority. Observations provide evidence. None of these alone proves software intent.**

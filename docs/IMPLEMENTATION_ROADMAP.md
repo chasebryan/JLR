@@ -11,7 +11,7 @@ Deliverables:
 - minimal Puppy-derived image recipe
 - software bill of materials
 - signed release manifest format
-- JPN schema
+- EPN schema
 - event schema
 - policy schema
 - deterministic test fixtures
@@ -49,7 +49,7 @@ Deliverables:
 - file/directory watchers
 - package inventory
 - process inventory
-- JPN assignment
+- EPN assignment
 - evidence store
 - hash-chained events
 
@@ -89,7 +89,7 @@ Deliverables:
 Exit criteria:
 
 - test workloads cannot escape declared filesystem/network/process boundaries under supported kernel assumptions
-- jail policy is reproducible from JPN record
+- jail policy is reproducible from EPN record
 
 ## Phase 5 — JLR-first host installation
 

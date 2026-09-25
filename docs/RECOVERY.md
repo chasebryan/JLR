@@ -32,7 +32,7 @@ Recovery should:
 Required operations:
 
 - inspect file hashes
-- inspect JPN records
+- inspect EPN records
 - verify package signatures
 - compare snapshots
 - copy user data to external media

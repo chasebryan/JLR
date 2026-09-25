@@ -97,7 +97,7 @@ Each jail has one of:
 - FULL_USER_NETWORK
 - PRIVILEGED_NETWORK
 
-Network policy is part of the JPN admission record.
+Network policy is part of the EPN admission record.
 
 ## 6. Process boundary
 
@@ -121,7 +121,7 @@ If the host kernel is untrusted, JLR must not assume namespace confinement is so
 A suspected escape or sandbox bypass triggers:
 
 1. terminate affected workload where safe
-2. mark workload DEGRADED or HOSTILE
+2. mark workload DEGRADED or REVOKED
 3. snapshot relevant evidence
 4. isolate related child processes
 5. require operator review
