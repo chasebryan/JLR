@@ -116,7 +116,7 @@ No newly discovered executable should silently become trusted.
 
 The Admission Controller:
 
-1. creates or resolves a EPN
+1. creates or resolves an EPN
 2. validates identity and provenance
 3. determines initial state
 4. assigns an isolation profile
