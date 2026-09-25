@@ -37,9 +37,9 @@ The running JLR instance continuously verifies itself against these anchors. A m
 
 ## Core object: the Encryption Protocol Number
 
-Every governed artifact is assigned a **Encryption Protocol Number (EPN)**.
+Every governed artifact is assigned an **Encryption Protocol Number (EPN)**.
 
-A EPN identifies a versioned protocol record containing:
+An EPN identifies a versioned protocol record containing:
 
 - cryptographic digests
 - artifact type and provenance
