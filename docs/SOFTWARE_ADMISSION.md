@@ -25,7 +25,7 @@ JLR creates an observation when it detects:
 - an executable memory image without a known file identity
 - a new package transaction
 
-The artifact is assigned or matched to a JPN.
+The artifact is assigned or matched to an EPN.
 
 ## 3. Static verification
 

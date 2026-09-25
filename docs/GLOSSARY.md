@@ -20,7 +20,7 @@
 
 **Immutable** — not writable during ordinary runtime; updates occur by authenticated replacement.
 
-**JLR Protocol Number (JPN)** — stable identifier for a versioned JLR security record.
+**Encryption Protocol Number (EPN)** — stable identifier for a versioned JLR security record.
 
 **Jail fabric** — composition of kernel isolation and resource-control mechanisms used to enforce JLR capability policy.
 

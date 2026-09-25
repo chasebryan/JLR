@@ -35,11 +35,11 @@ Instead, JLR separates trust into independently verifiable anchors:
 
 The running JLR instance continuously verifies itself against these anchors. A mismatch is a security event, not something the runtime is allowed to silently explain away.
 
-## Core object: the JLR Protocol Record
+## Core object: the Encryption Protocol Number
 
-Every governed artifact is assigned a **JLR Protocol Number (JPN)**.
+Every governed artifact is assigned an **Encryption Protocol Number (EPN)**.
 
-A JPN identifies a versioned protocol record containing:
+An EPN identifies a versioned protocol record containing:
 
 - cryptographic digests
 - artifact type and provenance
@@ -58,7 +58,7 @@ A JPN identifies a versioned protocol record containing:
 - user approvals
 - revocations and superseding records
 
-The JPN is an identifier for a security protocol record; it is **not** itself encryption and must never be treated as a substitute for cryptographic verification.
+The EPN is an identifier for a security protocol record; it is **not** itself encryption and must never be treated as a substitute for cryptographic verification.
 
 ## Security states
 
@@ -73,7 +73,7 @@ JLR uses explicit states instead of a binary trusted/untrusted flag:
 | ADMITTED | Explicitly permitted for a defined capability set |
 | DEGRADED | Previously admitted, but one or more measurements no longer match |
 | REVOKED | Explicitly denied by current policy |
-| HOSTILE | Strong evidence indicates malicious or prohibited behavior |
+| POLICY_BLOCKED | Evidence shows behavior or a classification prohibited by the active policy |
 
 A state transition is recorded with the evidence that caused it.
 
@@ -107,15 +107,20 @@ The detailed architecture is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - [Documentation index](docs/README.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Trust model](docs/TRUST_MODEL.md)
-- [Integrity protocol and JPN format](docs/INTEGRITY_PROTOCOL.md)
+- [Integrity protocol and EPN format](docs/INTEGRITY_PROTOCOL.md)
 - [Software admission lifecycle](docs/SOFTWARE_ADMISSION.md)
 - [Isolation and jail model](docs/JAIL_MODEL.md)
 - [Boot and installation model](docs/BOOT_INSTALLATION.md)
 - [Recovery and redundancy](docs/RECOVERY.md)
 - [Threat model](docs/THREAT_MODEL.md)
 - [Security invariants](docs/SECURITY_INVARIANTS.md)
+- [Configuration and cloning](docs/CONFIGURATION_CLONING.md)
+- [Security boundaries and claims](docs/SECURITY_BOUNDARIES.md)
+- [Architecture decisions](docs/DECISIONS.md)
 - [Implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md)
 - [Glossary](docs/GLOSSARY.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## Status
 

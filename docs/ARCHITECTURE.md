@@ -66,7 +66,7 @@ Inputs include:
 - artifact digests
 - signed metadata
 - provenance
-- prior JPN record
+- prior EPN record
 - dependency identity
 - runtime observations
 - policy version
@@ -116,7 +116,7 @@ No newly discovered executable should silently become trusted.
 
 The Admission Controller:
 
-1. creates or resolves a JPN
+1. creates or resolves an EPN
 2. validates identity and provenance
 3. determines initial state
 4. assigns an isolation profile
@@ -145,7 +145,7 @@ Preferred primitives:
 - device allowlists
 - resource ceilings
 
-A jail profile is attached to the JPN and policy decision.
+A jail profile is attached to the EPN and policy decision.
 
 ### Layer 7 — Host adapter
 
@@ -184,7 +184,7 @@ Recovery capabilities include:
 JLR uses explicit storage classes:
 
 - **IMMUTABLE** — base image, loader, release manifests
-- **TRUSTED_MUTABLE** — policy database, approved JPN records, revocations
+- **TRUSTED_MUTABLE** — policy database, approved EPN records, revocations
 - **EVIDENCE** — append-only event and measurement log
 - **CACHE** — reproducible derived data that can be discarded
 - **HOST** — host operating system state
