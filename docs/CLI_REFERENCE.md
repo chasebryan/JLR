@@ -1,0 +1,122 @@
+# Command reference
+
+`jlr` is the operator's tool. `jlrd` is the daemon. `jlr-release` is the build-time signing tool. `jlr-init` and
+`jlr-cell-init` are helpers that are started by other components and are not run by hand.
+
+Global option for `jlr` and `jlrd`: `--state DIR`, default `$JLR_STATE`, else `/var/lib/jlr` for root, else
+`$XDG_STATE_HOME/jlr` or `~/.local/state/jlr`.
+
+Environment: `JLR_STATE` (state directory), `JLR_CELL_INIT` (path of the `jlr-cell-init` helper; default: next to the
+`jlr` binary).
+
+## Exit status of `jlr`
+
+| Code | Meaning |
+|---:|---|
+| 0 | Success |
+| 1 | Error, or `scan` found artifacts that degraded because their content changed |
+| 2 | `doctor`: this machine cannot host JLR cells as this user |
+| 126 | `run`: execution denied by the trust decision |
+| other | `run`: the exit code of the program, clamped to 0..255 |
+
+## `jlr init [--strict]`
+
+Creates the state directory, the device and policy keys, trust anchors, the first signed policy, an empty revocation
+list and the ledger with its first checkpoint. Refuses to run twice. `--strict` installs the policy that quarantines
+everything without strong evidence and asks the operator.
+
+## `jlr status`
+
+Shows the assurance label, posture and its scope, policy name/epoch/digest, exec-gate mode, revocations, trust keys,
+artifact counts per state, baselines, approvals, and the ledger's size, checkpoints and Merkle root. A warning line
+appears if an incomplete ledger record was quarantined at start.
+
+## `jlr doctor`
+
+Prints kernel facts (LSMs, cgroup v2, TPM device, Secure Boot, IMA, user-namespace restriction) and then launches a
+sealed `/bin/true` in a CELL-0, printing every control as `active`, `UNAVAILABLE (reason)` or `not requested`.
+
+## `jlr scan [PATH...] [--full] [--exclude DIR]...`
+
+Default path `/usr`. Walks below each path without following symlinks, measures governed files (executables, libraries,
+scripts, modules, service units, boot files), records new artifacts and applies policy. Without `--full`, files whose
+size, mtime, ctime, inode and device are unchanged since the last scan are skipped. Prints counts and any path whose
+previously trusted content changed.
+
+## `jlr explain PATH`
+
+Read-only. Prints the EPN, class, size, digest, source, provenance, the state recorded in the ledger, the decision the
+policy would make now with its reasons, and the evidence with its source. If a person must answer something, prints
+the question.
+
+## `jlr run [--cap CAP]... PROGRAM [ARG...]`
+
+Measures `PROGRAM`, evaluates policy, and if the decision permits execution, seals the measured bytes into a memfd and
+runs them in the prescribed cell. Prints the decision and the enforcement report to standard error. `--cap` names a
+capability the program requests; high-risk capabilities are withheld unless an approval grants them.
+
+Capability syntax: `FS_READ:/abs/path`, `FS_WRITE:/abs/path`, `NET_CONNECT:host:port`, `NET_LISTEN:addr:port`,
+`DEV_AUDIO`, `DEV_GPU`, `DEV_USB:class`, `PROC_SPAWN:epn`, `IPC_DBUS:name`, `HOST_SERVICE_CONTROL:service`,
+`KERNEL_MODULE_LOAD`, `RAW_NETWORK`, `RAW_BLOCK_WRITE`. Paths must be absolute and normalised.
+
+## `jlr baseline enroll [PATH...] [--name N] [--cell C] [--network M] [--ttl-days D] [--by WHO] [--exclude DIR]... [--include-unmanaged]`
+
+Signs a baseline: an operator statement that the artifacts below the paths are the machine's initial state. Members are
+files the package database vouches for whose bytes match its manifest; `--include-unmanaged` also enrols everything
+else that is not known-bad (installer mode). Defaults: name `initial-host`, cell `CELL-2`, network
+`FULL_USER_NETWORK`, 365 days. Members are recorded as manual overrides, one legal state step at a time.
+
+## `jlr approve EPN [--cell C] [--network M] [--cap CAP]... [--ttl-hours H] [--by WHO]`
+
+Signs an approval for one known artifact and re-evaluates it. The cell is capped by the policy's `max_manual_cell`.
+An approval never lifts a revocation or a policy prohibition. Default: `CELL-1`, no network, 24 hours.
+
+## `jlr revoke (--digest sha256:HEX | --signer ID | --epn EPN) --reason TEXT`
+
+Adds an entry to the signed revocation list (epoch + 1) and moves matching known artifacts to `REVOKED`.
+
+## `jlr policy show | set FILE | enforce on|off`
+
+`show` prints the active policy as TOML. `set` compiles a TOML file, refuses it if validation fails, signs it with the
+policy key and installs it; the epoch must exceed the current one. `enforce on|off` installs a new epoch with the
+exec-gate enforcement flag changed.
+
+## `jlr ledger verify [--checkpoint FILE] | log [-n N] | checkpoint [--out FILE]`
+
+`verify` checks every signature, link and checkpoint, and optionally an external checkpoint. `log` prints the last N
+events. `checkpoint` writes a signed checkpoint; store it off the machine.
+
+## `jlrd [--state DIR] [--mark PATH]... [--scan-root PATH]... [--scan-every SECS] [--audit] [--fail-closed] [--lock-wait-ms N]`
+
+The exec gate, state watcher and background rescan. Needs root. Marks every real file system (or only `--mark` paths).
+`--audit` forces audit mode whatever the policy says. `--fail-closed` denies an exec when the daemon itself errs;
+the default is to allow and record a DEGRADED event. `--scan-every 0` disables the rescan.
+
+## `jlr-release`
+
+```text
+keygen   --role <root|release|policy|recovery|device> --out KEYFILE
+pubkey   KEYFILE --out PUBFILE
+anchors  --out ANCHORS PUBFILE...
+manifest --key KEYFILE --image IMG --name N --version V --epoch E [--min-epoch M] [--component NAME=FILE]... --out MANIFEST
+verify   --anchors ANCHORS --manifest MANIFEST [--image IMG] [--floor N]
+state    --out FILE [--install SLOT]... [--floor N]
+```
+
+Key files are created exclusively with mode 0600 and refused on load if group- or world-accessible.
+
+## Kernel command line for the initramfs
+
+| Parameter | Effect |
+|---|---|
+| `jlr.onfail=poweroff\|reboot` | What stage 1 does after a refusal (default: wait) |
+| `jlr.test=poweroff` | Stage 2 powers off after the payload; for automated tests |
+| `jlr.exec=/path` | Stage 2 runs this program as a child after proving the slot, then continues |
+
+## Console protocol
+
+Boot writes machine-checkable lines to the console. `JLR-BOOT:` lines come from stage 1 (`anchors loaded`,
+`media found`, `slot=… manifest=verified`, `selected slot=…`, `image verified …`, `base mounted read-only from RAM`,
+`boot media released`, `switching root`, or `REFUSED reason=…` followed by `state=RECOVERY-RESTRICTED`).
+`JLR-STAGE2:` lines come from the verified base (`check … ok`, `slot … marked successful; rollback floor is now N`,
+`ready`).

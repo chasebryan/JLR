@@ -1,163 +1,78 @@
-# JLR Implementation Roadmap
+# Implementation Roadmap
 
-The roadmap intentionally builds the smallest verifiable core before advanced automation.
+The roadmap builds the smallest verifiable core first and adds automation only on top of things that have been shown to
+work. **Engineering priorities, in order:** correctness, clear failure state, minimal trusted code, recoverability,
+explainability, performance, convenience.
 
-## Phase 0 — Reproducible design baseline
+## 1. Where things stand
 
-Deliverables:
+| Phase | Deliverable | Status | Evidence |
+|---|---|---|---|
+| 0 Reproducible baseline | Toolchain pinned, SBOM path, EPN/event/policy schemas, deterministic fixtures, reproducible image recipe | **Done**, SBOM pending | `rust-toolchain.toml`, [protocol vectors](vectors/protocol-v1.json), `boot/build.sh` builds identical artifacts twice |
+| 1 Bootable governance core | Immutable base, RAM boot, A/B slots, manifest verification, offline key workflow, CLI status | **Done (prototype anchor)** | 13 QEMU boots: refusals for every failure class, fallback, upgrade, rollback |
+| 2 Measurement | Descriptor hashing, classification, package inventory, EPN assignment, evidence store, chained events | **Done for files** | Mutation of a protected executable is detected and recorded; ledger replay validates. Processes, modules, listeners: designed |
+| 3 Admission and quarantine | State machine, deterministic policy engine, capability model, approvals, baselines, revocation | **Done** | Property tests; mutation-checked; approvals distinguishable from cryptographic verification |
+| 4 Jail fabric | Namespaces, private root, seccomp, Landlock, caps, cgroup, rlimits, enforcement report | **Done for CELL-0/1/2** | Real-cell tests for filesystem, network, syscalls, privileges, PID visibility, sealed exec |
+| 4b Continuous enforcement | Exec gate with audit and enforce modes, rescan, state watcher | **Done** | QEMU guest: audit, enforce, tamper, confined run, daemon stop |
+| 5 JLR-first installation | Installer, partition planner, host handoff, measured host launch, protected JLR partitions | **Designed** | Boot chain exists; installer does not |
+| 6 Recovery maturity | Read-only inspect, export, restore, boot repair, key rotation, evidence bundle | **Designed** | A/B fallback and ledger verification exist |
+| 7 Advanced | Behaviour baselining, remote attestation, reproducible package rebuilds, VM cells, fleet policy | **Designed** | n/a |
 
-- documented build environment
-- pinned dependency list
-- minimal Puppy-derived image recipe
-- software bill of materials
-- signed release manifest format
-- EPN schema
-- event schema
-- policy schema
-- deterministic test fixtures
+## 2. Next, in order
 
-Exit criteria:
+Each item has an exit test that must exist before the item is called done.
 
-- two clean builds produce an explainable artifact difference report
-- base image contents are enumerated
-- no undocumented startup services
+1. **Managed-installer hook (apt).** Record the file digests of an apt-verified transaction and emit `PACKAGE_SIGNATURE`, so
+   `managed-package` admits silently without a baseline and enforcement can coexist with unattended upgrades.
+   *Exit:* an upgrade under enforcement runs its maintainer scripts; a package tampered after download is not admitted.
+2. **Authenticated boot.** A unified kernel image signed with the operator's key, enrolled in firmware; the rollback floor in a
+   TPM NV counter; PCR measurements; checkpoints with `anchor = Tpm`.
+   *Exit:* under OVMF with Secure Boot and `swtpm`, an initramfs signed by another key does not start, and the floor cannot be
+   lowered by rewriting the media.
+3. **Recovery tools.** Read-only enumeration and mount, safe export with receipts, snapshot comparison, ledger verification
+   against an off-machine checkpoint, from a recovery image.
+   *Exit:* the disk-loss and host-unbootable drills in [RECOVERY.md](RECOVERY.md) pass.
+4. **Observation telemetry and an allow-list profile for CELL-0.** Record what an unknown program opens, executes, connects to
+   and asks for, in normalised form; derive a seccomp allow list from it; add `FORBIDDEN_BEHAVIOR`.
+   *Exit:* a fixture that attempts a forbidden action is moved to `POLICY_BLOCKED` with the observation as evidence.
+5. **Notification and portals.** The green/yellow/red contract, a Wayland-only display path and portal-style prompts so a
+   user's ordinary action grants a capability.
+   *Exit:* a graphical application runs in a cell and its file access is granted by a file-chooser action.
+6. **Host installer and supervisor deployment.** Partition planner, host handoff, measured host launch, IPE and fs-verity where
+   the kernel provides them, a shell-less production base.
+   *Exit:* a host installs after JLR without overwriting it; a modified host boot set yields a degraded posture.
+7. **VM-backed cell and cross-view comparison.** A KVM cell for hostile code; a rule that compares a guest's report with the
+   supervisor's view of the same fact.
+8. **Ledger scale and witnesses.** Persisted tree state so opening does not hash the whole log; tiled storage; a witness that
+   cosigns checkpoints.
+9. **Hybrid post-quantum signatures** for the root, release and recovery roles.
+10. **Fleet policy.** Enrolment against an organisation's policy key; signed role manifests; duplicate-identity detection.
 
-## Phase 1 — Bootable governance core
+## 3. Hardening work that is independent of features
 
-Deliverables:
+- **Fuzzing** of every untrusted parser: the CBOR decoder, the envelope, the manifest and boot state, the dpkg parser and the
+  ledger frame reader. Property tests exist; coverage-guided fuzzing does not.
+- **Reproducible Rust builds** verified across machines (the boot artifacts are reproducible today; the compiled binaries
+  inside them are not yet compared across hosts).
+- **SBOM and licence inventory** for every binary in the base image.
+- **`cargo-vet` or equivalent** for the dependencies in the trusted computing base.
+- **External review** of the boot chain, the cell setup and the envelope.
+- **A real power-cut matrix** for the update path, not only the logic.
+- **Usability testing** of the wording of the red screen with people who are not engineers.
 
-- immutable JLR base image
-- RAM boot
-- A/B base slots
-- recovery boot
-- manifest verification
-- offline root/release key workflow
-- initial CLI status interface
-
-Exit criteria:
-
-- corrupted image is rejected
-- invalid manifest is rejected
-- fallback slot boots
-- host is not required for JLR startup
-
-## Phase 2 — Measurement engine
-
-Deliverables:
-
-- host boot measurement
-- file/directory watchers
-- package inventory
-- process inventory
-- EPN assignment
-- evidence store
-- hash-chained events
-
-Exit criteria:
-
-- mutation of a protected executable is detected and recorded
-- event replay validates the chain
-- evidence can be exported from recovery
-
-## Phase 3 — Admission and quarantine
-
-Deliverables:
-
-- UNKNOWN/QUARANTINED/OBSERVED/VERIFIED/ADMITTED state machine
-- quarantine storage
-- explicit user approval flow
-- deterministic policy engine
-- capability model
-
-Exit criteria:
-
-- unknown executable cannot obtain normal host privileges without policy decision
-- approvals are distinguishable from cryptographic verification
-
-## Phase 4 — Jail fabric
-
-Deliverables:
-
-- namespace orchestration
-- cgroup v2
-- seccomp profiles
-- filesystem isolation
-- network isolation
-- device policy
-- observation telemetry
-
-Exit criteria:
-
-- test workloads cannot escape declared filesystem/network/process boundaries under supported kernel assumptions
-- jail policy is reproducible from EPN record
-
-## Phase 5 — JLR-first host installation
-
-Deliverables:
-
-- installer
-- partition planner
-- host installer handoff
-- host boot registration
-- measured host launch
-- protected JLR partitions
-
-Exit criteria:
-
-- supported Linux host can be installed after JLR without overwriting JLR
-- modified host boot set produces degraded state
-
-## Phase 6 — Recovery maturity
-
-Deliverables:
-
-- snapshot comparison
-- safe export
-- known-good restore
-- boot repair
-- key rotation
-- policy rollback
-- evidence bundle generation
-
-Exit criteria:
-
-- recovery works with host unbootable
-- recovery mounts host read-only by default
-- destructive actions are explicit and logged
-
-## Phase 7 — Advanced analysis
-
-Possible later features:
-
-- richer static analysis
-- behavioral baselining
-- anomaly scoring
-- remote attestation
-- reproducible package rebuilds
-- VM-backed hostile analysis
-- fleet policy distribution
-
-These features must not weaken deterministic identity and policy fundamentals.
-
-## Engineering priorities
-
-1. correctness
-2. clear failure state
-3. minimal trusted code
-4. recoverability
-5. explainability
-6. performance
-7. convenience
-
-## Minimum viable security release
+## 4. Minimum viable security release
 
 A release should not call itself security-ready until it has:
 
-- threat-model tests
-- update rollback tests
-- recovery tests
-- key compromise procedure
-- external code review
-- documented unsupported platforms
-- fuzzing for untrusted parsers
-- reproducible build analysis
+| Requirement | Status |
+|---|---|
+| Threat-model tests for the abuse cases in [THREAT_MODEL.md](THREAT_MODEL.md) | Mostly; see the coverage table there |
+| Update rollback tests | Done (QEMU) |
+| Recovery tests | Partly (fallback and refusal); the tools are not built |
+| A documented key-compromise procedure | Drafted in [RECOVERY.md](RECOVERY.md); not rehearsed |
+| External code review | Not done |
+| Documented unsupported platforms | Anything other than x86_64 Linux with a recent kernel; Ubuntu 24.04 needs the userns setting or root |
+| Fuzzing for untrusted parsers | Not done |
+| Reproducible build analysis | Boot artifacts yes; cross-machine Rust no |
+
+No security adjective outruns the test suite.
